@@ -1,0 +1,465 @@
+对了，就是之后是不是应该设计一个插件是专门管理模型的呢？比如配置各个模型厂商和云平台的 LLM 接入，然后也支持各种的订阅，比如 ChatGPT Codex 订阅、Claude Code 订阅、Google Antigravity、OpenCode 订阅之类的呢，就像 oh-my-pi 那样预备了非常多的提供商和订阅管理，也支持自定义？
+这些应该就是作为插件来管理的，而不是 Core 来管理的吧？
+是的，我很赞成把它设计成 **插件层能力**，而不是塞进 `bitty-ai Core`。但需要再细分一下：**Core 仍然要定义统一的 ModelProvider contract、model registry 和 selection/routing semantics；真正的厂商接入、认证、订阅/CLI 适配、模型发现则应该由插件负责。**
+
+这样边界会很干净：
+
+```text
+bitty-ai Core
+├── ModelProvider trait
+├── ModelDescriptor
+├── ProviderCapabilities
+├── ModelRegistry
+├── selection / routing policy
+├── fallback
+├── budget / usage accounting
+├── streaming abstraction
+└── provider-independent errors
+
+          ▲
+          │ register
+          │
+AI provider plugins
+├── OpenAI
+├── Anthropic
+├── Google Gemini
+├── OpenRouter
+├── Ollama
+├── OpenAI-compatible
+├── Azure OpenAI
+├── AWS Bedrock
+├── Vertex AI
+├── Codex CLI adapter
+├── Claude Code adapter
+├── Antigravity adapter
+└── custom provider
+```
+
+这里尤其要区分 **API Provider** 和 **Subscription/CLI Provider**，这两类东西看起来都是“模型接入”，但本质差别很大。
+
+### API Provider
+
+比如：
+
+```text
+OpenAI API
+Anthropic API
+Gemini API
+OpenRouter
+Groq
+Together
+DeepSeek
+Mistral
+xAI
+Azure OpenAI
+AWS Bedrock
+Vertex AI
+Ollama
+vLLM
+LM Studio
+自定义 OpenAI-compatible endpoint
+```
+
+这些很适合统一成：
+
+```rust
+trait ModelProvider {
+    fn list_models(...);
+    fn capabilities(...);
+    fn complete(...);
+    fn stream(...);
+    fn cancel(...);
+}
+```
+
+Core 只知道：
+
+```text
+provider_id = "anthropic"
+model_id    = "claude-..."
+transport   = http
+capabilities = [...]
+```
+
+它根本不需要知道 Anthropic HTTP endpoint 怎么拼。
+
+---
+
+## 而“订阅”最好单独抽象
+
+你说的这些：
+
+```text
+ChatGPT / Codex subscription
+Claude Code subscription
+Google Antigravity
+OpenCode subscription
+...
+```
+
+不能简单理解成：
+
+> “我买了订阅，所以 bitty-ai 可以直接拿这个订阅当 API Key。”
+
+很多产品的 **consumer subscription、CLI account、API billing 是不同体系**。
+
+所以 Bitty 不应该设计成：
+
+```text
+subscription -> 偷/读取 session token -> 模拟官方客户端
+```
+
+这种东西很不稳定，也容易碰到 Terms / security 问题。
+
+更合理的是抽象出另一种 transport：
+
+```text
+Provider
+├── HttpApi
+├── LocalEndpoint
+├── CliHarness
+├── ManagedAccount
+└── Router
+```
+
+例如：
+
+```toml
+[providers.claude-code]
+type = "cli"
+command = "claude"
+
+[providers.codex]
+type = "cli"
+command = "codex"
+
+[providers.ollama]
+type = "openai-compatible"
+base_url = "http://127.0.0.1:11434/v1"
+
+[providers.my-openrouter]
+type = "openrouter"
+credential = "secret://openrouter/default"
+```
+
+如果某个产品官方支持 account/CLI integration，那么 adapter 可以调用官方 CLI 或官方授权接口。
+
+这样 Bitty 不需要关心：
+
+> 用户到底是 API key、OAuth、subscription 还是 CLI login。
+
+Provider plugin 自己处理。
+
+---
+
+# 我甚至建议做两个层次的插件
+
+不要做成一个巨型的：
+
+```text
+bitty-model-manager
+    里面包含全世界所有 provider
+```
+
+更好的结构是：
+
+```text
+models
+│
+├── Model Manager UI / configuration plugin
+│
+└── Provider plugins
+    ├── provider-openai
+    ├── provider-anthropic
+    ├── provider-google
+    ├── provider-openrouter
+    ├── provider-ollama
+    ├── provider-openai-compatible
+    ├── provider-codex
+    └── provider-claude-code
+```
+
+第一层可以是官方插件，例如：
+
+```text
+bitty-terminal/models
+```
+
+它负责：
+
+* provider 管理
+* model 列表
+* 默认模型
+* fallback
+* model alias
+* auth 状态
+* quota / usage
+* latency
+* pricing
+* context window
+* capabilities
+* endpoint
+* routing policy
+
+但它**自己不一定直接实现网络协议**。
+
+Provider adapter 可以独立注册：
+
+```text
+models.register_provider(...)
+```
+
+这样以后社区可以随便加：
+
+```text
+provider-siliconflow
+provider-dashscope
+provider-volcengine
+provider-moonshot
+provider-custom-company
+```
+
+而 Bitty Core 一行都不用修改。
+
+---
+
+# 这和 oh-my-pi 的方向其实很接近
+
+但 Bitty 可以做得更“平台化”。
+
+例如用户打开：
+
+```text
+Mod+m
+```
+
+弹出一个 Model Manager Panel：
+
+```text
+Models
+
+Providers
+────────────────────────────
+✓ Anthropic       API
+✓ OpenRouter      API
+✓ Ollama          Local
+✓ Claude Code     Subscription / CLI
+✓ Codex           Subscription / CLI
+○ Gemini          Not configured
+
+Models
+────────────────────────────
+claude-sonnet-*        Anthropic
+gpt-*                  OpenAI
+qwen3-*                Ollama
+deepseek-*             OpenRouter
+```
+
+然后允许：
+
+```text
+Default model
+  claude-sonnet
+
+Fast model
+  gpt-5.x-mini
+
+Planning model
+  claude-opus
+
+Background model
+  gemini-flash
+
+Fallback
+  claude-sonnet
+  ↓
+  gpt
+  ↓
+  local/qwen
+```
+
+这就开始比普通 AI CLI 的 provider config 更有意思了。
+
+---
+
+# 更重要的是 model alias
+
+我非常建议 Bitty 不要让 Agent 到处写：
+
+```text
+anthropic/claude-xxxxx
+openai/gpt-xxxxx
+```
+
+而是支持 semantic alias：
+
+```toml
+[models]
+default = "smart"
+fast = "fast"
+reasoning = "reasoning"
+cheap = "cheap"
+local = "local"
+
+[model_alias.smart]
+candidates = [
+    "anthropic/claude-...",
+    "openai/gpt-..."
+]
+
+[model_alias.fast]
+candidates = [
+    "google/gemini-flash",
+    "openai/..."
+]
+```
+
+Agent 只说：
+
+```text
+need = reasoning
+```
+
+selection policy 决定实际模型。
+
+以后就可以实现：
+
+```text
+capability
+cost
+latency
+privacy
+context window
+subscription availability
+rate limit
+current quota
+```
+
+共同参与 routing。
+
+这才是 `bitty-ai ModelProvider` 应该拥有的价值，而不是硬编码一百家 Provider。
+
+---
+
+## Secret 管理也一定不能属于普通插件配置
+
+比如绝对不建议：
+
+```toml
+api_key = "sk-..."
+```
+
+至少架构上应该：
+
+```toml
+credential = "secret://anthropic/default"
+```
+
+真正 credential：
+
+```text
+Bitty host secret store
+        ↓
+opaque credential handle
+        ↓
+provider adapter
+```
+
+最好做到：
+
+```text
+Model Manager UI
+       │
+       ├── 知道：configured = true
+       └── 不知道：API key 内容
+
+Agent
+       │
+       └── 完全拿不到 API key
+
+Prompt
+       │
+       └── 完全拿不到 API key
+```
+
+即：
+
+> **model can use credentials, model must never see credentials.**
+
+这应该成为 Bitty AI 很重要的一条安全 invariant。
+
+---
+
+## Core 和 Plugin 的最终边界
+
+我建议固定成这样：
+
+| 能力                          |                    Core |             Plugin |
+| --------------------------- | ----------------------: | -----------------: |
+| `ModelProvider` interface   |                       ✅ |                    |
+| `ModelDescriptor`           |                       ✅ |                    |
+| capabilities vocabulary     |                       ✅ |                    |
+| selection/routing semantics |                       ✅ |                    |
+| budget/accounting semantics |                       ✅ |                    |
+| fallback semantics          |                       ✅ |                    |
+| provider registry protocol  |                       ✅ |                    |
+| OpenAI HTTP                 |                         |                  ✅ |
+| Anthropic HTTP              |                         |                  ✅ |
+| Gemini HTTP                 |                         |                  ✅ |
+| OAuth implementation        |                         |                  ✅ |
+| Codex subscription adapter  |                         |                  ✅ |
+| Claude Code adapter         |                         |                  ✅ |
+| OpenRouter                  |                         |                  ✅ |
+| Ollama                      |                         |                  ✅ |
+| custom endpoint             |                         |                  ✅ |
+| Model Manager Panel         |                         |                  ✅ |
+| credentials storage         | **Host infrastructure** |                    |
+| provider secret resolution  |         Host-controlled | ✅ adapter consumer |
+
+所以准确地说，不是：
+
+> “模型管理全部属于插件。”
+
+而是：
+
+> **模型系统的 abstraction / policy 属于 `bitty-ai Core`；具体 provider integration 和管理 UI 属于插件。**
+
+这是我认为最稳定的分界。
+
+---
+
+还有一个很漂亮的结果：以后 **bitty-ai 本身完全可以没有任何厂商依赖**。
+
+刚安装：
+
+```text
+bitty-ai
+```
+
+只有：
+
+```text
+ModelProvider protocol
+Agent runtime
+Context engine
+Tool bus
+Routing
+```
+
+然后：
+
+```bash
+bitty plugin add models
+bitty plugin add provider-openai
+bitty plugin add provider-ollama
+bitty plugin add provider-claude-code
+```
+
+或者 `models` 插件本身提供安装入口。
+
+这样非常符合 Bitty 现在的哲学：
+
+> **Core 极小，mechanism 稳定；ecosystem 承担 policy 与 integration。**
+
+而且也正好呼应你前面决定的另一件事情：**bitty 主程序本身不应该因为 AI 就引入 HTTP/network dependency**。真正需要网络的 provider adapter 可以独立承担这部分依赖。
+

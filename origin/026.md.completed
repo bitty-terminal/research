@@ -1,0 +1,717 @@
+
+
+是的，而且我会建议 bitty-ai **明确区分“Bitty 内置运行时提示”和“用户可自定义提示”**。不要把所有东西都塞成一个巨大的 system prompt。
+
+更合理的是分层。
+
+## 1. Bitty 应该有一层内置的 Core Prompt
+
+这一层相当于告诉 Agent：
+
+> “你现在运行在 Bitty Agent Runtime 里，这个环境有什么语义。”
+
+比如可以描述：
+
+```text
+You are running inside Bitty.
+
+Bitty is a terminal-native agent environment.
+
+Core concepts:
+- Workspace
+- Panel
+- Agent
+- Session
+- Tool
+- Plugin
+- Skill
+
+A Panel is a terminal execution context.
+Panels may be headed or headless.
+Panels and agents have independent lifetimes.
+
+You may inspect terminal history through panel tools.
+Do not assume a panel disappears when an agent exits.
+
+Use available tools instead of inventing environment state.
+```
+
+这里描述的是 **Bitty Runtime 的基本语义和 invariant**。
+
+它应该由 Bitty 自己维护，而不是让用户从零配置。
+
+因为否则 Agent 根本不知道：
+
+```text
+Panel 是什么
+headless panel 是什么
+workspace 是什么
+agent 和 panel 什么关系
+```
+
+这些不是用户偏好，而是 **Runtime Contract**。memcite
+
+---
+
+## 2. 但“有哪些工具”不要全部靠自然语言写进 Prompt
+
+例如不要写成：
+
+```text
+You can use:
+- read
+- write
+- bash
+- grep
+- panel_create
+- panel_history
+...
+```
+
+因为 Tool Schema 本身已经告诉模型：
+
+```json
+{
+  "name": "panel.history",
+  "description": "...",
+  "parameters": {}
+}
+```
+
+这里应该遵循：
+
+> Prompt 负责解释 **语义和规则**，Tool Schema 负责解释 **接口**。
+
+例如 Core Prompt 只需要说：
+
+```text
+Use Panel tools to inspect or manage terminal contexts.
+```
+
+具体有哪些：
+
+```text
+panel.list
+panel.inspect
+panel.history
+panel.create
+panel.close
+```
+
+由 Tool Registry 注入。
+
+这样以后 Lua Plugin 加了：
+
+```text
+panel.capture
+```
+
+不需要修改 Core Prompt。
+
+---
+
+# 3. 我会把 bitty-ai Prompt 分成至少 5 层
+
+大致：
+
+```text
+┌─────────────────────────────┐
+│ 1. Bitty Core Contract      │
+├─────────────────────────────┤
+│ 2. User Global Instructions│
+├─────────────────────────────┤
+│ 3. Project .bitty Config    │
+├─────────────────────────────┤
+│ 4. Skills / Agent Profile   │
+├─────────────────────────────┤
+│ 5. Runtime / Current Turn   │
+└─────────────────────────────┘
+```
+
+---
+
+## 1）Bitty Core Contract
+
+Bitty 内置。
+
+例如：
+
+```text
+bitty-ai/core.md
+```
+
+内容包括：
+
+- Bitty Runtime 是什么
+- Workspace 的语义
+- Panel 的语义
+- headed / headless
+- Agent 生命周期
+- Panel 生命周期
+- Tool 使用原则
+- Plugin/Skill 的基本模型
+- terminal command execution 的语义
+- 如何处理隐藏的 command output
+- Context / checkpoint 等基础行为
+
+这一层最好：
+
+```text
+稳定
+版本化
+不可被普通用户完全覆盖
+```
+
+例如：
+
+```text
+bitty-core-prompt@1
+```
+
+这同时非常利于 Prefix Cache。
+
+---
+
+# 4. 第二层：用户 Global Prompt
+
+用户当然应该可以自定义。
+
+例如：
+
+```text
+~/.config/bitty/ai/instructions.md
+```
+
+用户可以写：
+
+```markdown
+Always prefer Rust.
+
+Use concise responses.
+
+Use jj instead of git when possible.
+
+Never run destructive commands without asking.
+```
+
+这相当于：
+
+> “我这个用户希望 Agent 怎么工作。”
+
+跟 Bitty Runtime 本身无关。
+
+---
+
+# 5. 第三层：项目级 `.bitty`
+
+这层就非常重要。
+
+比如：
+
+```text
+project/
+├── .bitty/
+│   ├── config.lua
+│   ├── instructions.md
+│   ├── skills/
+│   ├── agents/
+│   └── mcp/
+```
+
+例如：
+
+```markdown
+# .bitty/instructions.md
+
+This is the Bitty terminal emulator repository.
+
+Architecture:
+- bitty-core: terminal runtime
+- bitty-ai: agent subsystem
+- bitty-plugin-sdk: plugin API
+
+Rules:
+- Rust 2024
+- run cargo fmt before committing
+- avoid introducing async unless necessary
+```
+
+这样 Agent 进入项目以后自动加载。
+
+这和现在很多工具里的：
+
+```text
+AGENTS.md
+CLAUDE.md
+.github/copilot-instructions.md
+```
+
+属于同一类东西。
+
+但 `.bitty` 可以更结构化。
+
+---
+
+# 6. `.bitty` 不应该只是一个 Prompt 文件
+
+这是我觉得 Bitty 可以做得更好的地方。
+
+现在很多 Agent 的项目配置基本还是：
+
+```text
+一个巨大 Markdown
+```
+
+Bitty 可以直接结构化：
+
+```text
+.bitty/
+├── config.lua
+├── instructions.md
+├── agents/
+│   ├── reviewer.lua
+│   └── debugger.lua
+├── skills/
+│   ├── rust/
+│   └── release/
+├── tools/
+├── mcp/
+├── hooks/
+└── context/
+```
+
+`config.lua`：
+
+```lua
+return {
+  ai = {
+    default_agent = "coding",
+  },
+
+  context = {
+    project_map = true,
+    git = true,
+  },
+
+  skills = {
+    "rust",
+    "bitty-development",
+  },
+}
+```
+
+也就是说：
+
+> `.bitty` 更像 Agent Runtime 的项目 manifest，而不只是 Prompt。
+
+---
+
+# 7. 第四层：Agent Profile
+
+因为 Bitty 以后很可能不只有一个 Agent。
+
+例如：
+
+```text
+coding
+reviewer
+debugger
+researcher
+planner
+```
+
+那么它们可以有不同 Prompt。
+
+例如：
+
+```text
+~/.config/bitty/agents/reviewer.lua
+```
+
+```lua
+return {
+    system = [[
+Focus on correctness, security and maintainability.
+Do not edit files unless explicitly requested.
+]],
+
+    tools = {
+        "fs.read",
+        "search.*",
+        "git.diff",
+    },
+
+    skills = {
+        "code-review",
+    },
+}
+```
+
+于是：
+
+```text
+Bitty Core
++
+User Instructions
++
+Project Instructions
++
+Reviewer Profile
+```
+
+组合成最终行为。
+
+---
+
+# 8. 这里一定要区分“能力”和“提示”
+
+这是非常关键的一点。
+
+不要让：
+
+```text
+Prompt
+```
+
+决定 Agent 有没有能力。
+
+例如用户写：
+
+```text
+You can access the network.
+```
+
+不能因此真的获得 network tool。
+
+能力应该来自：
+
+```text
+Capability Registry
+Tool Registry
+Plugin permissions
+Runtime policy
+```
+
+即：
+
+```text
+Prompt:
+    描述应该怎么做
+
+Capability:
+    决定实际上能不能做
+```
+
+例如：
+
+```text
+Agent Prompt:
+"You may inspect panels when necessary."
+
+Runtime:
+panel.inspect = enabled
+panel.close = denied
+```
+
+Agent 即使说：
+
+```text
+我要关闭 Panel
+```
+
+Runtime 也应该拒绝。
+
+这是安全边界。
+
+---
+
+# 9. Bitty Core Prompt 其实应该非常短
+
+我不建议搞成：
+
+```text
+15000 token system prompt
+```
+
+那会非常笨重。
+
+真正稳定的 Core Prompt 可能只有：
+
+```text
+1K ~ 3K tokens
+```
+
+主要定义：
+
+```text
+runtime semantics
+tool usage principles
+security invariants
+agent behavior
+```
+
+很多详细文档应该：
+
+> 按需获取。
+
+比如模型不需要一开始知道 Panel 的所有几十个 API。
+
+可以：
+
+```text
+help.topic("panel")
+```
+
+或者 Skill：
+
+```text
+bitty-panel
+```
+
+再加载详细知识。
+
+---
+
+# 10. Bitty 自己甚至可以提供 `runtime.describe`
+
+这个我觉得很适合。
+
+而不是 Core Prompt 塞所有细节：
+
+```text
+runtime.describe()
+```
+
+返回：
+
+```text
+Bitty Runtime 0.8
+
+Capabilities:
+- panels
+- workspaces
+- terminal execution
+- filesystem
+- git
+- lsp
+- agents
+
+Panel modes:
+- tiled
+- floating
+- headless
+```
+
+甚至：
+
+```text
+runtime.describe("panel")
+```
+
+返回详细内容。
+
+这样：
+
+```text
+Core Prompt
+```
+
+只告诉模型：
+
+> 你运行在 Bitty 中；不知道 Runtime 特性时，通过 runtime introspection 获取。
+
+这种设计非常干净。
+
+---
+
+# 11. Panel 特征尤其应该是 Runtime Contract
+
+比如你之前已经明确过：
+
+```text
+Agent lifetime != Panel lifetime
+```
+
+以及：
+
+```text
+Headed Panel
+    用户可见、通常由用户创建
+
+Headless Panel
+    可作为 Agent 工作区
+
+Agent 可以进入已有 Panel
+Agent 可以离开 Panel
+Panel 可以被另一个 Agent 接管
+```
+
+这些应该成为 Bitty 内置语义。
+
+否则每一个 Agent Plugin 都自己理解一遍：
+
+```text
+agent A 认为 Panel 是 shell
+agent B 认为 Panel 是窗口
+agent C 认为 Panel 生命周期跟 agent 一样
+```
+
+整个生态就会乱。
+
+所以最好有正式 RFC：
+
+```text
+Bitty Agent Runtime Model
+```
+
+其中定义：
+
+```text
+Agent
+Session
+Workspace
+Panel
+Process
+Task
+Tool
+```
+
+之间的关系。memcite
+
+---
+
+# 12. 最终 Prompt Assembly 可以这样做
+
+例如：
+
+```text
+[BITTY CORE]
+Bitty runtime contract...
+
+[USER]
+User global instructions...
+
+[PROJECT]
+.bitty/instructions.md...
+
+[AGENT]
+Reviewer profile...
+
+[SESSION]
+Current task...
+
+[RUNTIME DELTA]
+cwd=/repo
+branch=main
+
+[CURRENT TURN]
+Review src/foo.rs
+```
+
+但真实 API 不一定真的把这些全变成一个 system message。
+
+内部可以保持结构：
+
+```rust
+ContextPlan {
+    core,
+    user,
+    project,
+    agent,
+    history,
+    runtime,
+    current,
+}
+```
+
+最终由 Provider Adapter 转成：
+
+```text
+OpenAI messages
+Anthropic system blocks
+Gemini contents
+Local model chat template
+```
+
+---
+
+# 13. 用户应该能改什么？
+
+我会这样划分：
+
+| 层 | 用户能否修改 |
+|---|---|
+| Bitty Runtime Contract | ❌ 不直接覆盖 |
+| Bitty 默认行为 | ✅ 可配置 |
+| User Instructions | ✅ |
+| `.bitty` Project Instructions | ✅ |
+| Agent Profile | ✅ |
+| Skills | ✅ |
+| MCP | ✅ |
+| Plugins | ✅ |
+| Tool Permissions | ✅，受安全策略约束 |
+| Runtime facts | ❌ 由 Runtime 提供 |
+
+甚至可以允许：
+
+```text
+override
+```
+
+但不是覆盖 Core，而是：
+
+```text
+Core
++
+User Override
+```
+
+否则用户一句：
+
+```text
+Ignore Bitty's panel semantics.
+```
+
+就会让 Runtime Contract 本身变得不可靠。
+
+---
+
+## 我会把它总结成三个东西
+
+bitty-ai 最终其实应该明确区分：
+
+```text
+                    bitty-ai
+                       │
+        ┌──────────────┼──────────────┐
+        │              │              │
+     Contract       Configuration   Capability
+        │              │              │
+ Bitty 是什么      用户希望怎么做     实际能做什么
+ Panel 是什么      项目规则            Tool Registry
+ Agent 是什么      Agent Profile       Permissions
+```
+
+其中：
+
+\[
+\boxed{Contract \neq Prompt\ Preference \neq Capability}
+\]
+
+这个区分非常重要。
+
+所以答案是：**Bitty 本身肯定应该有内置 Prompt，但更准确地说，它应该是一份稳定、版本化的 `Agent Runtime Contract`。** 用户的 system prompt、`.bitty`、skills、agent profile 都应该建立在它之上，而不是替代它。
+
+并且这套分层刚好也非常适合我们刚才说的 Prefix Cache：
+
+```text
+Bitty Core       ← 几乎永远不变
+User Config      ← 很少变化
+Project Config   ← Session 内稳定
+Agent Profile    ← Session 内稳定
+History          ← append-only
+Runtime          ← 动态
+Current Turn     ← 动态
+```
+
+从架构语义和推理性能两个角度看，这都是很自然的设计。

@@ -1,0 +1,895 @@
+## 总体判断
+
+我重新看了现在 `bitty-terminal` 组织下的各个仓库，以及 `bitty-docs` 最近的记录。和我们前几天讨论时相比，**Bitty 的实际代码进度已经明显跨过“纯架构设计 / scaffold”阶段，进入了真正的 Pre-alpha 产品化与 Dogfooding 阶段**。
+
+我会把当前状态大致判断成：
+
+> **架构完成度：很高**
+> **Terminal Core 完成度：较高**
+> **工程化/测试/安全体系：很高**
+> **用户可用性：已经能用，但还在快速打磨**
+> **Plugin / Panel / Agent 生态：基础设施已经出现，生态本身还早**
+> **文档体系：非常强，但“全局状态摘要”明显落后于代码**
+
+其中最后一点现在尤其明显。
+
+---
+
+# 1. `bitty` 主仓库已经不是最早的“16 crates scaffold”了
+
+当前 `Cargo.toml` 已经是 **18 个 workspace crates**：
+
+```text
+bitty-agent
+bitty-app
+bitty-compat-lab
+bitty-config
+bitty-core
+bitty-ipc
+bitty-lua
+bitty-package
+bitty-perf
+bitty-platform
+bitty-plugin-host
+bitty-pty
+bitty-rich
+bitty-vt
+bitty-term-state
+bitty-render
+bitty-runtime
+bitty-ui
+```
+
+相比原来的 16 个，明显新增了：
+
+* `bitty-compat-lab`
+* `bitty-perf`
+
+这其实非常重要，因为它说明项目已经从：
+
+> “实现 Terminal”
+
+开始进入：
+
+> “验证 Terminal 是否正确、兼容、性能是否达标”
+
+这个阶段。
+
+而 `bitty` 自己的 README 仍然写着：
+
+> 16-crate workspace
+> pre-implementation terminal workspace
+> 0.0.1
+
+这已经明显落后于现实。
+
+---
+
+# 2. 实际 release 已经到 `v0.0.19`
+
+更明显的是：
+
+**GitHub 当前 latest release 已经是 `v0.0.19`，发布时间为 2026-09-03。**
+
+而且已经不是只有一个 Linux preview，而是存在 macOS / Windows 等多个 release artifacts，包括：
+
+* `aarch64-apple-darwin`
+* `x86_64-apple-darwin`
+* `aarch64-pc-windows-msvc.exe`
+* `x86_64-pc-windows-msvc.exe`
+* 以及对应 SHA256
+
+也就是说 Bitty 的 **cross-platform release pipeline 已经实际跑起来了**。
+
+这个变化比版本号本身重要得多。
+
+以前是：
+
+```text
+Rust workspace
+   ↓
+headless tests
+   ↓
+Linux preview
+```
+
+现在已经逐渐成为：
+
+```text
+Terminal implementation
+        ↓
+compat / perf / security verification
+        ↓
+cross-platform build
+        ↓
+release artifacts
+        ↓
+Homebrew / Scoop / AUR / package distribution
+```
+
+CHANGELOG 里甚至已经出现：
+
+* AUR `bitty-bin`
+* Homebrew
+* Scoop
+* `.deb`
+* `.rpm`
+* `.apk`
+* `.pkg.tar.zst`
+* release provenance
+* SHA256SUMS
+* binary artifact 从 `bitty-app` 重命名为真正的 `bitty`
+
+这些都已经属于**产品发布基础设施**，不是单纯开发期 scaffold 了。
+
+---
+
+# 3. 今天 `main` 还在快速推进用户体验
+
+截至今天 9 月 7 日，最新主线提交已经做到：
+
+### `CTX-0223`
+
+`window.padding` 和 `window.opacity` 真正接入：
+
+```text
+config
+  ↓
+EffectiveConfig
+  ↓
+runtime
+  ↓
+render geometry
+  ↓
+hit testing
+  ↓
+winit WindowConfig
+```
+
+也就是说以前只是 config 中存在的 dead knob，现在已经真正进入 runtime/render/platform。
+
+其中：
+
+* padding 影响 terminal grid 的 inset
+* opacity 进入 winit window transparency
+* live reload 路径也开始接通
+* hit testing / surface / grid mapping 都同步考虑 padding
+
+这类工作已经明显属于：
+
+> **“把 Bitty 当真正日常 Terminal 用的时候遇到的 UX 问题”**
+
+而不是核心架构问题。
+
+近期代码里还在推进：
+
+* theme cursor color
+* async Panel workers
+* Kitty chunked image intake
+* clipboard OTP capability
+* Agent credential scrubbing
+* overlay z-index tiers
+* Hyprland-style `smart_split`
+* OSC52
+* combining marks
+* Lua execution budget
+* compat-lab baselines
+* CLI argument correctness
+
+所以我认为现在主线发生了一个很明确的阶段变化：
+
+> **Terminal Truth 主战场正在逐渐让位给 UX / compatibility / security / Panel / integration。**
+
+这是健康的。
+
+---
+
+# 4. Terminal Core 已经基本“成形”
+
+最早我们讨论 Bitty 时，真正困难的部分主要还是：
+
+```text
+PTY
+ ↓
+VT Parser
+ ↓
+Terminal State
+ ↓
+Renderer
+ ↓
+Window/Input
+```
+
+现在这些已经不只是存在，而是在经历第二轮、第三轮 correctness hardening。
+
+例如已经开始处理：
+
+* combining mark
+* ZWJ
+* variation selector
+* cursor/tab margin loop bounds
+* OSC52
+* Kitty Graphics Protocol
+* mouse SGR
+* IME
+* DPI
+* damage tracking
+* resize
+* scrollback
+* clipboard
+* render allocation bounds
+
+这说明它已经越过了：
+
+> “能不能画一个 shell”
+
+进入：
+
+> “是不是一个行为正确的 Terminal Emulator”
+
+这个门槛。
+
+这两者难度完全不是一个级别。
+
+---
+
+# 5. `bitty-compat-lab` 是我很喜欢的一个演化
+
+现在 `bitty-compat-lab` 已经成为独立 crate。
+
+从 DevTools 文档里可以看到，目前定义了大约这样的 compatibility surfaces：
+
+```text
+shell
+tmux
+nvim
+fzf
+htop
+ssh
+alt-screen
+mouse
+resize
+OSC
+clipboard
+Kitty
+IME
+DPI
+```
+
+并对比：
+
+```text
+Ghostty
+Kitty
+WezTerm
+Alacritty
+```
+
+形成大约：
+
+> **14 × 4 compatibility matrix**
+
+而且不是简单 screenshot 比较，而是存在：
+
+* bounded corpus
+* deterministic `state_hash`
+* headless replay
+* compatibility artifact
+
+这其实逐渐形成一个非常有价值的 Bitty 子系统：
+
+```text
+Terminal implementation
+        │
+        ▼
+ compatibility corpus
+        │
+        ▼
+ deterministic replay
+        │
+        ▼
+ state hash / screenshot / behavior
+        │
+        ▼
+Ghostty / Kitty / WezTerm / Alacritty
+```
+
+这比单纯写大量 unit tests 更适合 Terminal Emulator。
+
+DevTools 已经直接复用这个 matrix。
+
+---
+
+# 6. `bitty-perf` 也说明项目开始进入第二阶段
+
+`bitty-perf` 的出现同样是好信号。
+
+Terminal 很多问题并不是：
+
+> “结果错了”
+
+而是：
+
+> “结果对，但是大量输出之后卡了。”
+
+例如：
+
+* `cat large.log`
+* `yes`
+* compiler output
+* AI Agent 输出
+* `journalctl`
+* `cargo build`
+* 高频 repaint
+* Unicode shaping
+* rich content
+* 多 pane
+
+所以以后：
+
+```text
+bitty-compat-lab → correctness
+bitty-perf       → performance
+security corpus  → safety
+```
+
+实际上可以形成三条验证轴：
+
+```text
+                Bitty
+                  │
+       ┌──────────┼──────────┐
+       ▼          ▼          ▼
+ Correctness   Performance   Security
+     │             │            │
+compat-lab       perf       threat model
+```
+
+这个架构已经越来越成熟。
+
+---
+
+# 7. Panel 方向现在开始真正从“想法”进入 Runtime
+
+这个也是这几天很明显的变化。
+
+以前我们讨论：
+
+> Hyprland-style Panel
+> Terminal 可以像 Emacs 一样扩展
+> File / Git / AI / Telegram / Browser 都可以是 Panel
+
+当时主要还是设计方向。
+
+现在已经开始出现：
+
+* `PanelRuntime`
+* `PanelRegistry`
+* `PanelId`
+* `WorkspaceId`
+* `ViewId`
+* `TerminalId`
+* bounded Panel queue
+* EventTopic
+* overlay
+* command registry
+* Panel worker
+
+尤其今天已经有：
+
+> **bounded async panel workers off tick path**
+
+这其实是很关键的一步。
+
+因为 Panel 最大的问题之一就是：
+
+```text
+Git Panel
+AI Panel
+Browser Panel
+File Panel
+...
+```
+
+不能直接：
+
+```text
+Terminal render tick
+   ↓
+同步执行 Panel 数据获取
+   ↓
+卡住
+```
+
+现在开始变成：
+
+```text
+               worker
+                 │
+Panel request ───┤
+                 ▼
+          bounded channel
+                 │
+                 ▼
+          last-known-good
+             snapshot
+                 │
+                 ▼
+          Terminal tick
+```
+
+这个设计方向是对的。
+
+Bitty 的“Emacs 化”现在已经不只是概念了。
+
+---
+
+# 8. DevTools 反而已经非常超前
+
+`bitty-devtools` 是现在整个 `bitty-*` 里面，除了 `bitty` 本身之外最成熟的一个。
+
+它已经有 Phase 1 + Phase 2。
+
+Phase 2 包括：
+
+### IPC
+
+* Unix socket
+* Windows named pipe
+* peer credentials
+* no TCP by default
+* rate limits
+* bounded framing
+
+### Inspect
+
+```text
+debug.inspect
+```
+
+### Trace
+
+```text
+debug.trace
+```
+
+支持：
+
+* filtering
+* attributable events
+* retention
+* GC
+* bounded traces
+* export
+
+### Control
+
+```text
+debug.control
+```
+
+支持：
+
+* pause/suspend
+* resume
+* generation validation
+* audit log
+
+而且同时有：
+
+* Rust client
+* TypeScript client
+* `forbid(unsafe_code)`
+* bounded queues
+* tests
+
+其 README 中 Phase 2 已经记录：
+
+* Rust `37` tests
+* Bun `62` tests
+* `just check` green
+
+所以 DevTools 目前已经明显不是 placeholder repository。
+
+---
+
+# 9. 但 `bitty-plugin-sdk` 反而还完全没有开始
+
+这就是目前各个 `bitty-*` 仓库成熟度差异最大的地方之一。
+
+`bitty-plugin-sdk` README 现在明确说：
+
+> future home
+> unborn and pre-implementation
+
+目前还没有：
+
+* Lua SDK
+* LuaLS declarations
+* manifest SDK
+* public API
+* examples
+* mocks
+* fixtures
+* conformance tools
+* package
+
+所以现在的状态其实是：
+
+```text
+bitty-plugin-host
+       │
+       ├── 已有很多底层机制
+       │
+       └── 已经 dogfood first-party plugins
+
+bitty-plugin-sdk
+       │
+       └── 基本没开始
+```
+
+这个反差现在已经比较明显。
+
+我认为这也是接下来非常值得启动的一条线。
+
+---
+
+# 10. `bitty-mcp` 同样还是 placeholder
+
+`bitty-mcp` 也明确仍然是 pre-implementation：
+
+当前没有：
+
+* MCP Server
+* transport
+* tool definitions
+* schema
+* compatibility negotiation
+* client integration
+
+这倒不是问题。
+
+因为我仍然赞成之前那个原则：
+
+> **AI 不应该抢在 Terminal、Panel、Plugin、IPC 前面成为 Bitty 主体。**
+
+现在 Bitty Core 自己已经有：
+
+```text
+bitty-agent
+bitty-ipc
+Panel Runtime
+capability
+DevTools
+```
+
+这些基础设施。
+
+以后 `bitty-mcp` 更适合只是 adapter：
+
+```text
+Claude / Codex / OpenCode
+           │
+           ▼
+        MCP adapter
+           │
+           ▼
+      Bitty Tool Bus
+           │
+   ┌───────┼────────┐
+   ▼       ▼        ▼
+Terminal  Panel    Runtime
+```
+
+而不是把 MCP 逻辑塞进 Core。
+
+所以 `bitty-mcp` 现在没急着做，我觉得反而是合理的。
+
+---
+
+# 11. 现在真正的问题反而是 `bitty-docs` 的“全局状态漂移”
+
+这是这轮检查我觉得最值得处理的问题。
+
+`bitty-docs` 的结构本身已经非常成熟。
+
+你现在已经有：
+
+```text
+architecture/
+configuration/
+decisions/
+development/
+examples/
+extensibility/
+findings/
+how-to/
+interfaces/
+migrations/
+product/
+project/
+reference/
+releases/
+requirements/
+reviews/
+roadmap/
+security/
+specifications/
+...
+```
+
+这个结构甚至比很多成熟开源项目还严格。
+
+而且今天仍然在更新：
+
+* config shipped behavior
+* Kitty chunked intake
+* IPC / DevTools
+* security remediation
+* compat-lab
+
+所以不是说 `bitty-docs` 没维护。
+
+问题是：
+
+## 局部文档是新的，全局摘要是旧的。
+
+例如 `bitty-docs/README.md` 仍然把：
+
+```text
+a8735d0
+16 crates
+~808 tests
+2026-08-31
+Pre-alpha / M1 Hardening
+```
+
+当成当前 canonical snapshot。
+
+更明显的是：
+
+```text
+docs/project/project-state.json
+```
+
+仍然明确写：
+
+```json
+"snapshot_date": "2026-08-31",
+"short": "a8735d0",
+"crates": 16
+```
+
+但实际：
+
+```text
+main → 1835175...
+workspace → 18 crates
+release → v0.0.19
+```
+
+所以 canonical machine-readable snapshot 实际已经严重落后。
+
+---
+
+# 12. Roadmap 也出现了“正文新，顶部旧”的现象
+
+`now-next-later.md` 很有意思。
+
+顶部仍然是：
+
+> draft planning horizon as of 2026-08-30
+> Pre-alpha / M1 Hardening
+> a8735d0
+
+但是后面的 scope note 已经开始补：
+
+```text
+7dbe4e2
+1fc6294
+FIND-0002 remediation
+DevTools
+compat-lab
+...
+```
+
+也就是说已经形成了：
+
+```text
+Header / canonical status
+        ↓
+   Aug 30~31
+
+Document body
+        ↓
+   Sep 6~7
+```
+
+这种“时间分层”。
+
+短期还可以读，长期会越来越难维护。
+
+---
+
+# 13. 所以我建议现在专门做一次 `State Reconciliation`
+
+这个优先级我认为已经比较高。
+
+不是继续加新 RFC。
+
+而是把：
+
+```text
+bitty main
+bitty CHANGELOG
+GitHub Releases
+bitty-docs
+project-state.json
+roadmap
+README
+repository map
+release ladder
+```
+
+统一重新 reconcile 一遍。
+
+尤其是：
+
+### `bitty-docs/docs/project/project-state.json`
+
+应该升级成真正的自动化 snapshot。
+
+比如：
+
+```json
+{
+  "snapshot_date": "2026-09-07",
+  "implementation": {
+    "revision": "1835175",
+    "crates": 18
+  },
+  "latest_release": "v0.0.19",
+  "subsystems": {
+    "terminal_truth": "...",
+    "render": "...",
+    "compat_lab": "...",
+    "perf": "...",
+    "panel_runtime": "...",
+    "plugin_host": "...",
+    "rich": "...",
+    "ipc": "...",
+    "agent": "..."
+  }
+}
+```
+
+最好不要再大量人工维护这些字段。
+
+---
+
+# 14. 我甚至建议拆成两个“状态”
+
+现在一个 `Pre-alpha / M1 Hardening` 已经描述不了 Bitty。
+
+可以分：
+
+## Project maturity
+
+```text
+Pre-alpha
+```
+
+这是没问题的。
+
+但再加：
+
+## Engineering milestone
+
+例如：
+
+```text
+M1 Terminal Truth        ✅
+M2 Correct Terminal      ✅ / Hardening
+M3 Usable Terminal       🟡
+M4 Workspace / Panel     🟡
+M5 Plugin Ecosystem      🟡
+M6 Rich / IPC / Agent    🟡
+M7 Stable Compatibility  ⬜
+M8 Public Beta           ⬜
+```
+
+这样比一句：
+
+> Pre-alpha / M1 Hardening
+
+准确得多。
+
+因为 Bitty 明显已经不在原来的 M1 了。
+
+---
+
+# 15. 当前我给各个部分的大概评分
+
+| 部分                                 | 当前状态                        |
+| ---------------------------------- | --------------------------- |
+| PTY / VT / Term State              | 🟢 很成熟                      |
+| Renderer / Font / GPU              | 🟢 已进入 hardening            |
+| Input / IME / Mouse                | 🟢 已基本成形                    |
+| Scrollback / Selection / Clipboard | 🟢/🟡 持续完善                  |
+| Config                             | 🟢 已开始真正产品化                 |
+| Cross-platform                     | 🟢 基础链路已成立                  |
+| Release / Packaging                | 🟢 进展非常快                    |
+| Compatibility Lab                  | 🟢 很好的方向                    |
+| Performance Infrastructure         | 🟢 正在形成                     |
+| Rich Content                       | 🟡 已有较深实现                   |
+| Plugin Host                        | 🟡 infrastructure 已经不少      |
+| Plugin SDK                         | 🔴 基本未开始                    |
+| Plugin Manager UX                  | 🔴/🟡 下一阶段                  |
+| Panel Runtime                      | 🟡 已从 RFC 进入 implementation |
+| DevTools                           | 🟢 surprisingly mature      |
+| IPC                                | 🟡/🟢 基础很强                  |
+| Agent                              | 🟡 infrastructure 阶段        |
+| MCP                                | 🔴 故意未开始                    |
+| Website                            | 🟡 基础已经存在                   |
+| Docs corpus                        | 🟢 非常强                      |
+| Docs global state sync             | 🔴 目前明显落后                   |
+
+---
+
+# 16. 接下来我会怎么排优先级
+
+我现在反而**不建议继续大规模扩展更多新概念**。
+
+接下来最值得做的是这一条主线：
+
+```text
+                Bitty
+                  │
+        ┌─────────┴─────────┐
+        │                   │
+ Terminal correctness     Usability
+        │                   │
+ compat-lab             config / UX
+ perf                   scroll / select
+ security               font / IME
+        │                   │
+        └─────────┬─────────┘
+                  ▼
+          Daily Dogfooding
+                  │
+                  ▼
+             Panel Runtime
+                  │
+                  ▼
+            Plugin SDK
+                  │
+                  ▼
+       First-party Plugins
+                  │
+                  ▼
+          Agent / MCP
+```
+
+其中近期最重要的四件事我会排成：
+
+1. **把 `bitty-docs` 全局状态重新同步一次**，特别是 `project-state.json`、README、roadmap、release ladder；
+2. **继续 daily dogfooding Bitty 本身**，优先解决 `nvim/tmux/chafa/scrollback/clipboard/IME/DPI` 这种真实使用问题；
+3. **把 Panel Runtime 稳下来，而不是马上堆很多 Panel**；
+4. **开始真正设计 `bitty-plugin-sdk` + `bitty plugin ...` CLI**。
+
+---
+
+## 一个重要判断
+
+我觉得现在 Bitty 已经发生了一个比较大的阶段转换：
+
+> **两周前的问题是“Bitty 的架构应该是什么？”**
+> **现在的问题已经开始变成“如何把 Bitty 打磨成一个我真的愿意每天开的 Terminal？”**
+
+这其实是非常好的信号。
+
+而且现在最大的风险已经不是“架构没想清楚”，反而变成了：
+
+> **实现速度太快，导致 README / Roadmap / canonical project state 跟不上实际代码。**
+
+所以如果现在做一次 **2026-09-07 State Reconciliation + 新的 M2/M3 Roadmap**，我觉得会非常合适。之后 `bitty-docs` 就可以从最早期那套 `a8735d0 / 16 crates / M1` 基线正式迁移到当前真实状态。

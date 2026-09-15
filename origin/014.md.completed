@@ -1,0 +1,825 @@
+# 总体判断
+
+这份 `013.md` 的主方向我很认可，尤其是三个架构判断已经逐渐形成 Bitty 自己的“骨架”：
+
+**Small Core + Mechanism/Policy 分离、`Panel != Terminal`、Lua is Glue。** 文档里已经把 Rust Core、Lua Policy、Panel Workspace 三层关系说得比较清楚了。
+
+但现在最大的风险不是“功能想得不够多”，而是**一些愿景层概念已经开始反过来侵入底层模型**。我会建议下一阶段少加功能，先把几个核心抽象重新校准。
+
+---
+
+## 1. 最需要修改的是 Session Restore
+
+目前文档把：
+
+> `TerminalRegistry`、`PTY Descriptor`、`LayoutTree`、scrollback
+
+都放进 Core，并认为可以在退出时保存、启动时恢复。
+
+这里需要拆成两个完全不同的问题：
+
+| 能力                                | 可以直接恢复吗       |
+| --------------------------------- | ------------- |
+| Window / Workspace / Panel layout | 可以            |
+| Tab / split / focus / cwd         | 可以            |
+| Scrollback snapshot               | 可以            |
+| Panel plugin state                | 可以            |
+| PTY 状态                            | 部分可以          |
+| **PTY 背后的真实进程**                   | **不能靠序列化恢复**  |
+| FD / PTY descriptor               | **进程退出后不能恢复** |
+
+也就是说：
+
+```text
+Session Restore
+├── Presentation Restore
+│   ├── Window
+│   ├── Workspace
+│   ├── LayoutTree
+│   ├── Panel state
+│   └── Scrollback
+│
+└── Execution Continuity
+    ├── shell process
+    ├── foreground job
+    ├── PTY
+    └── child process tree
+```
+
+后者如果你真的想做到像浏览器恢复一样，就不能只是：
+
+```text
+bitty GUI
+  └── PTY
+```
+
+而需要考虑：
+
+```text
+bitty-daemon / session-host
+        │
+        ├── PTY A ── zsh
+        ├── PTY B ── cargo
+        └── PTY C ── ssh
+             ↑
+             │ attach/detach
+             ↓
+        bitty GUI
+```
+
+这实际上已经接近 `tmux/zellij` 的 session server 思路。
+
+所以建议文档以后明确两个词：
+
+```text
+Restore     = 恢复 UI / 状态
+Persistence = 保持真实 execution session 存活
+```
+
+这是我认为整份文档里**最应该现在修改的一点**。
+
+---
+
+# 2. `Panel = 工位` 很好，但不要让它成为底层 Agent 模型
+
+“公司 → 楼层 → 工位 → 员工”的比喻非常适合产品层理解。当前文档把 Instance、Workspace、Panel、Agent 映射成公司、楼层、工位、员工，并引入了 Panel lease。
+
+但是底层最好不要真的变成：
+
+```text
+Agent occupies Panel
+```
+
+因为以后一定会出现：
+
+```text
+一个 Agent → 多个 Panel
+多个 Agent → 一个 Panel
+Agent → 无 Panel 后台任务
+Panel → 无 Agent
+Agent → Remote machine
+Agent → Headless executor
+Agent → Browser / MCP / SSH / container
+```
+
+更稳健的模型应该是：
+
+```text
+Agent
+  │
+  ├── owns / observes
+  ▼
+ExecutionContext
+  │
+  ├── TerminalExecution
+  ├── BrowserExecution
+  ├── TaskExecution
+  └── ToolExecution
+
+Panel
+  │
+  └── presents / interacts with
+          ↓
+    ExecutionContext
+```
+
+也就是：
+
+> **Panel 是 View，不是 Execution 本身。**
+
+这样未来：
+
+```text
+Agent A ─┬─ Terminal Panel
+         ├─ Diff Panel
+         └─ Log Panel
+
+Agent B ───────┘
+```
+
+都不会破坏模型。
+
+“工位”可以继续作为非常好的 UX metaphor，但不要成为 Core ontology。
+
+---
+
+# 3. `Lua owns ReAct Loop` 稍微过头了
+
+现在文档认为角色、Prompt、工具白名单、ReAct Loop、多轮会话树都由 Lua 编排。
+
+这里其实已经触碰到了你自己定义的：
+
+> Mechanism → Rust
+> Policy → Lua
+
+ReAct 的**策略**确实应该 Lua 化：
+
+```lua
+agent {
+    model = "...",
+    strategy = "...",
+    tools = {...},
+    max_turns = 20,
+}
+```
+
+但是这些最好属于 Host：
+
+```text
+Cancellation
+Timeout
+Token accounting
+Tool permission enforcement
+Concurrency
+Backpressure
+Retry
+Streaming lifecycle
+Resource quota
+Audit log
+Execution state machine
+```
+
+因此更合理的是：
+
+```text
+┌──────────────────────────────┐
+│ Lua Agent Policy             │
+│ prompt / routing / workflow  │
+└───────────────┬──────────────┘
+                ↓
+┌──────────────────────────────┐
+│ Agent Runtime                │
+│ scheduler / state / budget   │
+│ cancellation / permission    │
+└───────────────┬──────────────┘
+                ↓
+┌──────────────────────────────┐
+│ Model / Tool / Context APIs  │
+└──────────────────────────────┘
+```
+
+否则插件写一个：
+
+```lua
+while true do
+    model:generate(...)
+end
+```
+
+宿主还是必须拥有最终控制权。
+
+所以可以总结成一句：
+
+> **Lua owns orchestration; Host owns execution semantics.**
+
+这非常符合 Bitty 已经建立起来的哲学。
+
+---
+
+# 4. `32 KiB Context Budget` 不应该进入核心契约
+
+目前 `ContextProvider` 被定义成严格 32 KiB 上限，Rust AI 层也做 32 KiB Context Budget hard check。 
+
+我反而建议把这个删掉。
+
+因为 Context 的真正约束是：
+
+```text
+Model Context Window
+Token Budget
+Latency Budget
+Cost Budget
+Priority
+Freshness
+Information Density
+```
+
+而不是 bytes。
+
+甚至：
+
+```text
+32 KiB Chinese
+32 KiB Rust source
+32 KiB JSON
+32 KiB base64
+```
+
+token 数量都会差很多。
+
+更好的接口可能是：
+
+```rust
+ContextRequest {
+    max_tokens: Option<u32>,
+    max_bytes: Option<u64>,
+    priority: ContextPriority,
+    detail: DetailLevel,
+}
+```
+
+Provider 返回：
+
+```text
+ContextArtifact
+├── summary
+├── structured metadata
+├── references
+├── chunks
+└── provenance
+```
+
+这样 Agent 可以先得到：
+
+```text
+cargo test:
+127 tests
+3 failed
+critical error in parser.rs:218
+```
+
+需要时再：
+
+```text
+expand(context_id, section="failure-2")
+```
+
+这其实正好能服务你想做的“Agent 到隔壁工位看一眼”。
+
+---
+
+# 5. “日志存在显存里”这个思路要改
+
+文档具身 Agent 一节描述 2000 行日志可以保存在显存缓冲区，然后其他 Agent 只抓关键行。
+
+这里在架构上不要把 GPU 当 state storage。
+
+应该是：
+
+```text
+Terminal semantic state
+        │
+        ├── command blocks
+        ├── stdout/stderr
+        ├── OSC 133 metadata
+        ├── timestamps
+        └── exit status
+             │
+             ▼
+      CPU / persistent store
+             │
+             ▼
+      GPU render cache
+```
+
+GPU 应该只保存：
+
+```text
+visible glyph cache
+texture atlas
+vertex buffers
+render surfaces
+```
+
+Agent 应该读取的是：
+
+```text
+Semantic Command Store
+```
+
+而不是 framebuffer / VRAM。
+
+这样会自然得到一个非常强的 API：
+
+```text
+terminal.commands.list()
+terminal.commands.get(id)
+terminal.commands.output(id)
+terminal.commands.summary(id)
+terminal.commands.errors(id)
+```
+
+这个 API 对 Bitty AI 的价值可能比“直接读整个 terminal buffer”大很多。
+
+---
+
+# 6. Plugin Service Broker 的方向对，但 `Values, not handles` 不宜绝对化
+
+现在的设计要求跨插件调用经过 Rust Broker，Schema 校验并做 deep copy，明确：
+
+> Values, not handles. 
+
+安全思路是正确的。
+
+但未来一定会遇到：
+
+```text
+10 MB diff
+100 MB log
+image
+video stream
+LSP diagnostics stream
+Git index
+AI streaming response
+database result set
+```
+
+全部 deep copy 会成为问题。
+
+建议最终演化成：
+
+```text
+Small Value
+  → structured clone
+
+Large Immutable Resource
+  → ResourceId
+
+Stream
+  → bounded channel
+
+Privileged Object
+  → opaque capability handle
+```
+
+例如：
+
+```lua
+local stream = git:diff_stream()
+```
+
+这里的 `stream` 可以是：
+
+```text
+OpaqueHandle<GitDiffStream>
+```
+
+插件不能解引用，只能调用宿主暴露的方法。
+
+所以更准确的原则应该是：
+
+> **Never expose raw native handles. Use host-managed opaque capabilities.**
+
+这比 `Values, not handles` 更具有长期扩展性。
+
+---
+
+# 7. Provider 最好建立在更通用的 Service Protocol 之上
+
+现在定义了：
+
+```text
+PickerProvider
+StatusProvider
+ContextProvider
+```
+
+作为三大标准 Provider。
+
+这三种很实用，但我不建议称为“最终三大标准抽象”。
+
+因为之后很自然会出现：
+
+```text
+CommandProvider
+CompletionProvider
+ToolProvider
+PanelProvider
+ActionProvider
+DecorationProvider
+NotificationProvider
+SearchProvider
+```
+
+比较好的层级是：
+
+```text
+Host Service Broker
+        │
+        └── generic typed services
+               │
+               ├── UI conventions
+               │    ├── PickerProvider
+               │    └── StatusProvider
+               │
+               ├── AI conventions
+               │    ├── ContextProvider
+               │    └── ToolProvider
+               │
+               └── system services
+```
+
+也就是说：
+
+> `Provider` 是 Service Broker 上面的 convention，不应该成为 Broker 本身的限制。
+
+---
+
+# 8. Core / Plugin 的边界还可以再细化一次
+
+文档现在把 `shell-integration`、splits、terminal search 定为 Core，而 tabs/statusline/project/theme-switcher 等为 Lua。
+
+大方向对，但建议进一步分成：
+
+```text
+Mechanism          Policy
+────────────────────────────────
+OSC 133 parser      shell UX
+layout engine       splits command
+scrollback index    search UI
+palette primitive   theme switcher
+fuzzy matcher       palette UI
+panel compositor    tabs
+```
+
+因此不是：
+
+```text
+splits = Core
+```
+
+而是：
+
+```text
+LayoutTree + split primitive = Core
+split UX / mappings / strategy = Plugin
+```
+
+也不是：
+
+```text
+terminal search = Core
+```
+
+而是：
+
+```text
+Search/index primitive = Core
+Search panel + navigation behavior = Plugin
+```
+
+这会让你定义的 Mechanism/Policy 原则真正贯彻到底。
+
+---
+
+# 9. RichSurface 可能会成为 Bitty 最重要的 API 之一
+
+你现在把 Markdown、RichBlock、SceneNode 放在上层，WGPU 绘制留给 Core，这个判断非常对。
+
+但我建议不要让插件直接操作底层 `SceneNode`。
+
+否则几年后：
+
+```text
+SceneNode API == WGPU implementation ABI
+```
+
+很容易把实现细节暴露出去。
+
+可以设计：
+
+```text
+RichSurface
+  ├── Text
+  ├── RichText
+  ├── CodeBlock
+  ├── Image
+  ├── Stack
+  ├── Grid
+  ├── ScrollView
+  ├── Button
+  ├── Input
+  ├── Canvas
+  └── CustomSurface
+```
+
+然后内部：
+
+```text
+RichSurface
+    ↓
+Layout Tree
+    ↓
+Scene Graph
+    ↓
+WGPU
+```
+
+这样将来即使：
+
+```text
+wgpu → something else
+text renderer rewritten
+layout engine rewritten
+```
+
+插件 API 都不用动。
+
+这可能是 Bitty 未来和传统 terminal emulator 拉开差异最大的 API。
+
+---
+
+# 10. Sandbox 需要正式写 Threat Model
+
+文档已经大量强调：
+
+```text
+No Ambient Authority
+deny-by-default
+capability
+Rooted Module Resolution
+process.spawn:tool
+```
+
+这是很好的方向。
+
+但现在需要从“安全原则”升级成正式 Threat Model。
+
+尤其 Lua VM 是 **in-process sandbox**：
+
+```text
+Lua capability sandbox
+≠
+OS process isolation
+```
+
+Layer 4 Sidecar 才是另一个安全边界。文档明确禁止 `dlopen`，选择独立 helper process，这一点我很赞成。
+
+以后建议正式定义：
+
+```text
+Trust Level 0
+Core
+
+Trust Level 1
+Bundled Lua
+
+Trust Level 2
+Third-party Lua
+
+Trust Level 3
+Native Sidecar
+
+Trust Level 4
+External tools / MCP / network
+```
+
+然后每一层明确：
+
+```text
+filesystem
+network
+process
+clipboard
+environment
+credentials
+terminal input
+terminal output
+IPC
+GPU
+```
+
+哪些 capability 可以申请。
+
+Bitty 的插件体系以后能不能真正做大，这个甚至比 Lua API 本身更重要。
+
+---
+
+# 我尤其认可的一个变化
+
+文档里这一句实际上已经非常接近 Bitty 的真正产品定义：
+
+> 终端网格只是 Panel 的一种实现。
+
+所以我现在会更倾向于把 Bitty 定义成：
+
+```text
+Bitty
+=
+Programmable Workspace Runtime
++
+Terminal-native Execution Environment
+```
+
+而不是：
+
+```text
+Terminal Emulator + Plugins
+```
+
+Terminal 仍然是它的**根**，否则 Bitty 很容易变成一个泛 Electron/IDE；但 Panel / Workspace / Event / Capability / Lua 才逐渐成为它真正的系统模型。
+
+所以：
+
+```text
+Terminal is the origin.
+Panel is the primitive.
+Workspace is the environment.
+Lua defines policy.
+Rust guarantees mechanism.
+```
+
+这几句话其实可以发展成 Bitty architecture manifesto。
+
+---
+
+# “具身 Multi-Agent”也建议换一种技术表述
+
+“公司—楼层—工位—员工”这个设计作为演示和产品隐喻非常好。
+
+但技术论文/RFC 我建议改称：
+
+**Spatially Anchored Agent Runtime**
+
+或者：
+
+**Workspace-Anchored Multi-Agent Runtime**
+
+真正创新的地方并不是“Agent 像员工”。
+
+而是：
+
+```text
+Agent context
+不再只存在于 LLM conversation
+        ↓
+还锚定在 persistent execution environment
+        ↓
+Workspace / Panel / Terminal / Process / Artifact
+```
+
+传统：
+
+```text
+Agent A
+  ↓ token
+Agent B
+  ↓ token
+Agent C
+```
+
+Bitty：
+
+```text
+               Shared Workspace State
+              /        |          \
+         Agent A    Human       Agent B
+              \        |          /
+             persistent execution
+```
+
+这个表述技术含量要强得多。
+
+它实际上是在把：
+
+> **Context 从 conversation memory 提升为 environment state。**
+
+这可能是 `013.md` 里面最值得继续深入研究的思想。
+
+---
+
+# 我建议重新调整路线图
+
+当前路线是 Core → Plugin → Workspace → AI。
+
+我会稍微调整成：
+
+```text
+M0 — Architecture Contracts
+     ↓
+Terminal Truth
+Capability Model
+Resource Model
+Service Broker
+Panel/Execution separation
+
+M1 — Terminal Runtime
+     ↓
+PTY / VT / WGPU / OSC 133
+semantic command blocks
+
+M2 — Programmable Runtime
+     ↓
+Lua VM
+capabilities
+service RPC
+async runtime
+
+M3 — Workspace
+     ↓
+Panel
+LayoutTree
+Workspace
+Session Restore
+Event Bus
+
+M4 — Rich Application Platform
+     ↓
+RichSurface
+Picker
+Statusline
+Markdown
+Project
+Git
+
+M5 — bitty-ai
+     ↓
+Context graph
+Tool runtime
+Agent scheduler
+ExecutionContext
+
+M6 — Multi-Agent Workspace
+     ↓
+leases
+shared artifacts
+workspace awareness
+human-agent collaboration
+```
+
+尤其是 **M0 很重要**。
+
+现在 Bitty 已经过了“先写起来再说”的阶段。越到现在，`PanelId`、`WorkspaceId`、`ResourceId`、`ExecutionContextId`、`AgentId`、`GenerationId` 这些基础实体之间的关系越值得先确定。
+
+---
+
+## 最终评价
+
+`013.md` 最大的进步不是增加了 Matugen、Cava、AI、Markdown 这些具体功能，而是 Bitty 开始形成自己的**系统理论**：
+
+```text
+Small Core
+Stable APIs
+Capability Security
+Lua Policy
+Panel Abstraction
+Service Composition
+Persistent Workspace
+Semantic Terminal
+Agent Environment
+```
+
+但下一步我反而建议**停止继续横向扩功能一段时间**，专门做一份：
+
+> **`bitty-core-ontology.md` / `architecture-primitives.md`**
+
+把大约十个一级概念彻底定义清楚：
+
+```text
+Instance
+Workspace
+Panel
+Surface
+ExecutionContext
+Terminal
+Session
+Resource
+Service
+Agent
+```
+
+规定它们的 **ownership、lifetime、identity、persistence、permission、communication relationship**。
+
+一旦这一层确定下来，后面的 AI、Panel、插件、浏览器、文件管理器、Agent，基本都会自然落到这个模型中。
+
+目前我认为 **“Panel 与 Execution 分离” + “Session Restore 与 Process Persistence 分离”** 是最值得立刻写进规范的两个改动。它们会避免 Bitty 两个非常大的长期架构坑。

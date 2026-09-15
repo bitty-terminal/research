@@ -1,0 +1,469 @@
+# 013: Bitty 架构全景深度调研——从主题生态、插件体系到具身多智能体工作区 (Embodied Multi-Agent Workspace)
+
+> **归档位置**: `recording/research/013.md`  
+> **研究主题**: 终端外观与主题动态适配、富文本与语法高亮分层、插件复用与跨平台规范、会话恢复、Rust 二进制扩展机制、Neovim 到 Emacs 的哲学演进、bitty-ai 基础设施收敛、以及超越传统 TUI 的具身多智能体工作区架构。  
+> **对应规范**: `bitty-docs/docs/specifications/` (`ai-architecture.md`, `plugin-reuse-and-providers.md`, `panel-vision.md`, `panel-runtime-pre-study.md`, `rich-presentation-rfc.md`, `cli-contract-rfc.md`)。
+
+---
+
+## 目录
+
+1. [引言：Bitty 的架构愿景与技术定位](#一引言bitty-的架构愿景与技术定位)
+2. [主题与外观环境动态适配（Matugen 联动与热重载）](#二主题与外观环境动态适配matugen-联动与热重载)
+3. [富文本渲染、语法高亮与多媒体呈现（Glow、Bat、BiDi 与图片）](#三富文本渲染语法高亮与多媒体呈现glowbatbidi-与图片)
+4. [“Lua is Glue” 插件复用四层体系与系统 CLI 编排](#四lua-is-glue-插件复用四层体系与系统-cli-编排)
+5. [系统配置规范、XDG 布局与跨平台环境（Linux vs. Windows）](#五系统配置规范xdg-布局与跨平台环境linux-vs-windows)
+6. [浏览器级会话恢复（Session Restore & State Persistence）](#六浏览器级会话恢复session-restore--state-persistence)
+7. [高频多媒体流与音频可视化扩展（Cava 与 MPD/MPC）](#七高频多媒体流与音频可视化扩展cava-与-mpdmpc)
+8. [第一方内置插件分类哲学（Bundled Plugins Audit）](#八第一方内置插件分类哲学bundled-plugins-audit)
+9. [Rust 二进制与外部 CLI 扩展机制（对标 Cargo / Kubectl）](#九rust-二进制与外部-cli-扩展机制对标-cargo--kubectl)
+10. [“插件之上的插件”与 Provider 生态](#十插件之上的插件与-provider-生态)
+11. [哲学演进：从 Neovim 走向 Emacs 的现代系统重构](#十一哲学演进从-neovim-走向-emacs-的现代系统重构)
+12. [bitty-ai 基础设施设计：三大标准线协议与策略解耦](#十二bitty-ai-基础设施设计三大标准线协议与策略解耦)
+13. [超越传统 TUI 的原生 AI 工作区（Native Panel Workspace）](#十三超越传统-tui-的原生-ai-工作区native-panel-workspace)
+14. [终极突破：具身多智能体协作环境（公司-楼层-工位模型）](#十四终极突破具身多智能体协作环境公司-楼层-工位模型)
+15. [总结与架构演进路线图](#十五总结与架构演进路线图)
+
+---
+
+## 一、引言：Bitty 的架构愿景与技术定位
+
+Bitty 的产品定位在官方纲领中被概括为：
+
+> **“Small core. Stable API. Everything composable. Extensions own the experience.”**  
+> （核心小而精。稳定 API。万物皆可组合。扩展定义体验。）
+
+随着项目的演进，Bitty 已经超越了传统的单一 VT100/Xterm 终端模拟器，确立了一条清晰的演进路径：
+$$\text{Terminal Emulator} \longrightarrow \text{Programmable Terminal} \longrightarrow \text{Terminal Workspace} \longrightarrow \text{Extensible Application Shell}$$
+
+Bitty 的核心区别在于：
+
+1. **Rust 核心守护机制（Mechanism）**：负责真实 VT 状态机（Terminal Truth）、PTY 通信、WGPU 现代图形渲染、代数平铺合成器（Compositor）与基于无环境特权（No Ambient Authority）的能力沙箱；
+2. **Lua 负责定义策略（Policy）**：所有的外观样式、工作区编排、会话管理、工具调用与智能体工作流完全由 Lua 插件与配置动态装配；
+3. **打破 PTY 桎梏**：确立 **“Panel is not Terminal”** 原则，使终端网格仅仅成为工作区内众多面板（Panel）的其中一种特化表现形式。
+
+---
+
+## 二、主题与外观环境动态适配（Matugen 联动与热重载）
+
+### 1. 痛点分析
+
+现代 Linux 桌面（如 Hyprland、Niri 配合 Matugen）支持根据用户当前壁纸自动提取主色调，并生成 GTK、Btop、Ghostty、Waybar 的配色方案。终端模拟器若想实现壁纸切换时的平滑动态变色，必须具备零闪烁、运行时调色板实时热重载（Live Reload）能力。
+
+### 2. Bitty 现有机制与适配鸿沟
+
+- **热重载机制**：Bitty 的配置体系定义了 `ReloadClass::Live`，支持通过 CLI `bitty ctl config reload` 或检测配置文件变更触发免重启更新；
+- **现状缺口**：
+  1. 当前核心配置层尚未暴露完整的 16 色 ANSI 及背景/前景 Hex 颜色映射表结构体；
+  2. 动态色彩转义序列（如 `OSC 4` 动态改调色板、`OSC 10/11` 动态改前背景色）尚未全面覆盖；
+- **终极设计方案**：
+  - **模板联动模式**：Matugen 生成 `~/.config/bitty/theme.lua`，其中暴露颜色表：
+
+    ```lua
+    return {
+        background = "#1a1b26",
+        foreground = "#c0caf5",
+        palette = {
+            [0] = "#15161e", [1] = "#f7768e", [2] = "#9ece6a", [3] = "#e0af68",
+            [4] = "#7aa2f7", [5] = "#bb9af7", [6] = "#7dcfff", [7] = "#a9b1d6",
+            -- 高亮色 8-15 ...
+        }
+    }
+    ```
+
+  - **IPC 触发通知**：Matugen 的 hook 命令执行 `bitty ctl theme reload`，Bitty 核心在接收到 IPC 请求后，以单次 Render Pass 原子更新 GPU Uniform Buffer，整个过程无撕裂、无黑屏、无 PTY 重置。
+
+---
+
+## 三、富文本渲染、语法高亮与多媒体呈现（Glow、Bat、BiDi 与图片）
+
+### 1. Markdown 渲染应做成插件还是集成到 Core？
+
+- **核心结论**：**解析与排版逻辑做成插件/上层面板，GPU 图元渲染机制内置于 Core**。
+- **原因**：
+  - 如果做在 Core 内部，任何 Markdown 规范微调、HTML 标签容错或 MathJax 支持都会导致终端核心重新编译，违背 Small Core 原则；
+  - 如果完全依赖外部命令行工具（如子进程调用 `glow` 或 `bat`），其输出依然受限于 PTY 字符网格，无法实现点击展开、表单交互和独立高刷新；
+  - **正统架构**：Core 暴露声明式 `RichSurface`（包含 `RichBlock`、`SceneNode` 场景树），Lua 插件负责调用解析器将 Markdown 转换为场景树节点，由 WGPU 统一光栅化。
+
+### 2. 成熟 Rust 生态与候选 Crates
+
+- Markdown 解析：`pulldown-cmark`（CommonMark 标杆，极速事件驱动）或 `termimad`；
+- 代码语法高亮：`syntect`（Sublime Text 语法定义，兼容性好）或 `tree-sitter` 原生辅助进程；
+- 复杂文字与排版：
+  - 双向文字（BiDi）：`unicode-bidi`；
+  - 文本断行与塑形：`rustybuzz`（HarfBuzz 的纯 Rust 实现）；
+  - **重要原则**：依据 ADR-0004，双向文字（BiDi）严格限定在展示层处理，底层 VT 字符网格永远保持物理线性内存布局，杜绝逻辑坐标与物理光标映射混乱。
+
+---
+
+## 四、“Lua is Glue” 插件复用四层体系与系统 CLI 编排
+
+在 `bitty-docs/docs/specifications/plugin-reuse-and-providers.md` 中，Bitty 确立了严格的复用分层哲学，严禁插件私自向 Core 塞入未经审计的原生 Crate：
+
+```text
+       ┌──────────────────────────────────────────────┐
+       │   Layer 4: Native Helper Process (Sidecar)   │  高算力重型计算 (Tree-sitter, SQLite)
+       ├──────────────────────────────────────────────┤
+       │   Layer 3: Plugin Service (Inter-Plugin Bus) │  对等插件共享服务 (git-core, docker)
+       ├──────────────────────────────────────────────┤
+       │   Layer 2: System CLI (process.spawn:tool)   │  复用本机工具 (rg, fd, git, bat, matugen)
+       ├──────────────────────────────────────────────┤
+       │   Layer 1: Pure Lua (Rooted Resolution)      │  纯 Lua 脚本与前端胶水 (默认形态)
+       └──────────────────────────────────────────────┘
+```
+
+1. **Layer 1 (Pure Lua)**：默认形态。使用受限的 Lua 沙箱，允许在插件包内 vendor 纯 Lua 辅助库（如 `inspect.lua`），无外部依赖。
+2. **Layer 2 (System CLI)**：**“优先复用系统已安装工具，而不是在内部重新造轮子”**。
+   - 必须在 `bitty-plugin.toml` 中显式声明：
+
+     ```toml
+     [tools.rg]
+     required = false
+     version = ">=13"
+     args = ["--no-config"]
+     ```
+
+   - 宿主提供安全封装的异步派生 API：`bitty.process.spawn:tool`，禁止使用无沙箱特权的 `os.execute`。
+3. **Layer 3 (Plugin Service)**：对等插件协作层，下文详述。
+4. **Layer 4 (Native Helper Process)**：后 1.0 时代的编译型二进制辅助进程，用于承担解析、媒体、重索引等极限任务。
+
+---
+
+## 五、系统配置规范、XDG 布局与跨平台环境（Linux vs. Windows）
+
+### 1. Linux / BSD 环境（严格遵循 XDG Base Directory 规范）
+
+| 环境变量 / 目录    | 对应路径                | 存放内容与安全要求                                          |
+| :----------------- | :---------------------- | :---------------------------------------------------------- |
+| `$XDG_CONFIG_HOME` | `~/.config/bitty/`      | `init.lua`、`bitty-lock.json`、用户手工配置                 |
+| `$XDG_DATA_HOME`   | `~/.local/share/bitty/` | 已安装的第三方插件包、离线模板、会话历史数据                |
+| `$XDG_STATE_HOME`  | `~/.local/state/bitty/` | 运行日志、崩溃转储、持久化的会话快照、IPC 凭证              |
+| `$XDG_CACHE_HOME`  | `~/.cache/bitty/`       | 字体光栅化字形 Atlas 缓存、编译好的 Lua 字节码缓存          |
+| `$XDG_RUNTIME_DIR` | `/run/user/$UID/bitty/` | Unix Domain Socket 文件（如 `bitty-ipc.sock`，权限 `0600`） |
+
+### 2. Windows 原生环境对应映射
+
+- **漫游配置**：`%APPDATA%\bitty`（对应 `Roaming`，存放跨机器同步的 `init.lua` 与插件锁文件）；
+- **本地数据与状态**：`%LOCALAPPDATA%\bitty`（包含 `data/`、`state/`、`cache/`，避免漫游文件夹网络同步卡顿）；
+- **IPC 通道**：采用 Windows 原生 Named Pipe：`\\.\pipe\bitty-<username>-<instance-id>`；
+- **凭据存储**：通过 Windows Credential Manager 或 DPAPI（Data Protection API）加密存储 API Key，杜绝明文写入注册表或文本文件；
+- **文件权限**：利用 NTFS DACL 确保运行目录只对当前用户 SID 可读写。
+
+### 3. API Key 与敏感数据配置法则
+
+- **铁律**：API Key **绝对禁止硬编码在 `init.lua` 中**；
+- **正规途径**：
+  1. 环境变量桥接：在配置中声明环境变量名（如 `api_key_env = "ANTHROPIC_API_KEY"`）；
+  2. 操作系统 Keyring 机制：通过系统秘钥环（Secret Service API / Apple Keychain / Windows Credential Manager）以异步 API 请求获取；
+  3. 专用凭据存储：写入独立的安全存储区（权限强制 `0600`），经由宿主 `ai.provider` 授权审计后使用。
+
+---
+
+## 六、浏览器级会话恢复（Session Restore & State Persistence）
+
+### 1. 归属权裁决：必须属于 Core 原生能力
+
+- **结论**：**状态持久化与恢复引擎必须实现在 Core 内部**。
+- **架构必然性**：
+  1. **首帧零抖动（Zero-Jitter First Frame）**：如果是 Lua 插件来实现，启动时必须先启动窗口、再加载 Lua 虚拟机、再解析配置、再分屏。用户会看到窗口剧烈抽搐、空白闪烁数秒；而 Core 原生支持可以在创建窗口的第一帧直接把上次保存的 `LayoutTree` 几何尺寸与字符缓存完全填满；
+  2. **原子退出快照（Atomic Exit Flush）**：终端在接收到系统关机信号（`SIGTERM` / `WM_CLOSE`）时，分配给进程的退出时间往往只有几百毫秒。Core 可以在 C++ / Rust 级别直接将内存镜像刷入 `state.db`，若依赖 Lua 事件循环可能因超时被操作系统强杀导致状态撕裂；
+  3. **底层资源控制权**：`TerminalRegistry`、`PTY Descriptor`、`LayoutTree` 和滚动缓冲区属于 Core 的私有状态，上层插件无权直接抓取原始内存指针。
+
+### 2. 插件的边界职责
+
+- Core 负责**“怎么存、怎么复原物理现场”**；
+- 插件负责**“业务策略”**：定义多命名会话（如 “Work”、“Personal” 切换）、选择器 UI 面板、会话快照导入导出。
+
+---
+
+## 七、高频多媒体流与音频可视化扩展（Cava 与 MPD/MPC）
+
+在状态栏与面板中接入高频动态信息时，架构设计必须防范“重绘风暴”：
+
+### 1. MPD / MPC（事件驱动型）
+
+- **特征**：仅在歌曲切换、播放暂停时产生数据流；
+- **实现**：完全适合作为标准的 `StatusProvider`。通过在后台监听 `mpc idle player` 事件，触发后向上层状态栏抛出数据片段，系统开销极低。
+
+### 2. Cava 音频可视化（高频流媒体）
+
+- **特征**：30~60 FPS 高刷新，连续向标准输出发送频谱振幅字符；
+- **致命陷阱**：若直接塞入全局状态栏（Statusline），将迫使整个窗口和顶层布局每秒重绘 60 次，直接摧毁渲染性能与能耗比；
+- **正统解法**：
+  - **解法 A（独立面板）**：作为专用的分屏 `ViewContent::Panel` 运行，其刷新仅触发自身局部视口的脏矩形（Damage Rect）更新，与主编辑区完全隔离；
+  - **解法 B（流式控件隔离）**：状态栏分配固定宽度的字符单元格槽位，并在 GPU 渲染树中将其标记为独立的缓存图层（Cached Surface），局部像素更新不波及全屏。
+
+---
+
+## 八、第一方内置插件分类哲学（Bundled Plugins Audit）
+
+审计 `crates/bitty-plugin-host/src/bundled.rs` 中规划的 10 个第一方插件，其归属分工必须严格遵守“机制归 Core，策略归插件”：
+
+```text
+┌─────────────────────────┬──────────────┬────────────────────────────────────────────────────────┐
+│ 插件名称                │ 最终归属     │ 架构分界与设计考量                                     │
+├─────────────────────────┼──────────────┼────────────────────────────────────────────────────────┤
+│ **shell-integration**   │ **Core**     │ OSC 7/133 语义标记解析、光标模式注入，直接决定状态机   │
+├─────────────────────────┼──────────────┼────────────────────────────────────────────────────────┤
+│ **tabs**                │ **Lua 插件** │ 标签栏样式渲染、按键切标签逻辑；依赖 Core 提供的 View  │
+├─────────────────────────┼──────────────┼────────────────────────────────────────────────────────┤
+│ **statusline**          │ **Lua 插件** │ 状态栏布局容器，消费各方 StatusProvider 片段           │
+├─────────────────────────┼──────────────┼────────────────────────────────────────────────────────┤
+│ **palette**             │ **Lua 插件** │ 模糊匹配呼出弹窗；算法调用 Core fuzzy 宿主服务         │
+├─────────────────────────┼──────────────┼────────────────────────────────────────────────────────┤
+│ **project**             │ **Lua 插件** │ 项目目录探测、Git 根目录关联与会话绑定                 │
+├─────────────────────────┼──────────────┼────────────────────────────────────────────────────────┤
+│ **splits**              │ **Core**     │ 分屏几何计算与视口切割；必须由 Compositor 绝对掌控     │
+├─────────────────────────┼──────────────┼────────────────────────────────────────────────────────┤
+│ **search (Terminal)**   │ **Core**     │ 搜索终端屏幕与滚动缓冲区字符，避免将海量文本深拷贝给Lua│
+├─────────────────────────┼──────────────┼────────────────────────────────────────────────────────┤
+│ **search (Project)**    │ **Lua 插件** │ 复用外部 `rg` 进行全项目文件搜索                       │
+├─────────────────────────┼──────────────┼────────────────────────────────────────────────────────┤
+│ **theme-switcher**      │ **Lua 插件** │ 主题选择器交互；最终调用 Core 的调色板原子切换接口     │
+├─────────────────────────┼──────────────┼────────────────────────────────────────────────────────┤
+│ **bitty-ai**            │ **独立扩展** │ 严禁打入 Core 二进制，作为独立仓库按需分发             │
+└─────────────────────────┴──────────────┴────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 九、Rust 二进制与外部 CLI 扩展机制（对标 Cargo / Kubectl）
+
+对标 `cargo-xxx` 与 `kubectl-xxx`，Bitty 对二进制扩展设立了鲜明的“一禁两立”原则：
+
+### 1. 坚决禁止：In-Process `dlopen` / `cdylib`
+
+- **无稳定 ABI**：跨编译器或跨依赖版本的动态库加载极易引发 Undefined Behavior；
+- **崩溃传染（Fatal Crash）**：任何第三方原生库中的段错误或 Panic 会瞬间击毁主终端进程及其所有正在运行的 PTY；
+- **沙箱击穿（Sandbox Bypass）**：原生代码可任意解引用指针操纵显卡和内存，使 `bitty-plugin.toml` 的权限管控彻底失效。
+
+### 2. 支持形态 A：Cargo / Kubectl 风格的外部 CLI 子命令
+
+- **发现路径**：在 `$PATH` 或 `~/.local/share/bitty/bin/` 中检索 `bitty-<subcommand>`（如 `bitty-benchmark`）；
+- **调度路由**：用户调用 `bitty benchmark` 时，由 CLI 分发启动该独立进程；冲突时退回 `bitty x <vendor>.<cmd>`；
+- **通信机制**：该外部进程通过本地 IPC 接口（Unix Socket / Named Pipe）使用 `bitty ctl` 协议与运行中的 GUI 实例进行受控通信。
+
+### 3. 支持形态 B：Layer 4 进程外原生辅助进程（Sidecar）
+
+- **定位**：承担 Tree-sitter AST 解析、SQLite 历史全文索引等重型算力；
+- **安全铁律**：
+  1. 静态预编译并进行分平台绑定与 SHA-256 散列锁定；
+  2. 强制以子进程运行，通过 `stdio` 或匿名管道与宿主通信，绝不执行 `dlopen`；
+  3. 挂载于插件世代生命周期（Generation Lifecycle），插件卸载或崩溃时，辅助进程被自动回收。
+
+---
+
+## 十、“插件之上的插件”与 Provider 生态
+
+### 1. 禁止跨 VM 随意 `require`
+
+Bitty 中每个插件拥有独立的 Lua 虚拟机，遵循根定模块解析（Rooted Module Resolution）。插件 A 绝对无法直接 `require("plugin_b.internal")`，杜绝了命名空间污染与隐式循环依赖。
+
+### 2. 宿主服务总线（Host Service Broker）
+
+底层插件发布服务，高阶插件声明依赖并通过宿主获取接口：
+
+```toml
+# 底层插件 bitty-git 的 manifest
+[services.provided]
+"git.repository" = "2.0"
+```
+
+```lua
+-- 高阶插件（如 bitty-statusline 或 bitty-ai）调用服务
+local git = bitty.services:get("git.repository", { version = ">=2.0" })
+local branch = git.branch(bitty.terminal:cwd())
+```
+
+**安全边界**：跨插件调用在 Rust 宿主层完成 Schema 验证并执行值深拷贝（Values, not handles）。被调用插件以自身的沙箱权限运行，上层插件绝不会因此获得越权特权。
+
+### 3. 三大标准 Provider 抽象契约
+
+1. **`PickerProvider`**：向命令面板输出候选项源（如最近项目、SSH 会话列表）。单次呼出独占生效；
+2. **`StatusProvider`**：向状态栏/标签栏提供原子渲染片段（如 Git 分支状态、Cava 音频跳动、Token 消耗水线）。多路自动组合；
+3. **`ContextProvider`**：向核心自动化与 AI 层提供结构化的只读上下文快照（如当前选区、诊断树、CWD 路径）。受 32 KiB 严格预算截断保护。
+
+---
+
+## 十一、哲学演进：从 Neovim 走向 Emacs 的现代系统重构
+
+当 Bitty 将核心实体从单一的 `Terminal(PTY)` 抽象为通用的 `Panel` 时，**它在思想本质上已经从 Neovim 跃迁至了 Emacs**：
+
+### 1. 两种哲学的本质分歧
+
+- **Neovim**：Unix 哲学的坚守者，做极致纯粹的文本编辑器，其他一切皆通过外部工具管道连接；
+- **Emacs**：可扩展计算环境与应用底座。一切皆是 Buffer，文本编辑只是其中一个功能，邮件、目录树、网页浏览皆能由其承载；
+- **Bitty**：确立了 `Panel != Terminal`。终端网格只是 Panel 的一种实现，它天然能挂载 `MarkdownPanel`、`WebViewPanel`、`VideoPanel`、`AIPanel`。**Bitty 正是以现代图形技术构建的全新“Emacs 级可编程开发栖息地”。**
+
+### 2. 为什么“高度可自定义”才是真正的护城河？
+
+在现代终端领域，单凭“高性能”（吞吐量多大、渲染多少 FPS）无法形成壁垒，因为各大竞品在此维度已逼近硬件极限；而“开箱即用、功能丰富”往往会把软件做成臃肿难以拆卸的泥潭。
+**Bitty 的真正价值在于“数字黏土般的高可塑性”**：核心提供坚如磐石的原语，用户完全可以通过几行 Lua 把它塑造成极简纯 VT 终端，或是无所不能的 AI 研发工作站。
+
+### 3. 吸取传统 Emacs 的教训，用现代工程予以治愈
+
+| 历史陷阱       | GNU Emacs 的历史包袱               | Bitty 的现代工程解法                               |
+| :------------- | :--------------------------------- | :------------------------------------------------- |
+| **并发卡顿**   | 单线程阻塞，脚本跑网络整个界面卡死 | Rust 核心守护 PTY/GPU 热路径；Lua 独立 VM 异步运行 |
+| **状态污染**   | 全局变量随意篡改与 Monkey-patching | Rooted Module 隔离 + 清单显式依赖 + Host 服务总线  |
+| **安全裸奔**   | 恶意包可肆意读写敏感文件或提权     | 严格遵循 Deny-by-default Capabilities 沙箱治理     |
+| **冷启动劣化** | 配置越多启动越慢                   | 静态 Manifest 声明，未触发前连 Lua VM 都无需创建   |
+
+---
+
+## 十二、bitty-ai 基础设施设计：三大标准线协议与策略解耦
+
+### 1. 架构定位
+
+`bitty-ai` 绝不打入终端 Core 二进制。Core 只保留通用的 `bitty-agent` 骨架与 `bitty-mcp` 适配器。需要内置 AI 体验的用户通过独立仓库安装 `bitty-ai`。
+
+### 2. 机制收敛：Rust 只做最脏的三大标准线协议
+
+Rust 绝对不写针对 50 个厂商的胶水代码，而是收敛实现 3 个被全球工业界普遍接受的标准协议：
+
+1. **`openai_compatible`**（`/v1/chat/completions`）：覆盖 OpenAI、OpenRouter、DeepSeek、Ollama、vLLM 等；
+2. **`anthropic_messages`**（`/v1/messages`）：覆盖 Claude 3/3.5/3.7 全系列；
+3. **`gemini_content`**（`:generateContent` / `:streamGenerateContent`）：覆盖 Google Gemini 系列。
+
+Rust 层负责连接池、TLS、SSE 协议流解析、打字机背压控制与 32 KiB Context Budget 硬检查。
+
+### 3. 策略解耦：厂商预设（Provider Presets）全部交给 Lua
+
+相比 OpenCode 将模型列表和参数写死在二进制中导致更新滞后，Bitty 采用纯 Lua 预设表：
+
+```lua
+-- 厂商预设在 Lua 中自由扩展，零编译、即改即用
+local providers = {
+    deepseek = {
+        protocol = "openai_compatible",
+        base_url = "https://api.deepseek.com",
+        models = { "deepseek-chat", "deepseek-reasoner" },
+    },
+    ollama = {
+        protocol = "openai_compatible",
+        base_url = "http://localhost:11434/v1",
+        requires_api_key = false,
+    }
+}
+```
+
+用户在 `init.lua` 中修改 Base URL、添加内网私有模型代理仅需几秒钟。
+
+### 4. Agent、Subagent 与 Harness 完全由 Lua 编排
+
+- 角色定义、System Prompt、工具权限白名单均通过 Lua 声明；
+- 思维链执行回路（ReAct Loop）由 Lua 调度；
+- 多轮会话树管理与 Slash 命令完全由 Lua 插件掌控。
+
+---
+
+## 十三、超越传统 TUI 的原生 AI 工作区（Native Panel Workspace）
+
+传统 CLI 工具（Claude Code、OpenCode、Aider）之所以无法提供流畅的多面板协作，是因为它们受困于 **PTY 字符网格物理限制**（无法随意开辟侧边栏、滚动重绘撕裂、ANSI 转义序列脆弱、无原生多媒体）。
+
+Bitty 依托自身的 GPU 合成器与场景树实现了升维体验：
+
+```text
+┌───────────────────────────────── Bitty Native Workspace ─────────────────────────────────┐
+│                                                                                          │
+│  ┌────────────────────── Panel 1 (Terminal) ──────────────────────┐  ┌── Panel 2 (Side) ──┐  │
+│  │ $ cargo test                                                  │  │ [Context Gauge]    │  │
+│  │ error[E0308]: mismatched types                                │  │ 12.4 / 32 KiB      │  │
+│  │    --> src/main.rs:42:15                                      │  │                    │  │
+│  │                                                               │  │ [Active Tools]     │  │
+│  │                                                               │  │ ✓ git.diff  ✓ fs   │  │
+│  └───────────────────────────────┬───────────────────────────────┘  │                    │  │
+│                                  │ terminal.command-finished         │ [TODO Checklist]   │  │
+│                                  │ (OSC 133 Zone Event)              │ [x] Fix types      │  │
+│                                  ▼                                  │ [ ] Re-run tests   │  │
+│  ┌────────────────────── Panel 3 (AI Workspace) ──────────────────┐  └────────────────────┘  │
+│  │ 🤖 检测到编译错误，建议应用以下 Patch：                          │                          │
+│  │ ┌────────────────────────────────────────────────────────────┐ │                          │
+│  │ │ -    let count: u32 = buf.len();                          │ │                          │
+│  │ │ +    let count: usize = buf.len();                        │ │                          │
+│  │ └────────────────────────────────────────────────────────────┘ │                          │
+│  │ [ Enter: Apply Patch ]   [ Esc: Discard ]                    │ │                          │
+│  └───────────────────────────────────────────────────────────────┘                          │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+1. **Rich Presentation 场景树**：Markdown、折叠卡片、带颜色的 Diff 补丁以矢量级 UI 渲染，滚动零闪烁；
+2. **Side Inspector 侧边面板**：以声明式面板挂载，实时监控 Token 预算水线、活动 Skills 与动态 TODO 树；
+3. **真实图形支持**：生成的架构图、UI 原型直接以 GPU 纹理节点呈现，彻底告别 ASCII 字符图；
+4. **Inter-Panel Event Bus（面板间事件总线联动）**：
+   - 终端面板跑测试报错 $\rightarrow$ 触发 `terminal.command-finished`（携带退出码与行号）；
+   - AI 面板毫秒级捕捉事件 $\rightarrow$ 抓取错误上下文并自动生成修复建议；
+   - 侧边栏面板同步高亮任务进度；
+   - 用户敲击回车应用补丁 $\rightarrow$ 自动通知终端面板重跑测试。
+
+---
+
+## 十四、终极突破：具身多智能体协作环境（公司-楼层-工位模型）
+
+当前市面上的 Commander-Subagent 框架最大的弊端是：**“虽叫团队，但彼此都在无物理空间的小黑屋里，全靠主进程将成千上万的 Token 来回搬运”**。
+
+Bitty 提出的具身物理空间模型，在工程上构建了划时代的范式转变：
+
+```text
+                                [ Bitty 进程 ] ── (科技公司)
+                                       │
+            ┌──────────────────────────┴──────────────────────────┐
+            ▼                                                     ▼
+      Workspace 1 ── (一层楼：开发环境)                     Workspace 2 ── (二层楼：审核环境)
+            │                                                     │
+     ┌──────┴──────┐                                       ┌──────┴──────┐
+     ▼             ▼                                       ▼             ▼
+  Panel A       Panel B                                 Panel C       Panel D
+  (工位1)        (工位2)                                 (工位3)        (工位4)
+  [Busy]        [Idle]                                  [Occupied]    [Interactive]
+  Coder-Agent   空闲等待接入                            Reviewer-Agent 人类同事
+```
+
+### 1. 物理映射体系
+
+- **Instance（进程） = 科技公司**：统一的地址空间、GPU 资源池与安全权限控制基座；
+- **Workspace（工作区） = 楼层**：不同业务条线的分隔（前端开发、后端测试、架构文档）；
+- **Panel（面板） = 工位**：
+  - 拥有唯一的 `PanelId`、业务描述与租约状态机：`Idle`（空闲）、`Occupied(AgentId)`（被某智能体租用）、`Suspended`（挂起/现场保留）；
+  - 工位上运行着实际的“设备”：可能是 PTY 终端、浏览器视图或 Markdown 渲染器。
+- **Agent = 穿梭于各工位开展工作的员工**：按需申请工位、执行任务、释放租约；
+- **Inter-Panel Event Bus = 走廊与内部局域网**：广播工作状态与事件通知。
+
+### 2. 为什么能带来革命性的工程体验？
+
+1. **语义级 Token 极致节省（从全量搬运到视线查阅）**：
+   - Agent A 在工位 1 编译代码产生了 2000 行日志，由于 Core 拥有 OSC 133 语义标记与输出折叠机制，冗长日志直接保存在显存缓冲区；
+   - Agent A 只需向总线广播：“工位 1 构建完成”；
+   - Agent B 就像走到隔壁工位“看了一眼屏幕”一样，**仅抓取摘要和关键行**，无需在两个模型上下文之间进行巨额复制。
+2. **真实办公现场的“挂起与保留”**：
+   - 临时切换任务时，工位现场原样保留（Preserved Generation State）；
+   - 后续接手的其他 Agent 或人类切入时，案发现场完好无损，无需重新搭建上下文。
+3. **人类与 Agent 的平权共生（Human as a Co-worker）**：
+   - 人类不再是对着黑盒发号施令的“局外人”，**人类自己也是坐在这个公司里的一个核心员工**；
+   - 人类可以在各个 Workspace 之间巡视，看到某个 Agent 卡住了，直接敲击键盘输入修正代码，随后告诉 Agent 继续执行，实现真正无缝的人机协同。
+
+---
+
+## 十五、总结与架构演进路线图
+
+通过本次调研，Bitty 确立了面向未来的核心架构路线：
+
+```text
+  【阶段一：坚实机制基础 (M1-M2)】
+  • 完善 PTY、VT 状态机、WGPU 渲染管线与 OSC 7/133 语义分区
+  • 落地单进程隔离沙箱、XDG/Windows 规范路径与会话恢复引擎
+
+  【阶段二：插件平台与 Provider 生态 (M3)】
+  • 跑通 Lua 根定模块解析、清单能力引擎与“Lua is glue”四层复用
+  • 开放 Host Service Registry (bitty.services:get) 与标准三大 Provider
+
+  【阶段三：可编程工作区 (Workspace Compositor & Panel)】
+  • 落地 Panel Compositor 原生平铺与代数弹性布局 (Panel != Terminal)
+  • 激活 Inter-Panel Event Bus，实现跨面板超低延迟消息广播
+
+  【阶段四：AI 原生终端生态 (bitty-ai & Embodied Multi-Agent)】
+  • 建立 bitty-ai 独立仓库，收敛 3 大标准线协议基础设施
+  • 落地 Lua 智能体策略生态，开启“公司-楼层-工位”具身多智能体协作新纪元
+```
+
+Bitty 的终极愿景不是成为另一个“跑分更快的显示终端”，而是成为**极客与资深系统工程师赖以生存的、完全由自身意志定制的现代数字化栖息地**。

@@ -1,0 +1,1056 @@
+## 总体结论
+
+这次比上次好了很多，**核心方向已经基本对了**。我现在不会再建议你重构整个 `bitty-ai` 架构；剩下的主要是“去重 + 定义边界 + 状态同步”。
+
+目前最合理的主体已经出现：
+
+```text
+bitty
+├─ bitty-agent        # generic Agent protocol/vocabulary
+├─ bitty-ipc          # generic IPC/auth/scope/transport
+└─ terminal host primitives
+
+bitty-ai
+├─ bitty-ai-runtime   # AI-specific runtime mechanism
+└─ bitty-ai-slice     # cross-repo pressure/integration test
+
+bitty-ai-docs
+└─ AI-specific architecture/specifications
+```
+
+尤其 `bitty-ai-runtime` 现在明确是 deterministic、single-agent、`std` only，并且把 network、credential、consent ledger、capability enforcement、MCP transport 等 host-owned 部分留在 seam 后面，这个边界比之前清晰很多。
+
+不过我现在还能看到 **4 个比较重要的问题 + 几个次要问题**。
+
+---
+
+# 1. 最明显的问题：`bitty-ai-core` 应该可以直接删了
+
+这是目前最明确的一处自相矛盾。
+
+你的 `implementation-profile-v0.1.md` 已经明确说：
+
+> single `bitty-ai-runtime` crate
+> `bitty-ai-core` name is avoided because it collides with Bitty Core
+> `bitty-ai-core` remains a conceptual layer, not a crate assignment
+
+但当前 workspace 仍然有：
+
+```toml
+members = [
+    "crates/bitty-ai-core",
+    "crates/bitty-ai-slice",
+    "crates/bitty-ai-runtime",
+]
+```
+
+而 `bitty-ai-core` 里面还是纯 placeholder：
+
+```rust
+pub mod placeholder {
+    pub fn init() {}
+}
+```
+
+并写着：
+
+> Real implementation will follow after architecture documentation is complete.
+
+这已经没有存在价值了。
+
+### 我建议直接删除
+
+最终：
+
+```text
+crates/
+├── bitty-ai-runtime/
+└── bitty-ai-slice/
+```
+
+以后如果真的出现需要拆 crate 的证据，再演化成：
+
+```text
+bitty-ai-runtime
+bitty-ai-provider
+bitty-ai-context
+...
+```
+
+而不是保留一个叫 `core` 的空壳。
+
+这是我现在最推荐立即做的 cleanup。
+
+---
+
+# 2. 更重要的问题：`bitty-ai-slice` 和 `bitty-ai-runtime` 正在形成“两套 AI Runtime”
+
+这是现在最大的架构风险。
+
+当前 `bitty-ai-slice` 自己拥有：
+
+```text
+bridge
+context
+provider
+session
+stream
+toolbus
+```
+
+而新的 `bitty-ai-runtime` 又拥有：
+
+```text
+agent
+context
+provider
+session
+stream
+tool
+```
+
+也就是说现在实际上是：
+
+```text
+                bitty-ai
+                   │
+        ┌──────────┴──────────┐
+        │                     │
+bitty-ai-slice         bitty-ai-runtime
+        │                     │
+ provider                  provider
+ context                   context
+ session                   session
+ stream                    stream
+ toolbus                   tool
+```
+
+短期作为 prototype 很正常。
+
+**长期绝对不能保持这样。**
+
+---
+
+## `bitty-ai-slice` 应该退化成 Integration Harness
+
+你自己的 v0.1 profile 已经说：
+
+> `bitty-ai-slice` kept permanently as the end-to-end pressure test
+
+这点我赞成。
+
+但“永久保留”不应该意味着永久保留第二套实现。
+
+最终应该变成：
+
+```text
+bitty-ai-slice
+├── IpcBridge
+├── FakeBittyHost
+├── integration fixtures
+└── end-to-end tests
+        │
+        ├──── bitty-ai-runtime
+        │
+        └──── bitty-ipc
+```
+
+也就是：
+
+```toml
+[dependencies]
+bitty-ai-runtime = { path = "../bitty-ai-runtime" }
+bitty-ipc = { git = "...", rev = "..." }
+```
+
+而不是现在只依赖 `bitty-ipc`。
+
+逐渐删掉：
+
+```text
+slice/provider.rs
+slice/context.rs
+slice/session.rs
+slice/stream.rs
+slice/toolbus.rs
+```
+
+只留下 host bridge / fixtures。
+
+这样 pressure test 真正测试的是：
+
+> **real bitty-ai-runtime × real generic Bitty primitives**
+
+而不是：
+
+> 一个单独写出来的 mock AI runtime × Bitty primitives。
+
+这是我认为接下来优先级最高的结构性工作。
+
+---
+
+# 3. `bitty-agent` 与 `bitty-ai-runtime` 又出现 vocabulary duplication
+
+这个比上一次已经好很多，因为你把 `bitty-agent` 修正成了：
+
+> generic Agent protocol and bounded message vocabulary
+
+而且明确：
+
+> Model selection, auth, consent, streaming, real tool dispatch, compaction, MCP transport live outside this crate.
+
+这正是我们之前讨论的定位。
+
+但是新的 `bitty-ai-runtime` 又定义了：
+
+```rust
+AgentId(pub u64)
+AgentSession
+SessionState
+ToolSpec
+ToolRegistry
+```
+
+而 `bitty-agent` 也有：
+
+```text
+AgentId
+AgentSession
+ToolSpec
+ToolRegistry
+ToolCall
+ToolResult
+```
+
+问题不在于“不能有两个 Session”。
+
+问题是它们现在**同名但语义不同**。
+
+---
+
+## 最明显的是 `AgentId`
+
+`bitty-agent`：
+
+```text
+AgentId = owner.name
+```
+
+是 generic protocol identity。
+
+`bitty-ai-runtime`：
+
+```rust
+pub struct AgentId(pub u64);
+```
+
+而且注释写的是：
+
+> Logical agent handle.
+
+这两个其实不是同一种东西。
+
+我建议明确拆成：
+
+```rust
+// generic protocol identity
+bitty_agent::AgentId
+// e.g. "bitty-ai.coder"
+
+// runtime-local object identity
+AgentInstanceId(u64)
+
+// one invocation
+RunId(u64)
+
+// one context/history scope
+SessionId(u64)
+
+// one side-effect attempt
+ExecutionId(u64)
+```
+
+于是：
+
+```text
+AgentId
+   │
+   └── AgentInstanceId
+           │
+           ├── RunId
+           ├── SessionId
+           └── ExecutionId
+```
+
+这个模型就非常清晰。
+
+---
+
+# 4. `ToolSpec / ToolRegistry` 也建议变成 extension，而不是重新定义 protocol
+
+现在 AI Runtime 的：
+
+```rust
+ToolSpec {
+    name,
+    description,
+    schema_json,
+    required_scope,
+    read_only,
+}
+```
+
+而 `bitty-agent` 已经有 generic：
+
+```text
+ToolSpec
+ToolCall
+ToolResult
+ToolRegistry
+```
+
+而且还已经有比较完整的 credential scrubbing / bounded payload 逻辑。
+
+所以长期更合理的是：
+
+```rust
+struct AiToolBinding {
+    spec: bitty_agent::ToolSpec,
+
+    required_scope: ScopeRef,
+    effect: ToolEffect,
+}
+```
+
+例如：
+
+```rust
+enum ToolEffect {
+    ReadOnly,
+    Mutating,
+    External,
+}
+```
+
+AI runtime 增加的是：
+
+```text
+authorization metadata
+AI dispatch policy
+provider exposure
+effect semantics
+```
+
+而不是再造一套 generic tool wire vocabulary。
+
+---
+
+# 5. 但我不建议 `bitty-ai-runtime` 现在直接强依赖整个 `bitty`
+
+这里需要稍微克制一点。
+
+现在 runtime：
+
+```toml
+[dependencies]
+# No dependencies: std only.
+```
+
+这其实是一个非常漂亮的测试阶段设计。
+
+所以可以分两步：
+
+### v0.1 skeleton
+
+继续：
+
+```text
+bitty-ai-runtime
+    std only
+```
+
+但把类型语义改清楚：
+
+```text
+AgentInstanceId
+RuntimeSession
+RuntimeToolBinding
+```
+
+### integration phase
+
+再增加：
+
+```text
+bitty-ai-bridge
+        │
+        ├── bitty-agent vocabulary mapping
+        ├── bitty-ipc
+        └── bitty-ai-runtime
+```
+
+甚至：
+
+```text
+bitty-ai
+crates/
+├── bitty-ai-runtime
+├── bitty-ai-bridge
+└── bitty-ai-slice
+```
+
+我现在其实越来越倾向这个三 crate 结构：
+
+```text
+runtime = pure AI mechanism
+bridge  = Bitty integration
+slice   = end-to-end verification
+```
+
+非常干净。
+
+---
+
+# 6. `ModelProvider` ownership 现在需要重新写清楚
+
+这是 docs 最大的架构问题。
+
+`ai-architecture.md` 目前写：
+
+> ModelProvider registry is host-owned
+
+甚至还有：
+
+> The registry lives in Rust (`bitty-agent` or `bitty-runtime`, owning crate deferred)
+
+而新的 AI Runtime 本身已经实现：
+
+```rust
+trait ModelProvider
+FakeProvider
+ModelDescriptor
+list_models()
+complete()
+```
+
+并且 `provider.rs` 自己仍写：
+
+> a host-owned model registry surface
+
+这里应该明确“host-owned”到底是什么意思。
+
+---
+
+## 我建议拆成两个 ownership
+
+### AI Runtime owns
+
+```text
+ModelProvider abstraction
+ProviderRegistry logical model
+model descriptors
+model capability matching
+provider lifecycle
+stream orchestration
+request budgeting
+provider selection policy primitives
+```
+
+### Bitty Host owns
+
+```text
+credentials
+network capability
+consent
+secret storage
+host policy
+connection permission
+audit
+```
+
+即：
+
+```text
+          bitty-ai-runtime
+     ModelProvider / Registry
+              │
+              ▼
+        Provider Request
+              │
+              ▼
+           Bridge
+              │
+        host authorization
+        network / secret
+              │
+              ▼
+          actual provider
+```
+
+所以：
+
+> registry **mechanism** belongs to `bitty-ai`;
+> authority to actually reach network/secrets belongs to host.
+
+这跟你一直坚持的：
+
+> Core implements mechanism, policy/authority separated
+
+更一致。
+
+我不建议再让：
+
+```text
+bitty-runtime
+```
+
+拥有 AI Model Registry。
+
+否则 `bitty-ai` 又不独立了。
+
+---
+
+# 7. `AgentLevel` 现在有一个潜在安全 footgun
+
+目前：
+
+```rust
+Inspect    = 0
+Own        = 1
+Workspace  = 2
+All        = 3
+```
+
+然后：
+
+```rust
+includes(other) {
+    self.rank() >= other.rank()
+}
+```
+
+作为 UX profile 没问题。
+
+但是千万不要最终让：
+
+```text
+AgentLevel::Workspace
+```
+
+本身成为授权证明。
+
+因为：
+
+```text
+workspace
+```
+
+不是天然包含：
+
+```text
+filesystem.write
+process.spawn
+network.connect
+clipboard.write
+terminal.input
+```
+
+真正 authority 应该仍然是：
+
+```text
+AgentLevel
+    = policy preset / UX tier
+
+CapabilitySet + ConsentLedger
+    = actual authority
+```
+
+所以甚至可以考虑未来把：
+
+```rust
+AgentLevel
+```
+
+改名：
+
+```rust
+AgentMode
+AuthorityProfile
+AgentScopeProfile
+```
+
+避免别人看到：
+
+```rust
+level.includes(...)
+```
+
+以后拿它直接做安全判断。
+
+你现在 ToolBus 已经做对了——真正 dispatch 还要经过 `ToolAuthorizer`，而且缺失 authorizer 默认 deny。
+
+所以这个目前是**设计预防项，不是 bug**。
+
+---
+
+# 8. `ToolRegistry` 有一个很具体的小问题：重复名称
+
+当前：
+
+```rust
+pub fn register(&mut self, spec: ToolSpec) -> Result<(), ToolError> {
+    if self.specs.len() >= MAX_TOOLS_PER_SESSION {
+        ...
+    }
+    self.specs.push(spec);
+}
+```
+
+没有检查：
+
+```text
+duplicate tool name
+```
+
+于是可以：
+
+```text
+read
+read
+read
+```
+
+而：
+
+```rust
+lookup()
+```
+
+只会返回第一个。
+
+对于安全相关 registry，建议：
+
+```rust
+ToolError::DuplicateTool { name }
+```
+
+fail closed。
+
+同时 `required_scope: String` 最终最好也不要长期是任意字符串。
+
+至少：
+
+```rust
+ScopeRef
+```
+
+或者经过 host scope grammar validator。
+
+这是一个比较值得马上补的小修复。
+
+---
+
+# 9. README 已经再次落后于代码
+
+当前 README 的 repository structure 还是：
+
+```text
+crates/
+  bitty-ai-core/
+  bitty-ai-slice/
+```
+
+没有：
+
+```text
+bitty-ai-runtime
+```
+
+同时写：
+
+> Production runtime implementation has not started.
+
+但 `AI-0009` 已经在主分支落了 `bitty-ai-runtime` skeleton。
+
+建议改成类似：
+
+```text
+Experimental runtime implementation has started.
+No production-ready provider or stable public runtime exists yet.
+```
+
+这样就准确了。
+
+---
+
+# 10. `implementation-profile-v0.1.md` 也已经落后
+
+当前最后还写：
+
+> No product code exists for this profile yet.
+
+这现在显然已经不对。
+
+更有意思的是它的 Sequencing：
+
+```text
+1. profile accepted
+2. runtime skeleton
+```
+
+但实际：
+
+```text
+profile = draft
+runtime skeleton = 已经 landed
+```
+
+这并不是严重问题，因为 skeleton 本来就可以作为 experimental evidence。
+
+但文档应该改成：
+
+```text
+Draft profile
+        │
+        ├── experimental implementation evidence:
+        │       bitty-ai-runtime AI-0009
+        │
+        └── acceptance pending
+```
+
+而不是假装 implementation 还没发生。
+
+---
+
+# 11. `bitty-ai-runtime/src/lib.rs` 自己也有一个小漂移
+
+它现在写：
+
+> tracks the **unmerged draft** `implementation-profile-v0.1.md`
+
+但这个 profile 已经在 `bitty-ai-docs/main`。
+
+所以应该改成：
+
+> tracks the merged but still draft implementation profile
+
+这是很小的事情，但既然你已经开始做 truth reconciliation，最好一起清掉。
+
+---
+
+# 12. `bitty-ai-docs/docs/README.md` 还有明显历史快照残留
+
+这个页面写：
+
+```text
+bitty-ai/docs submodule at 39b4...
+bitty-ai HEAD 3623c6b...
+```
+
+但现在实际 `bitty-ai/docs` 已经 pin 到：
+
+```text
+fa183905...
+```
+
+而 `bitty-ai` 当前 HEAD 已经是 `51d153f...`，并且中间已经有 AI-0009 runtime skeleton。
+
+这就是我们前面讨论的：
+
+> Architecture/document map 不应该硬编码快速变化的 commit snapshot。
+
+建议把这一整段：
+
+```text
+Read-only inspection on 2026...
+HEAD ...
+submodule at ...
+```
+
+移到：
+
+```text
+evidence/
+project state/
+audit record
+```
+
+而 `docs/README.md` 只说：
+
+```text
+bitty-ai/docs is a pinned submodule of this repository.
+```
+
+即可。
+
+---
+
+# 13. `bitty-ai-docs` 也出现了“draft 文档内部 Accepted”的状态混用
+
+比如：
+
+```yaml
+status: draft
+```
+
+但是 `prefix-cache-context-design.md` 里面大量：
+
+> Accepted direction
+> Accept as direction
+> Accept as requirement
+
+`prompt-layering-design.md` 也类似：
+
+> Accepted as organizational direction
+> Accepted direction
+
+这会重新出现之前 terminal docs 的那个问题：
+
+```text
+Document status: Draft
+Section wording: Accepted
+```
+
+我建议统一改成：
+
+```text
+Draft disposition: adopt
+Draft disposition: qualify
+Draft disposition: reject
+Draft disposition: open
+```
+
+例如：
+
+```markdown
+**Draft disposition: adopt.**
+Stable content should precede dynamic content.
+```
+
+只有真正进入 accepted RFC / ADR 后才用：
+
+```text
+Accepted
+Normative
+Required
+```
+
+这样机器和人都更容易判断。
+
+---
+
+# 14. 不过 Prefix Cache / Prompt Layering 这两份新文档本身方向很好
+
+这部分我反而不建议大改。
+
+特别是你现在已经把我们前面讨论的：
+
+```text
+stable core prompt
+tool schemas
+skills
+project context
+history
+runtime delta
+current turn
+```
+
+整理成稳定前缀设计，并明确：
+
+> dynamic values 不进入早期 stable layers
+
+Prompt Layering 也明确形成：
+
+```text
+1 Core Contract
+2 User Global
+3 Project .bitty
+4 Skills / Agent Profile
+5 Runtime / Current Turn
+```
+
+以及最重要的：
+
+> **A prompt never grants a capability.**
+
+这几条我认为已经可以成为 Bitty AI 很核心的设计原则。
+
+暂时保持 Draft 是对的，等真正实现 prompt assembler / context planner 时再靠 benchmark 推进 acceptance。
+
+---
+
+# 15. Giant `ai-architecture.md` 不建议现在整体 Accepted
+
+当前它已经约 **132 KB**，而且同时覆盖：
+
+```text
+ModelProvider
+ContextProvider
+Stable IDs
+Context Budget
+Semantic Zones
+Agent Levels
+AgentWorkspace
+Rich Streaming
+Tool Bus
+Privacy
+...
+```
+
+现在最好的策略不是继续努力把这整个文档变成 accepted。
+
+我更建议：
+
+```text
+ai-architecture.md
+    = long-term umbrella / Draft
+
+implementation-profile-v0.1.md
+    = 当前可实现的窄 contract
+```
+
+然后逐渐把真正需要冻结的东西拆成小 RFC：
+
+```text
+Provider Contract v1
+Context Request v1
+Runtime Identity v1
+Tool Dispatch v1
+Prompt Assembly v1
+```
+
+这样不会出现：
+
+> 为了接受一个 `AgentId`，必须同时接受 132 KB AI architecture。
+
+---
+
+# 16. 你现在这个 v0.1 single-crate 思路是对的
+
+我现在反而比之前更支持：
+
+```text
+bitty-ai-runtime
+    provider.rs
+    context.rs
+    session.rs
+    tool.rs
+    agent.rs
+    stream.rs
+```
+
+不要急着：
+
+```text
+bitty-ai-model-provider
+bitty-ai-context-provider
+bitty-ai-agent
+bitty-ai-tool-bus
+bitty-ai-workspace
+```
+
+Cargo.toml 里这些目前只是 Future crates，这样很好。
+
+现在这种规模：
+
+```text
+one crate
+several strong modules
+```
+
+比过早 workspace fragmentation 更合理。
+
+等真正出现：
+
+```text
+independent dependency graph
+independent release/version
+compile-time boundary
+security boundary
+large module size
+```
+
+再拆。
+
+---
+
+# 我现在给出的优先级
+
+如果让我现在直接安排下一批工作，我会这样：
+
+| 优先级    | 工作                                                               |
+| ------ | ---------------------------------------------------------------- |
+| **P0** | 删除 `bitty-ai-core` placeholder                                   |
+| **P0** | 开始让 `bitty-ai-slice` 消费 `bitty-ai-runtime`，结束双实现                 |
+| **P0** | 明确 `AgentId` protocol identity vs runtime instance identity      |
+| **P1** | 明确 ModelProvider mechanism 属于 `bitty-ai`、host authority 属于 Bitty |
+| **P1** | Tool vocabulary 与 `bitty-agent` 建立 bridge，而不是长期双定义               |
+| **P1** | 修 README / implementation-profile / runtime rustdoc 状态漂移         |
+| **P1** | 修 `docs/README.md` 的历史 commit snapshot                           |
+| **P1** | ToolRegistry duplicate-name fail closed                          |
+| **P2** | `AgentLevel` 明确为 policy profile，不作为 capability proof             |
+| **P2** | Draft docs 内的 “Accepted direction” 改成 “Draft disposition”        |
+| **P2** | 等 runtime evidence 更多后，再决定哪些 draft spec 拆成真正 RFC                 |
+
+---
+
+## 我现在最推荐的最终形态
+
+经过这次修改后，我觉得 `bitty-ai` 已经可以收束成一个非常漂亮的三层结构：
+
+```text
+bitty-ai
+│
+├── bitty-ai-runtime
+│   │
+│   ├── Agent loop
+│   ├── Session
+│   ├── Context
+│   ├── Provider abstraction
+│   ├── Tool orchestration
+│   ├── Prompt assembly
+│   └── Streaming
+│
+├── bitty-ai-bridge
+│   │
+│   ├── bitty-agent protocol mapping
+│   ├── bitty-ipc
+│   ├── ContextProvider host bridge
+│   ├── ToolExecutor host bridge
+│   └── Consent / capability adapter
+│
+└── bitty-ai-slice
+    │
+    └── real runtime × real bridge × generic Bitty integration tests
+```
+
+而 Bitty Core：
+
+```text
+bitty-agent
+bitty-ipc
+Panel
+Terminal
+Execution
+Filesystem
+Process
+Capability
+Consent
+```
+
+完全不知道：
+
+```text
+OpenAI
+Anthropic
+Context Compaction
+Prompt Layer
+Review Agent
+Planning Agent
+```
+
+是什么。
+
+**这次已经离这个目标很近了。**
+
+相比上一次，我现在不会说 `bitty-ai` “架构还没有定下来”；实际上主干已经很明确。现在最重要的是**停止产生重复实现，把 `slice → runtime → bridge → generic Bitty primitives` 这条真实数据链打通**。这一步完成之后，就可以开始认真做 local provider、prompt assembler、context cache 和实际 Agent Loop，而不再只是架构预研。

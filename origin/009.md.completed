@@ -1,0 +1,2577 @@
+对，你现在描述下来，Bitty 已经不太适合再用“一个高度可扩展的 terminal emulator”来完整概括了。更准确地说，它正在变成：
+
+    一个以 terminal 为核心、以 workspace/window/compositor 为 UI 模型、以 Lua plugin 为扩展机制、以 IPC/service 为组件协作基础的可组合终端工作环境。
+
+所以它会比 Alacritty、Foot 复杂很多，这个复杂度本身并不奇怪。关键问题已经不是“为什么有十万行”，而是：
+
+    这十万行复杂度是不是被正确地分层、隔离和约束了。
+
+这也是接下来 Bitty 最应该守住的东西。
+1. Bitty 的演化其实是很自然的
+
+你最初的推导链条基本是成立的：
+
+Neovim
+↓
+核心能力 + 可编程扩展
+
+Hyprland / niri
+↓
+workspace / window / layout / dynamic composition
+
+Emacs
+↓
+应用本身只是平台，真正的能力由扩展组合出来
+
+现代 AI terminal
+↓
+Agent / context / tools / cross-session coordination
+
+Bitty
+↓
+Terminal Runtime + Workspace + Plugin Platform
+
+它并不是：
+
+我想做很多功能
+→ 全部塞进去
+
+而更像是：
+
+我要允许别人做很多功能
+→ 所以必须提前提供足够好的基础抽象
+
+这两者区别非常大。
+
+例如 AI 如果只是 Bitty Core 的一个内置按钮：
+
+Terminal
+├── AI
+├── Git
+├── File Manager
+└── Chat
+
+那很快就会变成 Warp 一类的 product architecture。
+
+而你想的是：
+
+Bitty Platform
+        │
+        ├── AI Plugin
+        ├── Git Plugin
+        ├── File Plugin
+        └── arbitrary plugins
+
+甚至：
+
+AI Plugin
+   │
+   ├── Claude Provider
+   ├── OpenAI Provider
+   ├── Local Model Provider
+   ├── Coding Agent Adapter
+   ├── Context Compressor
+   ├── Terminal Observer
+   └── AI UI Plugin
+
+这就完全是另一条路线了。
+2. “插件之上的插件”确实应该成为正式架构
+
+但我建议不要把它理解成真正的：
+
+plugin
+  └── child plugin
+       └── child plugin
+
+更好的模型应该是：
+
+    Plugin dependency + Service/Capability composition
+
+也就是：
+
+          Bitty Plugin Host
+                 │
+       ┌─────────┴─────────┐
+       │                   │
+   AI Runtime           Git Plugin
+       │
+ provides ai.*          provides git.*
+       │
+ ┌─────┼─────┐
+ │     │     │
+Claude UI  Agent  Context
+
+例如一个 AI 基础插件声明：
+
+[plugin]
+id = "bitty.ai"
+
+[provides]
+services = [
+    "ai.chat",
+    "ai.complete",
+    "ai.agent",
+    "ai.context"
+]
+
+另一个插件：
+
+[plugin]
+id = "bitty.ai.openai"
+
+[dependencies]
+plugins = ["bitty.ai"]
+
+[requires]
+services = ["ai.provider"]
+
+再比如：
+
+bitty.ai-statusline
+bitty.ai-history
+bitty.ai-context
+bitty.ai-opencode
+bitty.ai-claude-code
+
+都可以建立在：
+
+bitty.ai
+
+之上。
+
+这其实和 Neovim 很像。
+
+例如 Neovim 生态里：
+
+nvim core
+↓
+LSP API
+↓
+nvim-lspconfig
+↓
+completion / diagnostics / UI / navigation plugins
+
+插件本身就是其他插件的 infrastructure。
+3. 所以 Bitty 最终需要的并不只是 Plugin API
+
+而应该有四类扩展原语。
+Commands
+
+bitty.command.register(...)
+
+插件提供行为。
+
+例如：
+
+ai.chat
+git.status
+workspace.focus
+terminal.split
+
+Events
+
+bitty.on("terminal.output", ...)
+bitty.on("workspace.changed", ...)
+bitty.on("process.exited", ...)
+bitty.on("panel.focused", ...)
+
+提供 observation。
+Services
+
+这是你现在尤其值得正式化的部分：
+
+bitty.service.provide(...)
+bitty.service.require(...)
+
+例如：
+
+ai.provider
+git.repository
+filesystem.index
+workspace.navigation
+agent.context
+
+Service 是实现“插件建立在插件之上”的关键。
+UI Surfaces
+
+例如：
+
+panel
+overlay
+statusline
+command-palette
+notification
+terminal-decoration
+workspace
+
+插件不应该任意直接操纵 renderer。
+
+而应该：
+
+plugin
+  ↓
+UI abstraction
+  ↓
+Bitty compositor
+  ↓
+renderer
+
+这样 renderer 的 invariant 才不会被扩展系统破坏。
+4. 这其实可以形成一个非常漂亮的 Bitty 分层
+
+我会把 Bitty 的长期 architecture 看成五层。
+
+┌─────────────────────────────────────┐
+│           User Plugins              │
+│ AI / Git / Files / Mail / DevTools │
+├─────────────────────────────────────┤
+│       Plugin Composition Layer      │
+│ Services / Events / Commands / UI   │
+├─────────────────────────────────────┤
+│      Workspace / UI Runtime         │
+│ windows / panels / layouts / focus │
+├─────────────────────────────────────┤
+│        Terminal Runtime             │
+│ PTY / VT / state / input / render  │
+├─────────────────────────────────────┤
+│         Platform Layer              │
+│ Linux / macOS / Windows / BSD       │
+└─────────────────────────────────────┘
+
+另外 IPC 横穿其中，但受到 capability 控制：
+
+             IPC / Service Bus
+                   │
+    ┌──────────────┼──────────────┐
+ Terminal       Workspace       Plugin
+
+这时候 Bitty 就非常接近一种：
+
+    microkernel-like architecture
+
+不一定是 OS 意义上的 microkernel，但哲学很像：
+
+small trusted mechanism
++
+replaceable policy
++
+message/service based composition
+
+5. Hyprland 给 Bitty 带来的东西其实比“窗口”更重要
+
+这里你抓到的点很好。
+
+Hyprland 值得借鉴的不只是：
+
+workspace
+window
+layout
+
+更重要的是：
+
+    把 UI 当成动态可组合对象，而不是固定应用布局。
+
+普通 terminal 往往是：
+
+Window
+└── Tabs
+    └── Splits
+        └── Terminal
+
+结构基本固定。
+
+Bitty 可以变成：
+
+Workspace
+├── Terminal Panel
+├── AI Panel
+├── Git Panel
+├── File Panel
+└── arbitrary plugin surface
+
+甚至：
+
+Workspace
+├── Split
+│   ├── Terminal
+│   └── Terminal
+│
+├── Floating AI Panel
+│
+└── Overlay
+    └── Jump UI
+
+所以真正应该抽象的是：
+
+Surface
+Container
+Layout
+Workspace
+Focus
+Navigation
+
+而不仅仅是：
+
+TerminalPane
+
+这正是 Bitty 和 WezTerm 最容易真正拉开差距的地方。
+6. IPC 也因此不是一个“附加功能”
+
+这是很关键的一点。
+
+如果 Bitty 只是：
+
+PTY emulator
+
+IPC 确实没那么必要。
+
+但是如果：
+
+Terminal A
+Terminal B
+AI Panel
+Git Panel
+Agent
+Workspace
+Plugin
+
+需要互相感知：
+
+Terminal A 当前 cwd 是什么？
+Terminal B 当前运行什么？
+哪个 workspace active？
+哪个 command 刚刚失败？
+AI 应该读取哪个 terminal context？
+Git panel 应该跟哪个 terminal project 绑定？
+
+那就必然需要：
+
+shared runtime state
++
+event system
++
+IPC / service communication
+
+否则以后会产生非常糟糕的：
+
+AI Plugin → Terminal internals
+Git Plugin → Workspace internals
+File Plugin → Terminal internals
+
+然后整个系统耦合成一团。
+
+所以你现在做 IPC，其实是在提前避免未来这种问题。
+7. AI 最好永远不要成为 Bitty Core 的特殊公民
+
+这个原则我觉得可以明确下来。
+
+即使未来 AI 是 Bitty 最大的使用场景之一，也最好保持：
+
+Bitty Core 不知道 AI 是什么
+
+Core 只应该知道：
+
+events
+commands
+services
+permissions
+panels
+processes
+terminal sessions
+IPC
+
+然后：
+
+AI = 这些 primitive 的一种组合
+
+比如：
+
+Terminal output event
+        ↓
+AI observer plugin
+        ↓
+Context service
+        ↓
+Model provider
+        ↓
+Agent
+        ↓
+Command service
+        ↓
+Terminal input
+
+这会非常漂亮。
+
+因为十年后即使 AI 形态完全变了：
+
+Bitty architecture
+
+也不需要推倒重做。
+8. Lua + Rust 也是一个比较合理的边界
+
+这里真正重要的不是 Lua 快不快，而是：
+
+Rust = mechanism
+Lua = policy
+
+比如：
+
+Rust：
+
+PTY
+VT
+GPU
+IPC
+scheduler
+plugin sandbox
+resource accounting
+layout engine
+
+Lua：
+
+keymap
+workflow
+command
+panel composition
+automation
+plugin behavior
+
+而且最好尽量坚持：
+
+    Lua API 不映射 Rust internal structure。
+
+不要出现：
+
+terminal.grid.rows[3].cells[5].glyph
+
+这种。
+
+而是：
+
+terminal:snapshot()
+terminal:command(...)
+terminal:on(...)
+workspace:focus(...)
+ui:panel(...)
+
+因为：
+
+Rust implementation
+
+以后可以任意重构，
+
+但：
+
+Lua semantic API
+
+可以保持稳定。
+
+这就是插件平台真正能长期存在的关键。
+9. Bitty 和 Alacritty 的复杂度不应该直接比较 LOC
+
+你提到：
+
+    Alacritty 三万行，Bitty 已经十万多行。
+
+这个差异其实很正常，但需要注意一个指标。
+
+Alacritty 本身的 philosophy 接近：
+
+Terminal emulator
++
+performance
++
+simplicity
+
+而 Bitty 是：
+
+Terminal
++ config runtime
++ Lua VM
++ plugin host
++ package manager
++ dependency resolver
++ workspace model
++ UI extension
++ rich content
++ IPC
++ agent infrastructure
++ security model
++ devtools
++ compatibility lab
++ performance harness
+
+这两个已经不是完全同一类 architecture complexity。
+
+所以：
+
+LOC(Bittty) > LOC(Alacritty)
+
+本身没什么意义。
+
+真正应该关注的是：
+
+LOC(Core) / LOC(Total)
+
+10. Bitty 应该尽量让“核心复杂度”增长得很慢
+
+例如假设未来：
+
+Bitty = 300k LOC
+
+完全不一定有问题。
+
+如果其中：
+
+Terminal Kernel        30k
+Platform               20k
+Workspace/UI           30k
+Plugin Runtime         30k
+Package/Resolver       20k
+IPC                    15k
+Rich                   25k
+Agent                   20k
+Compat/Test/Bench      80k
+Others                 30k
+
+这是很健康的。
+
+真正危险的是：
+
+bitty-core = 150k LOC
+
+而且：
+
+PTY knows Workspace
+Workspace knows Plugin
+Plugin knows Renderer
+Renderer knows AI
+AI knows IPC
+IPC knows Terminal
+
+形成：
+
+      ┌──────────┐
+   ┌─→│ Terminal │─┐
+   │  └──────────┘ │
+   │               ↓
+ Plugin ←→ UI ←→ IPC
+   ↑               │
+   └───────────────┘
+
+这种复杂度才是真的失控。
+11. 所以以后我建议你看几个比 LOC 更重要的指标
+Dependency graph
+
+应该长期保持接近 DAG：
+
+platform
+   ↓
+pty/vt
+   ↓
+term-state
+   ↓
+runtime
+   ↓
+workspace
+   ↓
+plugin-host
+
+尽量不要逆向依赖。
+Stable API surface
+
+统计：
+
+public Rust API
+Lua API
+IPC protocol
+Plugin manifest
+Service API
+
+它们增长多快。
+
+API surface 增长速度比 LOC 增长速度更危险。
+Core hot path
+
+明确：
+
+PTY read
+↓
+VT
+↓
+State
+↓
+Snapshot
+↓
+Render
+
+任何：
+
+Lua
+Plugin
+IPC
+AI
+
+都不应该进入这条 hot path。
+
+你的现有设计已经在强调这一点，这是一定要长期守住的。
+Failure containment
+
+每增加一个 subsystem 都问：
+
+它坏了会导致谁坏？
+
+最好：
+
+AI crash    → AI unavailable
+Plugin crash → plugin disabled
+IPC crash   → ctl unavailable
+Rich crash  → image unavailable
+
+Terminal
+→ still works
+
+12. “可扩展”其实会成为 Bitty 最大的工程挑战
+
+因为一个普通 terminal 只需要保证：
+
+自己的代码正确
+
+Bitty 要保证的是：
+
+别人写的未知代码
++
+未知组合
++
+未知插件版本
++
+未知 UI
++
+未知事件流
+
+依然不能破坏系统。
+
+所以 Bitty 到后面真正难的部分反而会变成：
+Plugin dependency resolution
+
+A requires B >= 2
+C requires B < 2
+
+怎么办？
+Capability
+
+plugin wants filesystem
+plugin wants network
+plugin wants terminal input
+plugin wants clipboard
+
+怎么办？
+Lifecycle
+
+load
+enable
+disable
+reload
+upgrade
+uninstall
+
+过程中资源怎么释放？
+Event storm
+
+terminal.output
+
+每秒几千次怎么办？
+Plugin cycle
+
+A → B → C → A
+
+怎么办？
+Service disappearance
+
+AI provider plugin reload
+
+依赖它的插件怎么办？
+UI conflict
+
+多个插件都想：
+
+open panel
+modify statusline
+capture input
+
+怎么办？
+
+这些才是一个真正 extensible system 的难点。
+13. 我尤其建议现在把 Service 正式提升成一等公民
+
+因为从你现在描述的未来来看：
+
+Commands
+Events
+IPC
+UI
+
+还不足以支撑整个生态。
+
+应该再加：
+
+Service Registry
+
+于是 Bitty 的插件模型就变成：
+
+Plugin API
+├── Commands
+├── Events
+├── Services
+├── UI
+├── Storage
+├── IPC
+└── Capabilities
+
+Service 负责插件之间的 semantic composition。
+
+例如：
+
+AI plugin
+provides:
+    ai.complete
+    ai.chat
+
+Git plugin
+provides:
+    vcs.status
+    vcs.diff
+
+Project plugin
+provides:
+    project.current
+
+那么 AI Git Review 插件根本不需要 Bitty Core 支持：
+
+requires:
+  ai.chat
+  vcs.diff
+
+组合一下就行：
+
+AI + Git
+   ↓
+AI Review Plugin
+
+这才是真正意义上的：
+
+    Everything composable
+
+14. 这也是 Bitty 最可能形成自己身份的地方
+
+我觉得以后如果介绍：
+Alacritty
+
+fast terminal emulator
+
+Kitty
+
+GPU terminal + terminal protocol extensions
+
+WezTerm
+
+powerful cross-platform terminal multiplexer with Lua configuration
+
+Warp
+
+AI-first modern terminal/workspace
+
+Bitty
+
+可能应该逐渐变成：
+
+    Composable terminal workspace
+
+或者：
+
+    Programmable terminal environment
+
+核心身份不是：
+
+AI terminal
+
+也不是：
+
+GPU terminal
+
+甚至不只是：
+
+plugin terminal
+
+而是：
+
+Terminal
++
+Workspace
++
+Programmability
++
+Composition
+
+所以你说它：
+
+    “Neovim 版 terminal”
+
+没问题。
+
+但如果长期演化下去：
+
+    “Emacs philosophy applied to a modern terminal workspace”
+
+其实可能更准确。
+15. 而现在这个测试阶段恰恰非常关键
+
+因为你已经把：
+
+Terminal
+Workspace
+Plugin
+Lua
+IPC
+Rich
+Agent
+Package
+
+这些地基基本摆出来了。
+
+如果现在继续一路往上造：
+
+AI
+Mail
+Browser
+File Manager
+Git
+Task
+
+以后基础 bug 会越来越难修。
+
+所以目前最好的节奏其实就是：
+
+Architecture expansion
+       ↓
+暂停
+
+Terminal correctness
+Workspace correctness
+Plugin lifecycle
+IPC contracts
+Security boundary
+Performance
+Compatibility
+       ↓
+Verified
+
+再继续生态扩展
+
+最后一个很重要的判断标准
+
+以后每设计 Bitty 一个新能力，我觉得都可以问：
+
+    这个能力是 Bitty Core 必须知道的概念，还是可以由已有 primitive 组合出来？
+
+例如：
+
+AI
+
+答案应该是：
+
+Plugin
+
+Git
+
+应该是：
+
+Plugin
+
+File Manager
+
+应该是：
+
+Plugin
+
+但：
+
+Workspace
+Panel
+Focus
+Event
+Command
+Service
+Capability
+IPC
+Terminal Session
+
+这些属于：
+
+Platform Primitive
+
+如果这个边界一直保持清楚，即使未来 Bitty 从 10 万行增长到 50 万行，架构也未必会失控。
+
+反过来，如果这个边界失去控制，即使只有 5 万行，也可能已经很难维护。
+
+所以 Bitty 现在真正要控制的并不是 代码量，而是 irreducible complexity 到底有多少，以及复杂度被放在哪一层。这可能也是你现在这个项目从“做一个 terminal”真正迈入“做一个软件平台”的分界点。
+
+相比于窗口管理器的这种哲学，也就是 sway, i3, hyprland, niri, river 这种的跟传统的管理器，可以重叠的那种macos, windows, kde plamsa, gnome 等等这种的有什么优势呢？我觉得对于终端模拟器就很适合窗口管理器。
+
+
+然后就是在bitty插件系统中可能就是 ai 集成部分是最大的，这个领域可能会专门变得很大，所以是不是我可以先独立在一个 bitty-ai 这个仓库先把 crates 做好，然后之后的只要是跟 ai相关的插件都是可以基于这个来用lua实现对于的插件呢？因为 ai 部分肯定是比较麻烦的，本来 IPC 就是我自己给做的，那么我想把更多的接口暴露出去然后 lua 就可以更好的调用，而不是 lua 那边自己造轮子?
+
+是的，而且我觉得你现在可以把这两个方向进一步统一起来：
+
+    Bitty 的 UI 哲学可以来自 tiling/window manager；Bitty 的扩展哲学来自 Neovim/Emacs；而 bitty-ai 可以成为第一个证明这套扩展架构真的成立的大型“子平台”。
+
+这三者其实非常一致。
+1. 为什么窗口管理器哲学特别适合终端
+
+传统桌面环境的 floating window：
+
+Windows / macOS / GNOME / KDE
+
+Desktop
+├── Window A ─────┐
+├── Window B ──┐  │
+└── Window C ─────┘
+
+核心思想是：
+
+    用户负责空间布局。
+
+用户自己：
+
+    移动窗口
+
+    resize
+
+    重叠
+
+    最小化
+
+    找窗口
+
+    Alt-Tab
+
+而 i3/Sway/Hyprland/niri/river 这类更偏向：
+
+    系统负责布局，用户负责表达意图。
+
+Workspace
+├── Terminal
+├── Browser
+└── Editor
+
+用户不是不断告诉系统：
+
+x = 347
+y = 81
+width = 920
+height = 720
+
+而是在表达：
+
+这个放左边
+这个放右边
+这个进入 workspace 3
+focus 下一个
+移动到另一个 container
+
+这是一种非常重要的区别：
+
+    Imperative geometry → Declarative spatial relationship
+
+2. Tiling 最大优势其实不是“铺满屏幕”
+
+很多人第一反应是：
+
+    Tiling 可以充分利用屏幕。
+
+这只是表面。
+
+真正重要的是几个性质。
+Deterministic Layout
+
+传统 floating：
+
+窗口位置 = 大量偶然状态
+
+而 tiling：
+
+Layout Tree + Workspace State
+        ↓
+确定窗口位置
+
+所以它天然容易：
+
+保存
+恢复
+序列化
+脚本控制
+键盘导航
+自动布局
+
+这对 Bitty 极其重要。
+
+以后完全可以保存：
+
+Workspace "coding"
+
+main
+├── terminal
+├── terminal
+└── ai-panel
+
+下一次恢复：
+
+bitty workspace restore coding
+
+整个环境重新构建出来。
+3. 第二个巨大优势：Keyboard-first
+
+Terminal 用户本来就是：
+
+keyboard dominant
+
+用户正在：
+
+vim
+nvim
+shell
+fzf
+yazi
+tmux
+Claude Code
+
+突然要求：
+
+松开键盘
+拿鼠标
+拖窗口
+调整边界
+再回键盘
+
+其实会打断 workflow。
+
+窗口管理器则是：
+
+Super + H/J/K/L
+Super + 1..9
+Super + Shift + ...
+
+这和 Vim/Neovim 的 interaction model 几乎天然兼容。
+
+所以 Bitty 做：
+
+focus left
+focus right
+focus next panel
+move panel
+switch workspace
+toggle floating
+fullscreen
+
+非常自然。
+4. 第三个优势：它特别适合“很多相似矩形”
+
+Terminal 恰好是最适合 tiling 的 UI 类型之一。
+
+因为 terminal 通常：
+
+矩形
+文本密集
+可以 resize
+不需要复杂自由布局
+
+例如：
+
+┌───────────────┬───────────────┐
+│ backend       │ frontend      │
+│ terminal      │ terminal      │
+├───────────────┼───────────────┤
+│ logs          │ AI            │
+│               │               │
+└───────────────┴───────────────┘
+
+这和 Photoshop、Blender 那种大量 floating dialogs 完全不同。
+
+甚至 tmux 本身已经证明：
+
+    tiling window manager philosophy 和 terminal 是高度兼容的。
+
+只是 Bitty 可以继续向前走：
+
+tmux:
+Pane ≈ Terminal
+
+Bitty:
+Surface ≈ arbitrary application/plugin UI
+
+这就是区别。
+5. Bitty 不应该照搬 Hyprland，而应该吸收它的 primitive
+
+我会建议 Bitty 最终不是：
+
+Terminal Pane Manager
+
+而是：
+
+Workspace Compositor
+
+例如基础对象：
+
+Workspace
+├── Container
+│   ├── Surface
+│   └── Surface
+│
+├── FloatingSurface
+└── Overlay
+
+其中 Surface 可以是：
+
+Terminal
+AI Panel
+Git Panel
+File Browser
+Markdown
+Task View
+Plugin-defined UI
+
+所以 UI core 不应该知道：
+
+这是 AI panel
+
+只知道：
+
+这是一个 Surface。
+
+6. 我尤其觉得 niri 有一个设计很值得 Bitty 借鉴
+
+传统 i3/Hyprland tiling 的一个问题：
+
+窗口越来越多
+↓
+每个窗口越来越小
+
+例如：
+
+┌────┬────┬────┬────┬────┐
+│    │    │    │    │    │
+└────┴────┴────┴────┴────┘
+
+Terminal 对宽度又很敏感。
+
+niri 的 scrolling tiling 思维则更接近：
+
+        viewport
+┌────────────────────┐
+      ↓
+┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+│ term A │ │ term B │ │   AI   │ │  Git   │
+│        │ │        │ │        │ │        │
+└────────┘ └────────┘ └────────┘ └────────┘
+                 →
+
+不是把所有 panel 硬塞进屏幕，而是保持合理宽度，通过 focus/scroll 导航。
+
+这个我觉得甚至非常适合成为 Bitty 的一个特色 layout：
+
+layout = "scrolling"
+
+例如：
+
+Coding workspace
+
+[ Explorer ][ Main Terminal ][ AI ][ Logs ][ Git ]
+                       ↑
+                    focused
+
+每个保持：
+
+preferred_width
+min_width
+max_width
+
+比经典 terminal split 可能还好用。
+7. 但不要彻底抛弃 Floating
+
+窗口管理器用户自己也知道：
+
+    tiling 并不意味着 floating 没意义。
+
+Bitty 可以做三层：
+
+┌─────────────────────────────────┐
+│ Overlay Layer                   │
+│ command palette / jump / hint   │
+├─────────────────────────────────┤
+│ Floating Layer                  │
+│ quick AI / help / image preview │
+├─────────────────────────────────┤
+│ Tiled Workspace Layer           │
+│ terminals / panels / tools      │
+└─────────────────────────────────┘
+
+例如：
+Tiled
+
+长期存在：
+
+Terminal
+AI
+Git
+File
+
+Floating
+
+临时操作：
+
+AI Quick Chat
+Settings
+Debug Inspector
+
+Overlay
+
+瞬时交互：
+
+Flash-like jump labels
+Command Palette
+Completion
+Notification
+Search
+
+我认为这会比单纯模仿 Hyprland 更成熟。
+8. 这也会直接解决插件 UI 冲突问题
+
+因为如果 Plugin API 让插件自己：
+
+x/y/width/height
+
+以后一定会乱。
+
+应该让插件声明：
+
+bitty.ui.panel({
+    id = "ai.chat",
+    preferred_width = 64,
+    min_width = 40,
+})
+
+然后：
+
+Plugin
+   ↓
+UI Intent
+   ↓
+Workspace/Layout Engine
+   ↓
+Render
+
+而不是：
+
+Plugin
+↓
+直接操作 renderer
+
+窗口管理器哲学在这里就不仅是 UX，而是变成了插件架构的一部分。
+9. 再说 bitty-ai：我非常赞成独立仓库
+
+而且你现在 Bitty 的 RFC 已经天然支持这种方向。
+
+Plugin Platform RFC 已经定义：
+
+[dependencies]
+"xuepoo.gitcore" = ">=2.0"
+
+[services.provided]
+"markdown.render" = "1.0"
+
+也就是说：
+
+    Plugin dependency + Service composition 已经是正式设计的一部分。
+
+而不是我们现在临时想出来的。
+
+所以完全可以：
+
+bitty
+│
+├── Plugin Platform
+├── IPC
+├── Agent protocol
+└── UI primitives
+
+bitty-ai
+│
+├── AI runtime
+├── providers
+├── streaming
+├── context
+├── tools
+└── Lua-facing AI services
+
+AI plugins
+├── ai-chat
+├── ai-shell
+├── ai-explain
+├── ai-git
+├── ai-context
+└── ...
+
+10. 而且目前 bitty-agent 和 bitty-ai 应该刻意分开
+
+你现在 IPC/Agent RFC 有一句特别重要：
+
+    bitty-agent 不负责 model selection、LLM I/O、API-key handling。
+
+我觉得这个边界非常正确。
+
+可以理解为：
+
+bitty-agent
+=
+Bitty 如何描述 Agent
+Bitty 如何和 Agent 通信
+Bitty 如何授权 Agent
+Bitty 如何传递 observation/tool call
+
+而：
+
+bitty-ai
+=
+LLM 到底怎么调用
+Provider 怎么抽象
+Streaming 怎么处理
+Context 怎么组织
+Tool loop 怎么调度
+
+所以：
+
+        Bitty Core
+            │
+       bitty-agent
+            │
+       IPC / Service
+            │
+        bitty-ai
+            │
+    ┌───────┼────────┐
+ OpenAI  Anthropic  Ollama ...
+
+这个边界很干净。
+11. bitty-ai 可以直接做成 Rust workspace
+
+我甚至会建议一开始就不要做成一个大 crate。
+
+例如：
+
+bitty-ai/
+├── crates/
+│   ├── core/
+│   ├── runtime/
+│   ├── provider/
+│   ├── context/
+│   ├── tools/
+│   ├── bridge/
+│   └── host/
+│
+├── providers/
+│   ├── openai/
+│   ├── anthropic/
+│   ├── ollama/
+│   └── openai-compatible/
+│
+└── plugins/
+    ├── ai/
+    ├── chat/
+    └── shell-assistant/
+
+不用一开始全部实现，但边界可以这样规划。
+12. 各 crate 可以这样分
+bitty-ai-core
+
+纯数据模型：
+
+ModelId
+ProviderId
+
+Message
+Role
+Content
+TextContent
+ImageContent
+
+Request
+Response
+
+Usage
+FinishReason
+
+Tool
+ToolCall
+ToolResult
+
+StreamEvent
+
+最好基本不依赖 Bitty。
+
+这样以后甚至别人可以单独使用。
+bitty-ai-provider
+
+定义 provider abstraction：
+
+trait Provider {
+    async fn complete(...);
+    async fn stream(...);
+    fn capabilities(...);
+}
+
+不同模型：
+
+OpenAI
+Anthropic
+Gemini
+Ollama
+OpenAI-compatible
+
+统一到这里。
+
+Lua 完全不应该自己处理这些 API 差异。
+13. bitty-ai-runtime
+
+这里处理最麻烦的工程问题：
+
+streaming
+cancellation
+timeout
+retry
+rate limiting
+backpressure
+
+provider lifecycle
+session
+request scheduling
+
+这些非常适合 Rust。
+
+尤其 SSE/WebSocket/HTTP streaming。
+
+不要让每一个 Lua AI 插件都自己：
+
+HTTP
+JSON
+SSE
+retry
+timeout
+stream parsing
+
+那会重复造无数次轮子。
+14. bitty-ai-context
+
+这个我觉得最后可能非常重要。
+
+因为 terminal AI 最大优势根本不是聊天框，而是：
+
+    它天然拥有 workspace context。
+
+可以统一抽象：
+
+ContextItem
+├── TerminalOutput
+├── Command
+├── Cwd
+├── ExitStatus
+├── File
+├── GitDiff
+├── Selection
+├── Workspace
+└── PluginProvided
+
+然后：
+
+ContextCollector
+ContextFilter
+ContextBudget
+ContextSnapshot
+
+AI 插件只是声明：
+
+local ctx = ai.context.collect({
+    terminal = "current",
+    cwd = true,
+    git = true,
+    max_tokens = 12000,
+})
+
+而不是自己去：
+
+读 PTY
+解析 cwd
+调用 git
+裁剪日志
+算 token
+
+这才是真正的平台价值。
+15. bitty-ai-tools
+
+统一 Tool Calling：
+
+ToolSchema
+ToolCall
+ToolResult
+ToolPermission
+
+然后和 Bitty 本身：
+
+Commands
+Services
+IPC
+Capabilities
+
+连接起来。
+
+例如 Lua：
+
+ai.tools.register({
+    "terminal.run",
+    "workspace.focus",
+    "git.diff",
+})
+
+而底层处理：
+
+LLM ToolCall
+     ↓
+bitty-ai
+     ↓
+Capability Check
+     ↓
+Bitty Command / Service
+     ↓
+Result
+
+不要让模型直接获得：
+
+arbitrary shell
+raw IPC
+raw filesystem
+
+16. 最关键的是一个 bridge
+
+例如：
+
+bitty-ai-bridge
+
+负责：
+
+Bitty IPC / Service API
+        ↕
+bitty-ai runtime
+
+这也是因为你当前 Plugin RFC 明确禁止 native in-process plugins；Lua VM 是扩展边界，高隔离扩展应该走 WASM/helper process + scoped IPC。
+
+所以我不建议：
+
+bitty
+dlopen(libbitty_ai.so)
+
+然后 Rust AI plugin 直接进入主进程。
+
+更合理的是：
+
+Bitty process
+│
+├── Lua Plugin
+│
+└── scoped IPC
+        │
+        ▼
+ bitty-ai-host
+        │
+        ├── provider
+        ├── streaming
+        ├── context
+        └── tools
+
+这样非常符合你现在已经建立的 security model。
+17. 然后 Lua 只负责“组合”
+
+这是最漂亮的地方。
+
+例如一个聊天插件：
+
+local ai = require("bitty.ai")
+
+local session = ai.session({
+    provider = "openai",
+    model = "gpt-5.6",
+})
+
+bitty.command.register("ai.ask", function(args)
+    session:send(args.text)
+end)
+
+一个 shell error 插件：
+
+bitty.on("terminal.command-finished", function(event)
+    if event.exit_code ~= 0 then
+        ai.explain(event)
+    end
+end)
+
+一个 Git Review 插件：
+
+local git = bitty.service.require("git.diff")
+local ai  = bitty.service.require("ai.chat")
+
+bitty.command.register("git.ai-review", function()
+    local diff = git.current()
+    ai.send(diff)
+end)
+
+这里已经完全体现出：
+
+    插件建立在插件之上。
+
+18. AI 生态最终可以变成这样
+
+                    Bitty
+                      │
+        ┌─────────────┴─────────────┐
+        │ Plugin / Service Platform │
+        └─────────────┬─────────────┘
+                      │
+                 bitty.ai
+                      │
+       ┌──────────────┼──────────────┐
+       │              │              │
+   Provider        Context         Tools
+       │              │              │
+ OpenAI/...      Terminal/...    Commands
+       │              │              │
+       └──────────────┼──────────────┘
+                      │
+              AI plugin ecosystem
+        ┌─────────────┼─────────────┐
+        │             │             │
+      Chat       Shell Helper    Git Review
+        │
+    AI Workspace
+        │
+   Coding Agent UI
+
+这已经不是普通意义的：
+
+AI feature
+
+而是：
+
+AI subsystem / platform
+
+所以独立 bitty-ai repo 非常合理。
+19. 但有一点我会特别提醒：不要为了 Lua“暴露所有接口”
+
+你说：
+
+    想把更多接口暴露出去，让 Lua 更好调用，而不是 Lua 自己造轮子。
+
+方向是对的，但应该改成：
+
+    暴露更多 semantic primitives，而不是暴露更多 internals。
+
+例如不要：
+
+bitty.ipc.send_raw_frame(...)
+bitty.runtime.channel(...)
+bitty.terminal.grid.cells(...)
+bitty.renderer.draw(...)
+
+这种 API 一旦公开，以后内部就很难重构。
+
+应该提供：
+
+bitty.workspace.list()
+bitty.workspace.focus()
+
+bitty.terminal.snapshot()
+bitty.terminal.send()
+
+bitty.service.require()
+
+bitty.ui.panel()
+
+ai.chat()
+ai.stream()
+ai.context()
+ai.tools()
+
+Lua 看见的是：
+
+    系统语义
+
+而不是：
+
+    Rust implementation details
+
+20. Rust 和 Lua 的职责可以明确成这条线
+
+我觉得以后可以一直坚持：
+Rust	Lua
+mechanism	policy
+IPC framing	workflow
+concurrency	orchestration
+streaming	UI behavior
+HTTP/SSE	prompt logic
+resource bounds	keybindings
+capability enforcement	plugin composition
+terminal state	choosing context
+provider protocol	provider/model preference
+lifecycle	UX
+
+一句话：
+
+Rust makes things possible and safe.
+Lua decides how they are used.
+
+这其实就是非常典型的 Neovim/Emacs 式思想。
+21. 我甚至觉得 bitty-ai 可以成为 Plugin API 的“压力测试”
+
+因为 AI 可能同时需要：
+
+Terminal observation
+Workspace
+IPC
+Services
+UI panels
+Streaming
+Async tasks
+Network
+Process
+Context
+Storage
+Notifications
+Commands
+Capabilities
+
+也就是说，如果：
+
+bitty-ai
+
+可以完全不修改 Bitty Core，只依靠：
+
+Plugin API
++
+Services
++
+IPC
++
+UI primitives
++
+Capabilities
+
+实现一个非常复杂的 AI environment，
+
+那实际上是在证明：
+
+    Bitty 的插件架构真的成功了。
+
+这甚至可以成为一个架构测试原则：
+
+如果为了实现 bitty-ai，
+不断需要往 Core 加 AI-specific API，
+说明 Plugin API abstraction 不够好。
+
+如果 bitty-ai 可以完全建立在通用 primitives 上，
+说明 architecture 是成立的。
+
+我觉得这是一个非常好的检验方法。
+最终我会形成这样的 Bitty 项目结构
+
+bitty
+│
+│   通用平台
+│
+├── Terminal
+├── Workspace
+├── Layout / Surface
+├── Plugin Host
+├── Lua
+├── Services
+├── IPC
+├── Agent Protocol
+├── Capabilities
+└── UI primitives
+
+
+bitty-ai
+│
+│   AI 基础设施
+│
+├── AI Core
+├── Provider
+├── Runtime
+├── Streaming
+├── Context
+├── Tools
+├── Bitty Bridge
+└── AI Service
+
+
+Lua ecosystem
+│
+├── bitty-ai-chat
+├── bitty-ai-shell
+├── bitty-ai-git
+├── bitty-ai-context
+├── bitty-ai-coding
+├── bitty-ai-complete
+└── ...
+
+其中最重要的关系不是：
+
+Bitty Core → AI
+
+而是：
+
+Bitty Core
+   ↑ generic interfaces
+bitty-ai
+   ↑ AI interfaces
+AI plugins
+
+这就形成了非常漂亮的两级扩展体系。
+
+而且我觉得这其实进一步明确了 Bitty 和 WezTerm、Warp 的区别：Bitty 不是“一个带很多功能的 terminal”，而是在尝试把 window-manager-style composition + Neovim/Emacs-style programmability 做到 terminal workspace 里面。 AI 只是第一个足够复杂、能够验证这套哲学的大型生态，而不是 Core 的中心。
+
+确实在窗口管理器中的，是不是可以把各种弹窗，甚至之后的桌宠插件这种的都是可以设计成一个 floating 模式的 panel 呢？也就是默认都是 tiled 模式，但是别的模式应该也有对应的用处的吧。
+这样的话设计空间就会很大了吧。对了就是在 hyprland 等等窗口管理器都是有一个 mod 键，在 neovim 也是有一个 leader 键的，所以在 bitty 也是有一个默认的 Mod 键位，我设置的默认是 Alt，就比如 Mod+, Mod+? 这种的就会弹出来一个 floating 的帮助 panel，展示各个快捷键这种的
+
+对，而且我觉得这会成为 Bitty UI 系统里非常重要的一层：不要把 Panel 等同于“平铺窗口”，而应该把 Panel 当成一个统一的 UI Surface，然后由不同 presentation mode 决定它怎么出现在 workspace 里。
+
+也就是说：
+
+Panel = 内容和行为
+Mode  = 它如何出现在空间里
+
+这样设计空间会非常大。
+Panel 不应该只有 tiled
+
+我建议至少从架构上区分这几类：
+Mode	用途
+tiled	长期工作的 Terminal、AI、Git、File Panel
+floating	Help、Settings、Quick AI、桌宠、小工具
+overlay	Command Palette、Flash Jump、提示层
+fullscreen	临时最大化 Terminal/AI/Markdown
+scratchpad	平时隐藏，需要时快速召回
+pinned	固定在 workspace 某个边缘
+popover	依附某个 UI element 的小面板
+
+它们最好共享：
+
+PanelId
+Surface
+Focus
+Input
+Lifecycle
+Visibility
+
+但布局策略不同。
+1. 桌宠这种东西确实非常适合 floating panel
+
+例如：
+
+Workspace
+├── Terminal [tiled]
+├── AI       [tiled]
+├── Git      [tiled]
+│
+└── Hamster  [floating]
+
+甚至桌宠插件可以声明：
+
+bitty.ui.panel({
+    id = "hamster",
+    mode = "floating",
+    focusable = false,
+    always_on_top = true,
+    anchor = "bottom-right",
+    width = 20,
+    height = 10,
+})
+
+然后它完全不参与 tiled layout：
+
+┌──────────────────────────────┐
+│ Terminal          │ AI       │
+│                   │          │
+│                   │      🐹  │
+└──────────────────────────────┘
+
+这时候 Bitty 的 UI extensibility 就开始真正体现出来了。
+
+而且这个桌宠甚至可以订阅：
+
+terminal.command-finished
+terminal.command-failed
+workspace.changed
+plugin.loaded
+
+例如：
+
+命令成功 → 仓鼠开心
+命令失败 → 仓鼠疑惑
+长时间 idle → 睡觉
+
+Core 完全不需要知道“桌宠”是什么。
+2. Help Panel 也是最典型的 floating
+
+你说：
+
+Mod + `
+Mod + ?
+
+弹出帮助 panel，这其实非常符合这种体系。
+
+比如：
+
+                   ┌─────────────────────┐
+                   │ Bitty Keybindings   │
+                   │                     │
+                   │ Alt+h  Focus left   │
+                   │ Alt+l  Focus right  │
+                   │ Alt+1  Workspace 1  │
+                   │ ...                 │
+                   └─────────────────────┘
+┌────────────────────────────────────────────┐
+│               Terminal                     │
+│                                            │
+└────────────────────────────────────────────┘
+
+Help panel：
+
+mode       = floating
+temporary  = true
+modal      = maybe
+dismiss    = Esc / same shortcut
+
+这种 UI 就比：
+
+新开一个 terminal pane 显示帮助
+
+自然得多。
+3. overlay 和 floating 最好不要混为一谈
+
+虽然视觉上都“压在 tiled content 上”。
+
+但语义不同。
+Floating
+
+它是一个真正的 Panel：
+
+有生命周期
+可以 focus
+可以移动
+可以 resize
+可以长期存在
+
+例如：
+
+AI Chat
+Help
+File Preview
+桌宠
+Calculator
+
+Overlay
+
+更像：
+
+瞬时 interaction layer
+
+例如：
+
+Command Palette
+Flash Jump
+Completion Menu
+Which-key
+Search Result
+Context Menu
+
+典型结构：
+
+Workspace
+├── Tiled Layer
+├── Floating Layer
+└── Overlay Layer
+
+我觉得这个分层以后非常有价值。
+4. scratchpad 也特别适合 terminal
+
+这个来自 i3/Sway/Hyprland 的思路也非常值得借鉴。
+
+例如用户一直有一个：
+
+AI Chat
+
+但是不希望它长期占屏幕。
+
+那么：
+
+Alt+A
+
+第一次：
+
+show AI scratchpad
+
+第二次：
+
+hide AI scratchpad
+
+类似：
+
+┌──────────────────────────────┐
+│                              │
+│         Terminal             │
+│                              │
+│     ┌─────────────────┐      │
+│     │ Quick AI        │      │
+│     │                 │      │
+│     └─────────────────┘      │
+└──────────────────────────────┘
+
+这会非常适合：
+
+AI
+Calculator
+Notes
+Git status
+Music
+Clipboard history
+Task list
+
+甚至：
+
+desktop pet
+
+都可以是 scratch/floating。
+5. 最好把 Mode 做成 Panel 的 runtime property
+
+也就是说一个 Panel 不应该出生时就永远是：
+
+TiledPanel
+
+或者：
+
+FloatingPanel
+
+更好的模型：
+
+Panel {
+    id,
+    surface,
+    presentation,
+}
+
+然后：
+
+enum PresentationMode {
+    Tiled,
+    Floating,
+    Overlay,
+    Fullscreen,
+    Scratchpad,
+}
+
+于是可以：
+
+AI Panel
+tiled
+↓
+用户按快捷键
+↓
+floating
+↓
+fullscreen
+↓
+tiled
+
+例如：
+
+Alt+Shift+Space
+
+类似 Hyprland 的 togglefloating。
+
+这非常强。
+6. 甚至可以允许插件建议 mode，而不是强制 mode
+
+这里还是 mechanism/policy 分离。
+
+插件声明：
+
+bitty.ui.panel({
+    id = "ai.chat",
+    preferred_mode = "floating",
+})
+
+但最终用户配置可以：
+
+panel.rules({
+    match = "ai.*",
+    mode = "tiled",
+})
+
+或者：
+
+panel.rules({
+    match = "pet.*",
+    mode = "floating",
+    focusable = false,
+})
+
+类似 Hyprland window rules。
+
+这就很有 Bitty 自己的味道了。
+7. 甚至可以发展出 Panel Rules
+
+我觉得这个以后会非常有价值。
+
+例如：
+
+bitty.ui.rule({
+    match = {
+        plugin = "bitty.ai",
+    },
+    mode = "floating",
+    width = "40%",
+    height = "70%",
+    anchor = "right",
+})
+
+或者：
+
+bitty.ui.rule({
+    match = {
+        role = "help",
+    },
+    mode = "floating",
+    centered = true,
+})
+
+甚至：
+
+bitty.ui.rule({
+    match = {
+        role = "notification",
+    },
+    mode = "overlay",
+})
+
+这基本就是把：
+
+Hyprland window rules
+
+映射到了：
+
+Bitty Panel rules
+
+我觉得这是非常合理的。
+8. Mod 键这个设计也非常符合 Bitty
+
+你观察得很对：
+
+Window Manager → Mod
+Neovim        → Leader
+Bitty         → Mod
+
+它们本质上都是：
+
+    进入应用自身 command namespace 的前缀。
+
+例如：
+
+Alt + H/J/K/L
+
+不是发给 shell：
+
+Alt+h
+
+而是：
+
+Bitty: focus panel
+
+因此实际上形成：
+
+普通按键
+↓
+Terminal
+
+Mod + key
+↓
+Bitty
+
+Leader / app-specific
+↓
+Neovim / shell / TUI
+
+这使键盘层次很清楚。
+9. 但 Alt 作为默认 Mod 有一个现实问题需要认真设计
+
+我觉得 Alt 本身是合理的默认值，但一定要考虑 terminal Meta key。
+
+很多 terminal/TUI 本身大量使用：
+
+Alt+b
+Alt+f
+Alt+.
+Alt+Backspace
+
+例如 shell readline、Emacs binding、某些 TUI 都会用。
+
+而 terminal 中：
+
+Alt+key
+
+传统上还可能编码为：
+
+ESC + key
+
+所以如果 Bitty 默认拦截：
+
+所有 Alt + Key
+
+会破坏 terminal 应用。
+
+因此不要设计成：
+
+Alt
+=
+Bitty 全局捕获
+
+而应该：
+
+只有注册的 Alt chord
+→ Bitty
+
+没有注册的 Alt chord
+→ Terminal
+
+例如：
+
+Alt+h
+
+如果 Bitty 没绑定：
+
+send Meta+h to PTY
+
+这样才兼容。
+10. 最好明确一个 Key Dispatch Priority
+
+例如：
+
+1. Emergency / reserved Bitty binding
+2. Active overlay/modal
+3. User-defined Bitty binding
+4. Plugin binding
+5. Terminal encoding
+
+也就是说：
+
+keypress
+   ↓
+Bitty Binding Resolver
+   ↓ matched?
+ yes ───────→ command
+ no
+   ↓
+Terminal Input Encoder
+   ↓
+PTY
+
+这个边界一定要非常确定。
+
+否则以后：
+
+Plugin A
+Plugin B
+Bitty Core
+Terminal
+
+全部争抢按键，会很难维护。
+11. 其实可以同时支持 Mod 和 Leader
+
+这甚至可能比只有 Mod 更有意思。
+Mod
+
+立即 chord：
+
+Alt+h
+Alt+1
+Alt+Enter
+
+适合高频操作。
+Leader
+
+例如：
+
+Alt+Space
+
+进入：
+
+Bitty command sequence
+
+然后：
+
+w  → workspace
+p  → panel
+a  → AI
+g  → git
+?  → help
+
+类似：
+
+tmux prefix
+Neovim leader
+
+结构：
+
+Alt+Space
+   ↓
+Leader mode
+
+w 1
+↓
+workspace 1
+
+这样可以避免快捷键 namespace 爆炸。
+12. Help Panel 可以顺便做成 which-key
+
+这和你前面提到的 Flash 思路其实可以组合起来。
+
+例如按：
+
+Alt+Space
+
+之后 floating overlay 自动显示：
+
+┌────────────────────────────────┐
+│ Bitty                           │
+│                                │
+│ w   Workspace                  │
+│ p   Panel                      │
+│ a   AI                         │
+│ g   Git                        │
+│ f   Focus                      │
+│ ?   Help                       │
+└────────────────────────────────┘
+
+再按：
+
+p
+
+变成：
+
+┌────────────────────────────────┐
+│ Panel                          │
+│                                │
+│ n   New                        │
+│ c   Close                      │
+│ f   Floating                   │
+│ m   Move                       │
+│ j   Jump                       │
+└────────────────────────────────┘
+
+这其实就是：
+
+    which-key + window-manager command mode
+
+非常适合 Bitty。
+13. 再和你之前设计的 Flash-style Jump 结合
+
+例如：
+
+Alt+J
+
+所有 panel 出现：
+
+      A
+┌──────────────┐
+
+               S
+         ┌─────────────┐
+
+ D
+┌──────────────┐
+
+然后按：
+
+S
+
+focus 对应 panel。
+
+甚至：
+
+Alt+Shift+J
+
+进入：
+
+panel action mode
+
+然后：
+
+A → toggle floating
+S → close
+D → fullscreen
+
+这时候 Bitty 的 keyboard interaction 就开始形成自己的完整语言了。
+14. 这实际上也解决了“大量插件”的可发现性问题
+
+插件越多：
+
+AI
+Git
+Files
+Task
+Mail
+Music
+Pet
+Debug
+...
+
+越不可能要求用户记住：
+
+100 个快捷键
+
+所以需要：
+
+Command Registry
++
+Keybinding Registry
++
+Help Panel
++
+Leader
++
+Search
++
+Flash Navigation
+
+最终：
+
+所有插件 command
+       ↓
+统一 Registry
+       ↓
+Command Palette / Help / Which-key
+
+这样插件只需要注册：
+
+bitty.command.register({
+    id = "ai.explain",
+    title = "Explain terminal output",
+    category = "AI",
+})
+
+Bitty 自动知道：
+
+Help 显示什么
+Command Palette 搜什么
+快捷键冲突如何检测
+Leader 菜单怎么生成
+
+这是非常关键的平台能力。
+15. 所以你现在这条 UI 设计路线其实可以总结为三层
+
+Interaction Model
+──────────────────
+Mod
+Leader
+Command Palette
+Flash Jump
+Keyboard Navigation
+
+
+Spatial Model
+──────────────────
+Workspace
+Container
+Tiled
+Floating
+Scratchpad
+Fullscreen
+Overlay
+
+
+Extension Model
+──────────────────
+Panel
+Command
+Event
+Service
+Capability
+Plugin
+
+然后它们会相互组合：
+
+Plugin
+  ↓
+creates Panel
+  ↓
+Workspace compositor
+  ↓
+Tiled/Floating/Overlay
+  ↓
+Mod/Leader/Flash 控制
+
+这时候 Bitty 和普通 terminal 的差距就已经非常明显了。
+我会特别建议你保留一个原则
+Tiled 是默认状态
+
+因为：
+
+稳定
+可预测
+键盘友好
+容易持久化
+容易恢复
+
+Floating 是临时/独立对象
+
+例如：
+
+Help
+AI Quick Chat
+Settings
+Pet
+Preview
+
+Overlay 是瞬时交互
+
+Command Palette
+Flash
+Completion
+Which-key
+
+Scratchpad 是可快速召回的工具
+
+AI
+Notes
+Calculator
+Clipboard
+
+这样语义非常清楚。
+
+而且我觉得你现在默认：
+
+Mod = Alt
+
+本身是可以成立的，只要做到：
+
+    Bitty 只消费已经注册的 Alt binding；未注册的 Alt chord 必须继续传给 terminal。
+
+否则会和 shell/readline/Emacs/TUI 的 Meta key 产生非常大的兼容性问题。
+
+如果这一点处理好，那么 Alt 很适合作为 Bitty 的默认 Mod，因为它确实有很强的 window-manager 使用感，而且比 Ctrl 更不容易和 terminal 最核心的 Ctrl+C/D/Z/L/... 冲突。
+

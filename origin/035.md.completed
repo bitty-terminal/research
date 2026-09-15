@@ -1,0 +1,1238 @@
+对了，之前讨论过 Bitty 的图像渲染相关的协议，Bitty 选择的是 Kitty，然后兼容 Sixel 的形式。
+那么请问下这个选择跟这些部分有联系吗？
+
+- 背景透明度 opacity
+- 背景模糊程度 blur
+- 背景图片 background
+- 主题 theme
+- 之后会有配色方案相关的插件，也就是参考 matugen 这种的根据图片生成的那种
+
+这些是否跟这个图像协议有联系呢
+
+有联系，但应该把它们分成两类来看：
+
+> **Kitty / Sixel 是“终端程序如何把图像交给 Bitty”的协议；opacity / blur / background / theme / matugen 则主要属于 Bitty 自己的 Rendering / Compositor / Theme 系统。**
+
+它们最终会在 **同一条 GPU 合成管线** 中相遇，但不应该在架构上耦合。
+
+## 1. 可以把 Bitty 的渲染理解成几层
+
+我比较建议 Bitty 最后形成类似这样的结构：
+
+```text
+┌─────────────────────────────────────┐
+│ OS Desktop / Wallpaper              │
+├─────────────────────────────────────┤
+│ Window Backdrop                     │
+│   opacity / blur                    │
+├─────────────────────────────────────┤
+│ Bitty Background                    │
+│   background color                  │
+│   background image                  │
+│   tint / dim                        │
+├─────────────────────────────────────┤
+│ Terminal Cell Backgrounds           │
+│   ANSI colors / theme               │
+├─────────────────────────────────────┤
+│ Terminal Graphics                   │
+│   Kitty Graphics                    │
+│   Sixel                             │
+├─────────────────────────────────────┤
+│ Text / Glyphs                       │
+├─────────────────────────────────────┤
+│ Bitty UI / Panel / Floating UI      │
+│   borders / tabs / selection        │
+├─────────────────────────────────────┤
+│ Plugins / overlays / pet / etc.     │
+└─────────────────────────────────────┘
+```
+
+所以之前讨论的 **Kitty primary + Sixel compatibility**，主要对应中间这个 `Terminal Graphics` 层。
+
+而你现在说的：
+
+```text
+opacity
+blur
+background
+theme
+dynamic color scheme
+```
+
+更多是 Bitty 自己的 **Appearance / Composition** 系统。
+
+---
+
+## 2. opacity：有关系，但不是 Kitty Graphics 的 opacity
+
+这里尤其要区分 **三种透明度**。
+
+### A. Window / background opacity
+
+例如：
+
+```lua
+appearance = {
+    opacity = 0.85
+}
+```
+
+意思是：
+
+```text
+Bitty window
+      ↓ alpha
+desktop / wallpaper
+```
+
+这个和 Kitty Graphics Protocol **没有直接关系**。
+
+kitty 自己也是这么设计的，`background_opacity` 控制的是终端默认背景颜色的 opacity，而不是把整个终端里的文字、图片一起透明化。官方还特意指出，它主要作用于与默认 terminal background 相同的 cell，从而避免 Vim status bar、Powerline 等东西也一起变透明。([Kovid Goyal][1])
+
+Bitty 也很适合采取这个语义：
+
+```text
+background opacity ≠ whole-window opacity
+```
+
+否则：
+
+```text
+文字
+图片
+光标
+Panel
+UI
+
+全部 × 0.8
+```
+
+会非常难看。
+
+---
+
+### B. Image alpha
+
+这个才和 Kitty Graphics Protocol **直接相关**。
+
+比如 PNG：
+
+```text
+RGBA
+```
+
+其中某些像素：
+
+```text
+R G B A
+      ↑
+     alpha
+```
+
+Kitty Graphics Protocol 本身支持 alpha blending，而且它明确把“graphics 能够位于 text 上方/下方、能够 alpha blend”作为设计目标。([Kovid Goyal][2])
+
+所以例如：
+
+```text
+透明 PNG
+   ↓ Kitty Graphics
+Bitty ImageObject
+   ↓
+GPU texture RGBA
+   ↓ alpha blend
+Terminal framebuffer
+```
+
+这和：
+
+```lua
+appearance.opacity = 0.85
+```
+
+是完全不同的两个 opacity。
+
+---
+
+### C. Plugin/UI opacity
+
+以后 Bitty 的：
+
+```text
+floating panel
+pet
+notification
+command palette
+AI panel
+```
+
+可能还有：
+
+```lua
+panel.opacity = 0.9
+```
+
+这又应该是 Bitty Scene Graph 自己的 alpha。
+
+所以我甚至建议内部不要只使用一个模糊的：
+
+```rust
+opacity
+```
+
+而是区分：
+
+```rust
+BackgroundOpacity
+SurfaceOpacity
+ImageAlpha
+UiOpacity
+```
+
+至少在 subsystem 层面分清楚。
+
+---
+
+# 3. blur 基本和 Kitty / Sixel 没关系
+
+例如：
+
+```lua
+appearance = {
+    opacity = 0.8,
+    blur = 20,
+}
+```
+
+blur 的意思一般是：
+
+```text
+┌ Bitty ─────────────┐
+│                     │
+│   blurred desktop   │
+│   behind Bitty      │
+│                     │
+└─────────────────────┘
+```
+
+也就是：
+
+```text
+Desktop
+   ↓
+Gaussian / compositor blur
+   ↓
+Bitty translucent surface
+```
+
+这不是：
+
+```text
+Kitty image
+   ↓
+blur
+```
+
+Kitty 自己同样把 `background_blur` 和 `background_opacity` 作为终端窗口 appearance 功能；blur 只有在 opacity < 1 时才有意义，并且需要平台支持。([Kovid Goyal][1])
+
+Bitty 在这方面更应该抽象成：
+
+```rust
+trait BackdropEffect {
+    fn set_opacity(...);
+    fn set_blur(...);
+}
+```
+
+不同平台：
+
+```text
+Linux Wayland
+    ↓ compositor capability / compositor-specific mechanism
+
+macOS
+    ↓ native visual effect / compositor
+
+Windows
+    ↓ DWM / backdrop APIs
+```
+
+所以这是 **platform/windowing backend** 的职责，不应该放进：
+
+```text
+kitty_graphics.rs
+sixel.rs
+```
+
+---
+
+# 4. background image：和 Kitty Graphics “共享基础设施”，但语义不同
+
+这个比较有意思。
+
+例如用户：
+
+```lua
+appearance = {
+    background = "~/Pictures/wallpaper.png"
+}
+```
+
+这里 Bitty 自己加载：
+
+```text
+PNG
+ ↓
+decoder
+ ↓
+RGBA pixels
+ ↓
+GPU Texture
+ ↓
+Background Layer
+```
+
+而：
+
+```bash
+kitten icat cat.png
+```
+
+则是：
+
+```text
+Application
+ ↓
+Kitty Graphics Protocol
+ ↓
+Bitty Kitty Parser
+ ↓
+ImageObject
+ ↓
+GPU Texture
+ ↓
+Terminal Graphics Layer
+```
+
+两条路径最终可能变成：
+
+```text
+                    ┌─ background image
+Image Decoder ──────┼─ Kitty Graphics
+                    ├─ Sixel
+                    ├─ plugin image
+                    └─ pet texture
+                           ↓
+                     Texture Manager
+                           ↓
+                         GPU
+```
+
+所以：
+
+> **协议不应该共享，但图像后端应该共享。**
+
+这是非常值得 Bitty 提前设计好的。
+
+比如可以有：
+
+```rust
+ImageAsset
+ImageDecoder
+Texture
+TextureCache
+ImagePlacement
+ImageRenderer
+```
+
+然后：
+
+```text
+KittyGraphics
+      ↓
+ImageAsset
+
+Sixel
+      ↓
+ImageAsset
+
+Background
+      ↓
+ImageAsset
+
+Plugin
+      ↓
+ImageAsset
+```
+
+但生命周期和 placement namespace 分开。
+
+kitty 本身的 background image 也是独立配置功能，支持 PNG/JPEG/WebP/TIFF/GIF/BMP，并会将多张 background image 按需保存在 GPU VRAM 中。([Kovid Goyal][1])
+
+这正好说明了：
+
+```text
+Terminal Graphics Protocol
+≠
+Terminal Background Image
+
+但它们可以共享 GPU image infrastructure。
+```
+
+---
+
+# 5. Kitty 比 Sixel 对 Bitty 的现代合成模型更加友好
+
+这其实也是为什么你之前选：
+
+```text
+Kitty → primary
+Sixel → compatibility
+```
+
+是很合理的。
+
+Kitty Graphics 有比较完整的：
+
+```text
+RGBA
+alpha blending
+image id
+placement id
+z-index
+relative placement
+animation
+```
+
+尤其是 `z-index` 很重要。
+
+kitty 协议明确允许：
+
+```text
+z < 0
+```
+
+把图像画到文字下面；半透明图像重叠时还会进行 blending。([Kovid Goyal][2])
+
+于是 Bitty 可以自然映射：
+
+```text
+Scene
+│
+├── background
+│
+├── negative Kitty images
+│
+├── cell backgrounds
+│
+├── normal Kitty images
+│
+├── glyphs
+│
+├── positive Kitty images
+│
+└── UI overlay
+```
+
+实际上具体 ordering 还需要按 Kitty specification 精确实现，不过总体就是一个 **scene composition problem**。
+
+Sixel 就传统很多。
+
+Sixel 本质上是把 bitmap raster 编码成 terminal data stream；经典协议还有“是否擦除 image background”这样的 background mode。([VT100][3])
+
+所以 Bitty 最好：
+
+```text
+Sixel Parser
+     ↓
+normalize
+     ↓
+ImageObject / Texture
+```
+
+而不要让 Sixel 的老式 rendering model 渗透到整个 Bitty renderer。
+
+---
+
+# 6. Theme 和 Kitty/Sixel 基本无关
+
+Theme 应该在更高一层。
+
+例如：
+
+```rust
+Theme {
+    foreground,
+    background,
+
+    ansi_0..ansi_15,
+    ansi_256,
+
+    cursor,
+    selection_fg,
+    selection_bg,
+
+    border,
+    panel_bg,
+    panel_fg,
+
+    accent,
+    warning,
+    error,
+    success,
+}
+```
+
+然后：
+
+```text
+                 Theme
+                   │
+        ┌──────────┼──────────┐
+        ↓          ↓          ↓
+ Terminal Cells  Bitty UI   Plugins
+```
+
+Kitty/Sixel：
+
+```text
+                  │
+                  ↓
+              ImageObject
+```
+
+不会去访问 Theme。
+
+---
+
+# 7. 但 theme 和 background / opacity / blur 联系非常紧
+
+这里反而可以做出很漂亮的 Bitty Appearance 系统。
+
+例如：
+
+```lua
+appearance = {
+    theme = "catppuccin-mocha",
+
+    background = {
+        image = "~/Pictures/bg.png",
+        opacity = 0.85,
+        blur = 20,
+        tint = 0.25,
+    },
+}
+```
+
+最终：
+
+```text
+Wallpaper
+   ↓
+Blur
+   ↓
+Background image
+   ↓
+Theme background tint
+   ↓
+Cell background
+   ↓
+Terminal graphics
+   ↓
+Text
+```
+
+而 Kitty 自己也已经存在类似思想：background image 可以按当前 window background color 进行 tint，以提高文字可读性。([Kovid Goyal][1])
+
+Bitty 完全可以做得更统一。
+
+---
+
+# 8. matugen 类型的插件就应该放在 Theme System 上面
+
+你说的这个我非常赞成做成插件，而且它**完全不应该知道 Kitty/Sixel 的存在**。
+
+例如：
+
+```text
+wallpaper.jpg
+      ↓
+bitty-colorgen plugin
+      ↓
+Palette Generator
+      ↓
+Theme
+```
+
+生成：
+
+```text
+primary
+secondary
+surface
+background
+foreground
+accent
+error
+warning
+success
+```
+
+再由 Bitty 做：
+
+```text
+semantic palette
+       ↓
+┌──────┼───────────┐
+↓      ↓           ↓
+ANSI   Bitty UI    Panel UI
+16     colors
+↓
+ANSI 256 mapping
+```
+
+甚至：
+
+```lua
+plugins.colorgen = {
+    source = "~/Pictures/wallpaper.jpg",
+
+    apply = {
+        terminal = true,
+        ui = true,
+        panels = true,
+    }
+}
+```
+
+这会比“插件直接改一堆颜色配置”干净很多。
+
+---
+
+# 9. 甚至可以让 Background → Theme 形成响应式关系
+
+例如：
+
+```text
+                    ┌───────────────┐
+                    │ Background    │
+                    │ Image         │
+                    └───────┬───────┘
+                            │
+                      Palette Extract
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │ Theme Engine  │
+                    └───────┬───────┘
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+          Terminal UI    Bitty Panels   Plugins
+```
+
+然后动态：
+
+```bash
+bitty background set ~/Pictures/foo.png
+```
+
+插件收到：
+
+```text
+BackgroundChanged
+```
+
+重新计算：
+
+```text
+Material / matugen-like palette
+```
+
+然后：
+
+```text
+ThemeChanged
+```
+
+全局平滑 transition。
+
+甚至：
+
+```text
+background image
+      ↓
+dominant color extraction
+      ↓
+OKLCH palette
+      ↓
+ANSI 16
+      ↓
+ANSI 256 approximations
+      ↓
+Bitty semantic colors
+```
+
+这样就相当漂亮。
+
+---
+
+# 10. 所以我会建议 Bitty 最后拆成这几个 subsystem
+
+```text
+bitty-render
+│
+├── compositor
+│   ├── layers
+│   ├── alpha
+│   └── blending
+│
+├── image
+│   ├── decode
+│   ├── texture
+│   ├── cache
+│   └── placement
+│
+├── text
+│   └── glyph renderer
+│
+└── effects
+    └── tint / dim / etc.
+
+bitty-terminal
+│
+├── ansi
+├── kitty-graphics
+└── sixel
+
+bitty-theme
+│
+├── palette
+├── semantic colors
+├── ansi palette
+└── theme manager
+
+bitty-platform
+│
+├── window transparency
+├── backdrop blur
+└── compositor integration
+
+bitty-plugin
+      ↓
+Theme API
+Background API
+Appearance API
+```
+
+这里最重要的一条边界是：
+
+```text
+            Protocol
+ Kitty ────────────────┐
+                       │
+ Sixel ────────────────┼──→ Image / Texture System
+                       │
+ Plugin Image ─────────┤
+                       │
+ Background ───────────┘
+```
+
+也就是说 **“所有图片最终殊途同归，但图片从哪里来这件事情必须保持独立。”**
+
+---
+
+## 一个特别值得现在就确定的原则
+
+我建议 Bitty 明确写进设计文档：
+
+> **Terminal graphics protocols are image producers, not rendering backends.**
+
+Kitty 和 Sixel 只负责：
+
+```text
+bytes
+ ↓
+decode
+ ↓
+image resource + placement semantics
+```
+
+真正负责：
+
+```text
+alpha
+z-order
+GPU texture
+composition
+background
+theme
+blur
+UI
+```
+
+的是 Bitty Renderer。
+
+这样以后无论加入：
+
+```text
+Kitty
+Sixel
+iTerm2 graphics
+background image
+animated wallpaper
+desktop pet
+Markdown image
+AI generated UI
+plugin texture
+video
+```
+
+都不用修改整个架构。
+
+而且这和你前面 Bitty 的 **Panel / Floating Panel / pet / plugin UI** 方向会非常契合：最终 Bitty 会越来越像一个小型 **GPU-composited scene system**，终端字符只是其中最重要的一类 scene content，而 Kitty Graphics 只是另一类内容。
+
+[1]: https://sw.kovidgoyal.net/kitty/conf/ "kitty.conf - kitty"
+[2]: https://sw.kovidgoyal.net/kitty/graphics-protocol/ "Terminal graphics protocol - kitty"
+[3]: https://vt100.net/mirror/mds-199909/cd3/printer/pplv2pmb.pdf?utm_source=chatgpt.com "Digital Ansi-Compliant Print Protocol Lev 2 Program. Ref. Man."
+
+还有光标透明度、光标颜色等等
+而且我刚查了一下，**Rust 生态里已经有 Kitty Graphics Protocol 相关 crate**。不过对 Bitty 来说要特别注意：很多 crate 是给“终端里的应用发送图片”用的，而 Bitty 作为 **terminal emulator**，需要的是另一侧——**解析 Kitty Graphics APC、管理 image/placement、再交给 renderer**。
+
+目前我会重点看下面几个。
+
+* **`termwiz`**：对 Bitty 最有参考价值。它已经能解析 Kitty Graphics 的 APC，并暴露 `KittyImage`、`KittyImageData`、`KittyImageTransmit`、`KittyImagePlacement`、frame/composition 等结构；同时也有 Sixel parser。WezTerm 就是在这个体系上实现 Kitty Graphics 的。([Docs.rs][1])
+* **`kitty-graphics-protocol` 0.1.3**：2026 年较新的独立 crate，宣称完整支持 commands、RGB/RGBA/PNG、chunking、animation、Unicode placeholders 等。([Docs.rs][2])
+* **`kitty_image` 0.1.0**：提供协议里的 `Action`、`Transmission`、`Placement`、Animation 等数据结构，但定位明显更偏向“生成 escape sequence 并显示图片”的 client-side library。([Docs.rs][3])
+* **`little_kitty`**：也是低层 Kitty graphics client API，支持普通 sprite 和 Unicode placeholder mode，更偏发送端。([Docs.rs][4])
+
+## 对 Bitty 来说，真正有用的是 `termwiz`
+
+原因是 Bitty 接收到的其实是类似：
+
+```text
+application
+    │
+    │ ESC _ G ... ESC \
+    ▼
+PTY byte stream
+    │
+    ▼
+terminal parser
+    │
+    ├── ANSI / CSI / OSC
+    │
+    └── APC Kitty Graphics
+              │
+              ▼
+        KittyImageCommand
+              │
+              ▼
+        Image Manager
+              │
+              ▼
+          Renderer
+```
+
+而不是：
+
+```rust
+display_png("image.png")
+```
+
+后者是让一个 CLI 程序**向 Kitty/Bitty 发送图片**。
+
+`termwiz` 的 `escape` 模块正好明确定位为：
+
+> parse escape sequences and attach semantic meaning to them
+
+并且直接 re-export 了 `KittyImage`。([Docs.rs][1])
+
+它内部已经把：
+
+```text
+t=d    direct
+t=f    file
+t=t    temporary file
+t=s    shared memory
+```
+
+这些 transmission medium 都建模了，包括 Unix shared memory / Windows file mapping。([Docs.rs][5])
+
+这对于真正实现 terminal emulator 很重要。
+
+---
+
+## 但是我反而不建议 Bitty 直接依赖整个 `termwiz`
+
+这是关键。
+
+`termwiz` 是 WezTerm 的完整 terminal utility library，目前依赖相当多，例如：
+
+```text
+anyhow
+base64
+bitflags
+fancy-regex
+filedescriptor
+finl_unicode
+fixedbitset
+pest
+pest_derive
+terminfo
+vtparse
+wezterm-bidi
+wezterm-blob-leases
+wezterm-color-types
+wezterm-dynamic
+wezterm-input-types
+...
+```
+
+而它的 package source 本身约 3.63 MB。([Docs.rs][6])
+
+这和你目前 Bitty 一贯的哲学有一点冲突：
+
+```text
+small core
+minimal dependencies
+明确 subsystem boundary
+```
+
+所以如果 Bitty现在已经有自己的：
+
+```text
+VT parser
+terminal state
+screen model
+renderer
+```
+
+只是缺 Kitty Graphics，那么为了一个 Kitty parser 引入整个 `termwiz`，我觉得不太划算。
+
+---
+
+# 我更推荐 Bitty 自己做一个小的 `bitty-graphics-protocol`
+
+其实 Kitty Graphics Protocol 的 **syntax parser 本身并不是最难的部分**。
+
+例如：
+
+```text
+ESC _ G
+a=T,f=32,s=800,v=600,i=42;
+<base64 data>
+ESC \
+```
+
+本质就是：
+
+```text
+APC
+ ↓
+_G
+ ↓
+key=value,key=value,...
+ ↓
+;
+ ↓
+payload
+ ↓
+ST
+```
+
+真正复杂的是后面的 **state machine / resource management**：
+
+```text
+Transmit
+Put
+Delete
+Query
+
+image id
+placement id
+
+chunking
+compression
+shared memory
+
+Unicode placeholders
+
+animation frames
+frame composition
+
+z-index
+
+scroll behavior
+```
+
+Kitty 官方 specification 本来就是把 graphics 看成独立于 terminal cells 的 image/placement system，并且支持文字上下层、alpha blending 等。([GitHub][7])
+
+因此我更倾向：
+
+```text
+bitty-core
+├── vt
+│   └── APC detection
+│
+├── graphics
+│   ├── kitty
+│   │   ├── parser.rs
+│   │   ├── command.rs
+│   │   ├── transmit.rs
+│   │   ├── placement.rs
+│   │   ├── animation.rs
+│   │   └── state.rs
+│   │
+│   └── sixel
+│       ├── parser.rs
+│       └── decoder.rs
+│
+└── image
+    ├── store.rs
+    ├── texture.rs
+    └── placement.rs
+```
+
+然后：
+
+```rust
+enum GraphicsCommand {
+    Kitty(KittyCommand),
+    Sixel(SixelImage),
+}
+```
+
+最终统一进入：
+
+```rust
+ImageStore
+ImagePlacement
+```
+
+再交给 renderer。
+
+---
+
+## 有一个中间方案倒是很值得考虑
+
+可以**参考甚至抽取 `termwiz` Kitty parser 的设计**，而不把整个 `termwiz` 加进 production dependency。
+
+因为它已经把 Kitty protocol 的 command model 做得比较完整：
+
+```rust
+KittyImage
+KittyImageData
+KittyImageTransmit
+KittyImagePlacement
+KittyImageFrame
+KittyImageFrameCompose
+```
+
+而且 WezTerm 的实际实现证明了这种模型能用于 terminal emulator。WezTerm 的 Kitty support issue 里明确列出了：
+
+```text
+termwiz: parse APC escapes
+termwiz: parse baseline Kitty Image protocol
+term: placement model
+wezterm-gui: renderer quads
+animation/composition
+shared memory
+Unicode placeholders
+```
+
+这条分层路线其实跟我们刚才给 Bitty 讨论的架构非常接近。([GitHub][8])
+
+---
+
+## `kitty-graphics-protocol` 可以用吗？
+
+这个 crate 很新，目前 `0.1.3`，而且依赖相当轻：
+
+```text
+base64
+thiserror
+libc
+```
+
+它宣称：
+
+```text
+all graphics commands
+RGB / RGBA / PNG
+chunking
+animation
+Unicode placeholders
+protocol detection
+```
+
+([Docs.rs][9])
+
+所以它**非常值得研究**。
+
+但是从它目前公开文档的 API 看：
+
+```rust
+display_png(...)
+display_png_data(...)
+ImageDisplay::display_rgba(...)
+```
+
+它的主要设计中心仍然明显偏向：
+
+```text
+Rust application
+       ↓
+encode Kitty Graphics Protocol
+       ↓
+terminal emulator
+```
+
+而 Bitty需要：
+
+```text
+terminal emulator
+       ↑
+decode Kitty Graphics Protocol
+       ↑
+application
+```
+
+所以在决定直接依赖之前，我会重点检查它有没有暴露：
+
+```rust
+fn parse(...)
+fn decode_command(...)
+KittyCommand::from_str(...)
+```
+
+这种 **receiver-side API**。
+
+如果没有，那它最多适合作为：
+
+1. Bitty integration test 的发送端；
+2. 协议数据结构参考；
+3. 测试 Bitty 是否兼容 Kitty protocol。
+
+---
+
+# 其实它特别适合拿来做 Bitty 测试
+
+即使最终 Bitty 不依赖它，也可以加入：
+
+```toml
+[dev-dependencies]
+kitty-graphics-protocol = "0.1"
+```
+
+然后测试：
+
+```text
+kitty-graphics-protocol
+          │
+          │ generate APC
+          ▼
+    Bitty VT Parser
+          │
+          ▼
+   Kitty Parser
+          │
+          ▼
+     ImageStore
+          │
+          ▼
+      Placement
+```
+
+这样可以避免：
+
+```rust
+let input = b"\x1b_Ga=T,f=32,..."
+```
+
+到处手写协议。
+
+这种用途我觉得反而非常合适。
+
+---
+
+# 我的建议
+
+如果现在让我给 Bitty 定方向，我会选：
+
+```text
+Production
+──────────
+
+Bitty VT Parser
+      │
+      ▼
+bitty 自己的 Kitty Graphics parser
+      │
+      ▼
+bitty ImageStore / Placement
+      │
+      ▼
+Renderer
+
+
+Reference
+─────────
+
+termwiz
+kitty official spec
+WezTerm implementation
+
+
+Dev / compatibility tests
+─────────────────────────
+
+kitty-graphics-protocol
+```
+
+而不是：
+
+```text
+bitty
+  ↓
+整个 termwiz
+```
+
+尤其 Bitty之后还有：
+
+```text
+Kitty Graphics
+Sixel
+background image
+plugin image
+pet
+Markdown image
+AI panel image
+```
+
+最好从一开始就建立自己的：
+
+```text
+Graphics Protocol
+        ↓
+Image Resource
+        ↓
+Image Placement
+        ↓
+Renderer
+```
+
+抽象，而不是把 WezTerm 的内部 image model 当成 Bitty 的核心模型。
+
+另外还有一个很好的信号：最近的 `par-term-emu-core-rust` 也正在做类似设计，它实现了自己的 `KittyParser`，在进入 `vte::Parser` 前专门 intercept `ESC _ G ... ST` 的 APC，因为 `vte 0.15` 本身不会把 APC payload 交给 `Perform`。([Docs.rs][10])
+
+所以如果 **Bitty 当前 VT parser 也基于 `vte` crate**，这点需要特别检查——Kitty Graphics 很可能不能单纯依赖现有 `vte::Perform` callback 就完成。这个会直接影响你现在应该怎么接 Kitty Graphics。
+
+[1]: https://docs.rs/termwiz/latest/termwiz/escape/index.html?utm_source=chatgpt.com "termwiz::escape - Rust"
+[2]: https://docs.rs/crate/kitty-graphics-protocol/latest?utm_source=chatgpt.com "kitty-graphics-protocol 0.1.3 - Docs.rs"
+[3]: https://docs.rs/kitty_image/latest/kitty_image/?utm_source=chatgpt.com "kitty_image - Rust"
+[4]: https://docs.rs/little-kitty?utm_source=chatgpt.com "little_kitty - Rust"
+[5]: https://docs.rs/termwiz/latest/src/termwiz/escape/apc.rs.html "apc.rs - source"
+[6]: https://docs.rs/crate/termwiz/latest/source/Cargo.toml?utm_source=chatgpt.com "termwiz 0.23.3 - Docs.rs"
+[7]: https://github.com/kovidgoyal/kitty/blob/master/docs/graphics-protocol.rst?utm_source=chatgpt.com "kitty/docs/graphics-protocol.rst at master · kovidgoyal/kitty · GitHub"
+[8]: https://github.com/wezterm/wezterm/issues/986?timeline_page=1&utm_source=chatgpt.com "Kitty Image Protocol Support · Issue #986 · wezterm/wezterm · GitHub"
+[9]: https://docs.rs/crate/kitty-graphics-protocol/latest/source/Cargo.toml?utm_source=chatgpt.com "kitty-graphics-protocol 0.1.3 - Docs.rs"
+[10]: https://docs.rs/crate/par-term-emu-core-rust/latest/source/CHANGELOG.md?utm_source=chatgpt.com "par-term-emu-core-rust 0.48.0 - Docs.rs"

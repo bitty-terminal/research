@@ -1,0 +1,2018 @@
+我会建议 Bitty Core 本身完全不引入网络依赖。
+
+也就是说：
+
+bitty-core
+bitty-terminal
+bitty-render
+bitty-panel
+bitty-plugin-host
+bitty-config
+
+这些模块都应该是 network-free。
+
+真正涉及网络的只有：
+
+bitty plugin install
+bitty plugin update
+bitty plugin search
+bitty self-update        # 如果以后做
+
+而且我甚至建议把这些能力放到一个独立层：
+
+bitty-package / bitty-plugin-manager
+
+而不是让整个 bitty 二进制到处依赖 HTTP client。
+1. Bitty 和 CarryCtx 的情况其实不太一样
+
+CarryCtx 可以做到：
+
+    “我只管理本地状态，同步交给 Git。”
+
+这是非常合理的，因为 CarryCtx 本质是：
+
+local data
+    ↓
+filesystem / sqlite
+    ↓
+git
+    ↓
+remote
+
+它自己根本不需要理解网络。
+
+Bitty 也可以在相当长一段时间里采用类似哲学。
+
+例如插件：
+
+bitty plugin add https://github.com/foo/bar
+
+内部实际上：
+
+Bitty
+  ↓
+调用 git
+  ↓
+git clone
+  ↓
+~/.local/share/bitty/plugins/bar
+
+更新：
+
+bitty plugin update bar
+    ↓
+git fetch
+git checkout <version/commit>
+
+这样 Bitty 完全不需要 HTTP client。
+2. 我反而不建议用 curl
+
+例如千万不要把插件安装设计成：
+
+curl https://plugins.bitty.run/foo.tar.gz
+
+然后：
+
+download
+unzip
+install
+
+因为一旦这么做，你很快就会遇到：
+
+HTTP
+TLS
+proxy
+redirect
+timeout
+retry
+checksum
+signature
+cache
+resume
+compression
+authentication
+release assets
+Windows compatibility
+
+如果是：
+
+Command::new("curl")
+
+你实际上只是把网络复杂性转嫁给外部程序。
+
+而且还增加了：
+
+curl 是否存在？
+curl 版本？
+Windows 上行为？
+用户 proxy 配置？
+证书配置？
+错误信息解析？
+
+所以：
+
+    如果 Bitty 初期要避免网络依赖，优先调用 git，而不是调用 curl。
+
+3. 为什么 Git 特别适合 Bitty Plugin
+
+因为你现在的插件体系本身就非常适合 Git。
+
+例如之前规划的：
+
+bitty-plugins/
+├── app/
+├── plugins/
+│   ├── activity -> github.com/bitty-terminal/activity
+│   ├── beacon   -> github.com/bitty-terminal/beacon
+│   └── ...
+└── registry.toml
+
+第三方开发者本身也是：
+
+GitHub repository
+    ↓
+bitty plugin SDK
+    ↓
+plugin manifest
+    ↓
+Lua / WASM / assets
+
+因此插件天然就有：
+
+repository URL
+commit
+tag
+branch
+version
+
+Git 已经替你解决了大量问题：
+
+下载
+版本历史
+增量更新
+哈希标识
+回滚
+远程源
+认证
+SSH
+HTTPS
+代理
+缓存
+
+例如：
+
+bitty plugin add github:user/foo
+
+可以规范化成：
+
+https://github.com/user/foo.git
+
+然后：
+
+git clone --filter=blob:none --depth=1 \
+    --branch v1.3.0 \
+    https://github.com/user/foo.git
+
+甚至以后可以：
+
+bitty plugin add foo@1.3.0
+
+解析 registry：
+
+[foo]
+repo = "https://github.com/user/foo"
+version = "1.3.0"
+rev = "abc123..."
+
+最终仍然交给 Git。
+4. 但不要让 Bitty “依赖 Git 才能运行”
+
+这里需要明确区分：
+
+Bitty runtime
+
+和：
+
+Bitty package management
+
+应该是：
+
+                  ┌──────────── bitty terminal
+                  │
+bitty executable ─┼──────────── bitty panel
+                  │
+                  ├──────────── bitty ai
+                  │
+                  └─ plugin ─── bitty package manager
+                                  │
+                                  └── Git
+
+也就是说：
+
+bitty
+
+永远不需要：
+
+git
+curl
+network
+
+但：
+
+bitty plugin install xxx
+
+如果没有 Git，可以：
+
+error: Git is required to install plugins from Git repositories.
+
+Install Git or manually place the plugin in:
+~/.local/share/bitty/plugins/
+
+这样就很好。
+5. bitty plugin 可以设计成 Source Backend
+
+我很推荐不要把 Git 写死到 package manager 的业务逻辑里。
+
+设计：
+
+trait PluginSource {
+    fn resolve(&self, spec: &PluginSpec) -> Result<ResolvedPlugin>;
+    fn fetch(&self, plugin: &ResolvedPlugin, dest: &Path) -> Result<()>;
+    fn update(&self, plugin: &InstalledPlugin) -> Result<()>;
+}
+
+然后最开始只有：
+
+GitSource
+LocalSource
+
+例如：
+
+PluginSource
+├── LocalSource
+└── GitSource
+
+以后再扩展：
+
+PluginSource
+├── LocalSource
+├── GitSource
+├── RegistrySource
+├── HttpArchiveSource
+└── OCISource      # 甚至以后可能
+
+于是用户可以：
+
+bitty plugin add ./foo
+bitty plugin add https://github.com/foo/bar
+bitty plugin add foo/bar
+bitty plugin add activity@1.2.0
+
+它们只是不同 source。
+6. Registry 和插件源码最好分开
+
+这是 Bitty 很值得提前设计好的地方。
+
+我建议：
+
+plugins.bitty.run
+
+负责：
+
+metadata
+search
+discovery
+README
+screenshots
+versions
+authors
+permissions
+compatibility
+
+但是：
+
+    它不一定负责托管插件本体。
+
+例如 registry：
+
+[[plugin]]
+name = "activity"
+description = "Activity tracking for Bitty"
+
+[source]
+type = "git"
+url = "https://github.com/bitty-terminal/activity"
+
+[version]
+latest = "0.4.2"
+rev = "a81d..."
+
+CLI：
+
+bitty plugin install activity
+
+流程：
+
+registry
+   ↓
+resolve metadata
+   ↓
+https://github.com/bitty-terminal/activity
+   ↓
+git clone
+
+这样 Bitty 官方不用承担：
+
+plugin binary hosting
+CDN
+large artifacts
+version archives
+bandwidth
+
+7. 那 Registry 本身怎么获取？
+
+这里有两个阶段。
+V1：Registry 也是 Git
+
+这是我目前最推荐 Bitty 使用的方案。
+
+例如：
+
+github.com/bitty-terminal/bitty-plugins
+
+里面：
+
+registry/
+├── activity.toml
+├── beacon.toml
+├── pet.toml
+└── ...
+
+第一次：
+
+git clone https://github.com/bitty-terminal/bitty-plugins-registry
+
+缓存到：
+
+$XDG_CACHE_HOME/bitty/registry/
+
+以后：
+
+git fetch
+
+于是：
+
+bitty plugin search pet
+
+其实完全是本地搜索：
+
+registry cache
+    ↓
+parse TOML
+    ↓
+search
+
+甚至可以：
+
+bitty plugin registry update
+
+显式更新。
+
+这与你 CarryCtx 的哲学非常接近。
+8. 后期再考虑 Native HTTP
+
+等 Bitty 真正成熟以后，你大概率还是会需要 HTTP。
+
+例如：
+
+plugin registry API
+binary plugin releases
+WASM package
+precompiled native plugin
+self-update
+telemetry（如果未来有，而且必须 opt-in）
+AI provider HTTP API
+OAuth
+remote sessions
+cloud sync
+
+特别是：
+
+bitty-ai
+
+如果直接调用：
+
+OpenAI API
+Anthropic API
+Gemini API
+OpenRouter
+
+那显然不可避免需要 HTTP。
+
+但这里仍然应该做到：
+
+bitty-core      ← network-free
+bitty-ai-core   ← network-free
+bitty-ai-provider-http
+                  ↓
+               HTTP
+
+而不是：
+
+bitty-core
+└── reqwest
+
+9. 如果以后确实引入 HTTP，我建议 reqwest + rustls
+
+例如：
+
+[dependencies]
+reqwest = { version = "...", default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
+
+但是放在类似：
+
+crates/
+├── bitty-core/
+├── bitty-terminal/
+├── bitty-plugin/
+├── bitty-package/
+├── bitty-net/             # optional
+└── bitty-ai-provider/
+
+甚至 feature：
+
+[features]
+default = []
+network = ["dep:reqwest"]
+
+这样：
+
+cargo build --no-default-features
+
+仍然可以得到一个：
+
+    完全不需要网络栈的 Bitty。
+
+这个属性其实很漂亮。
+10. git2 也不建议一开始使用
+
+还有一个选择是：
+
+git2
+
+也就是 libgit2 Rust binding。
+
+看起来可以：
+
+Repository::clone(...)
+
+不用执行：
+
+git clone
+
+但我目前不建议 Bitty 使用。
+
+因为这样等于：
+
+Bitty
+  ↓
+git2
+  ↓
+libgit2
+  ↓
+TLS / SSH / crypto
+
+结果依赖反而更重。
+
+而且系统 Git 本来已经处理好了：
+
+~/.gitconfig
+SSH agent
+credential helper
+proxy
+CA
+GitHub authentication
+
+所以直接：
+
+Command::new("git")
+
+对于 Bitty 反而更加 Unix philosophy：
+
+    不要重新实现 Git。
+
+11. 最终我推荐这样的架构
+
+bitty
+│
+├── bitty-core                # ❌ network
+├── bitty-terminal            # ❌ network
+├── bitty-render              # ❌ network
+├── bitty-panel               # ❌ network
+├── bitty-plugin-host         # ❌ network
+├── bitty-config              # ❌ network
+│
+├── bitty-package
+│   │
+│   ├── resolver
+│   ├── manifest
+│   ├── lockfile
+│   └── source
+│       ├── local             # ❌ network
+│       └── git               # external git
+│
+└── bitty-ai
+    ├── core                  # ❌ network
+    ├── agent                 # ❌ network
+    ├── tools                 # mostly ❌ network
+    └── providers
+        ├── openai            # ✅ network
+        ├── anthropic         # ✅ network
+        └── openrouter        # ✅ network
+
+插件安装：
+
+bitty plugin install activity
+            │
+            ▼
+     PluginResolver
+            │
+            ▼
+     Registry Cache
+            │
+            ▼
+       GitSource
+            │
+            ▼
+        git clone
+            │
+            ▼
+ ~/.local/share/bitty/plugins/activity
+
+然后生成：
+
+bitty.lock
+
+例如：
+
+[[plugin]]
+name = "activity"
+source = "git+https://github.com/bitty-terminal/activity"
+version = "0.3.1"
+rev = "7fa31c..."
+
+这样就获得了 reproducibility。
+我的建议
+
+你在 CarryCtx 上形成的那个设计原则，其实也非常适合 Bitty：
+
+    网络不是基础能力，而是边界能力。
+
+对于 Bitty，我会进一步演化成：
+
+Core never talks to the network.
+
+也就是 Bitty Core 只理解：
+
+PTY
+terminal state
+rendering
+Panel
+IPC
+plugin runtime
+filesystem
+process
+config
+events
+
+至于：
+
+GitHub
+HTTP
+OpenAI
+Anthropic
+registry
+remote server
+
+全部放在 adapter / provider / source 层。
+
+而当前 bitty plugin 最合适的第一版就是：
+
+LocalSource + GitSource
+
+调用系统 git，不用 curl，不用 git2，不用 reqwest。
+
+等以后真的出现「Git 无法很好解决」的场景，再加入独立的 bitty-net / HttpSource。这样不会因为一个 bitty plugin install，让整个终端模拟器背上一整套 TLS/HTTP/network dependency tree。
+
+那么看看各个终端模拟器，哪些是有网络依赖的呢？对于 Unix 来说，这些应该本身不需要网络依赖吧？
+
+对。从 Unix 的传统模型来看，Terminal Emulator 本身并不需要网络能力。
+
+它最核心的路径其实只有：
+
+keyboard/mouse
+      ↓
+terminal emulator
+      ↓
+PTY master
+      ↕
+PTY slave
+      ↓
+shell / application
+
+然后再加：
+
+VT parser
+font shaping
+GPU/software rendering
+clipboard
+input method
+window system
+filesystem/config
+IPC
+
+这里没有任何一步天然要求 TCP、HTTP、TLS、SSH。
+几个典型终端的情况
+Terminal	Core 是否需要网络	自带网络能力	大致设计
+Alacritty	❌	基本无	极简、本地 PTY
+foot	❌	基本无	非常 Unix-style
+Ghostty	❌	部分辅助	SSH 主要调用系统 ssh
+kitty	❌	✅ 部分功能	kittens 可访问网络，SSH 包装系统 ssh
+WezTerm	✅/功能层需要	✅ 很强	内建 SSH、TLS、remote mux
+Contour	✅/功能层需要	✅	已有 in-process SSH、remote daemon
+GNOME Terminal / VTE	❌	基本无	本地 PTY + GUI
+
+这里所谓 Core 不需要网络 和“整个软件完全没有联网功能”要区分开。
+Alacritty
+
+Alacritty 是最典型的例子。
+
+它的官方 README 对运行要求主要就是图形系统，比如 OpenGL ES 2.0，以及 Windows 的 ConPTY，没有把 SSH / HTTP / remote session 当作 terminal 自身能力。
+
+它的哲学本身就是：
+
+    terminal emulator 做 terminal emulator 的事情。
+
+甚至 tabs/splits 都长期倾向于交给 window manager / tmux 等外部组件。
+
+所以可以近似理解成：
+
+Alacritty
+├── PTY
+├── terminal parser
+├── renderer
+├── input
+└── window
+
+没有：
+
+HTTP client
+SSH client
+TLS client
+plugin registry
+remote server
+
+这与你目前对 Bitty Core 的设想很接近。
+Ghostty
+
+Ghostty 也很有意思，因为它现在有 SSH integration，但仍然没有因此要求“Terminal Core 自己实现 SSH”。
+
+它目前的：
+
+ghostty +ssh user@server
+
+官方明确说这是一个 SSH wrapper，最后 exec 真正的系统 ssh binary。
+
+即：
+
+Ghostty
+   ↓
+prepare environment
+terminfo / env / shell integration
+   ↓
+exec("ssh")
+   ↓
+OpenSSH
+   ↓
+network
+
+而不是：
+
+Ghostty
+   ↓
+libssh
+TLS
+TCP
+crypto
+
+这其实和我们刚才讨论的：
+
+bitty plugin
+    ↓
+git
+
+思路高度一致。
+一个容易混淆的地方
+
+Ghostty 编译时会联网下载 Zig dependencies。例如当前 build.zig.zon 中存在从 deps.files.ghostty.org 获取依赖的情况。
+
+但：
+
+build-time network
+≠
+runtime network dependency
+
+这两者完全不同。
+
+Cargo 也是一样：
+
+cargo build
+
+默认需要访问 crates.io，并不能说明你编译出来的软件需要网络。
+kitty 属于中间路线
+
+kitty Core 本身也并不要求互联网。
+
+但是 kitty 已经不是一个“纯 PTY renderer”了，它有很多 kittens。
+
+例如：
+
+kitten ssh hostname
+
+kitty 官方说明这个 ssh kitten 是：
+
+    traditional ssh command line program 的 thin wrapper
+
+也就是仍然大量复用系统 SSH。
+
+因此：
+
+kitty
+ ↓
+ssh kitten
+ ↓
+OpenSSH
+ ↓
+network
+
+它自己没有必要重新实现整个 SSH protocol。
+
+但 kitty 的某些其他 feature 会真正访问网络。
+
+比如：
+
+kitten themes
+
+主题列表可以从中央 repository 获取；维护者也明确解释过这个过程会联网，并提供 cache age 控制。
+
+所以 kitty 属于：
+
+Terminal Core         ❌ network required
+kittens/features      ✅ some network access
+
+另外 kitty remote control 可以监听：
+
+unix:/tmp/mykitty
+
+甚至 TCP socket。官方文档同时支持 Unix-domain socket 和 TCP socket。
+
+不过这里又有一个重要概念：
+
+    Unix Domain Socket 不应该简单算作“网络依赖”。
+
+比如：
+
+AF_UNIX
+SOCK_STREAM
+
+虽然 API 长得很像 socket networking：
+
+socket()
+bind()
+listen()
+accept()
+
+但数据根本不会经过 IP 网络栈，是本机 IPC。
+
+因此 Bitty 将来大量使用：
+
+$XDG_RUNTIME_DIR/bitty.sock
+
+完全不违背：
+
+    Core is network-free.
+
+WezTerm 就完全不同了
+
+WezTerm 是一个很好的反例。
+
+它已经把：
+
+terminal emulator
++
+multiplexer
++
+SSH client
++
+remote terminal
++
+TLS transport
+
+集成到一个系统里。
+
+官方支持：
+
+SSH Domain
+TLS Domain
+Unix Domain
+local mux
+remote mux
+
+SSH Domain 使用 libssh2，TLS Domain 可以通过 SSH bootstrap，然后直接使用 TLS TCP connection。
+
+而且看看当前 workspace dependencies 就非常明显：
+
+git2 = { ..., features = ["https"] }
+
+http_req = "0.11"
+reqwest = "0.12"
+
+libssh-rs = "0.3.8"
+ssh2 = "0.9.3"
+
+openssl = "..."
+socket2 = "..."
+rcgen = "..."
+
+这些都直接出现在 WezTerm workspace 里。
+
+所以：
+
+WezTerm
+├── Terminal
+├── Mux
+├── SSH
+├── TLS
+├── HTTP
+├── remote daemon
+└── networking
+
+它已经不是传统意义上的“只做终端模拟”的软件了。
+
+这不是坏设计，只是 product boundary 不一样。
+Contour 现在也走向 WezTerm 这边了
+
+Contour 2026 年的设计也已经明显往：
+
+terminal + persistent remote workspace
+
+发展。
+
+它现在支持 daemon mode，可以让 session 在 window 关闭后继续存在，并且：
+
+    可以从另一台机器通过 encrypted connection reattach。
+
+而且它还有 in-process SSH，也就是说不像 Ghostty/kitty 单纯调用系统 ssh，SSH 能力已经进入应用内部。
+
+所以这类终端自然会出现真正的 network dependency。
+所以 Unix Terminal 的经典哲学其实是
+
+传统 Unix 会更倾向于：
+
+Terminal Emulator
+        │
+        ├── PTY
+        ├── Rendering
+        └── Input
+
+ssh              ← OpenSSH
+tmux             ← tmux
+scp/rsync        ← dedicated tools
+git              ← Git
+curl             ← curl
+shell            ← bash/zsh/fish
+
+而不是：
+
+Terminal Emulator
+├── PTY
+├── rendering
+├── SSH
+├── HTTP
+├── Git
+├── SCP
+├── package manager
+├── TLS
+└── sync
+
+也就是非常经典的：
+
+    composition over integration
+
+终端只是承载这些程序。
+
+例如你在 Bitty 里：
+
+ssh server
+
+真正联网的是：
+
+ssh process
+
+而不是：
+
+Bitty
+
+Bitty 只是在：
+
+PTY
+ ↑↓
+ssh
+
+之间传递 bytes。
+对 Bitty 来说，我觉得这个边界应该非常明确
+
+我现在会更加倾向于把规则直接写成一条 architecture invariant：
+
+bitty-core MUST NOT initiate Internet/network connections.
+
+注意是：
+
+    initiate Internet/network connections
+
+而不是禁止 socket。
+
+因为 Bitty 本身肯定会有：
+
+Unix Domain Socket
+IPC
+Panel IPC
+Agent IPC
+daemon IPC
+plugin host IPC
+
+这些完全合理。
+
+可以进一步分：
+
+                bitty-core
+                    │
+          ┌─────────┼──────────┐
+          ▼         ▼          ▼
+        PTY      Renderer     IPC
+                              │
+                           AF_UNIX
+
+全部 network-free。
+
+外部能力：
+
+bitty plugin install
+        │
+        └──── exec git ───────► Internet
+
+bitty ssh
+        │
+        └──── exec ssh ───────► Internet
+
+而 AI：
+
+bitty-ai
+   │
+   └── provider
+         ├── local Ollama
+         ├── OpenAI
+         ├── Anthropic
+         └── ...
+
+这时候 HTTP 才真正必要。
+
+但也不要让它污染：
+
+bitty-core
+
+而应该：
+
+bitty
+├── bitty-core             # network-free
+├── bitty-terminal         # network-free
+├── bitty-panel            # network-free
+├── bitty-plugin-host      # network-free
+│
+├── bitty-package
+│    └── GitSource
+│         └── exec git
+│
+└── bitty-ai-provider-http
+     └── HTTP/TLS
+
+这样甚至可以得到一个非常漂亮的性质：
+
+bitty
+
+拔掉网线完全不影响 Bitty 本身任何 terminal 功能。
+
+只有当用户主动执行：
+
+bitty plugin install xxx
+
+或者使用：
+
+AI cloud provider
+SSH
+network plugin
+
+时，网络才存在。
+
+这比“为了一个 plugin manager 给 Bitty 主 binary 引入 reqwest + rustls + hyper + ...”更符合 Bitty 目前的 Core 极简 + Plugin 扩展哲学。WezTerm 可以作为“高度集成路线”的参考，而 Alacritty / Ghostty + Unix tool composition 更适合作为 Bitty Core 的参考。
+
+那么 bitty 就选择用系统的 git 就行了，因为现在没有必要引入，而且没有那种相关的需求。
+那么这种的是否可以通过 Lua 插件来做呢？比如做一个天气插件，那么获取天气需要网络，那么这种的是怎么做呢？
+
+可以，而且我觉得天气插件正好是验证 Bitty 插件 capability 设计的好例子。
+
+关键不是“Lua 能不能联网”，而是：
+
+    Lua 插件不应该自己随便获得 socket/network 能力；Bitty 应该给插件一个受控的 Network Capability。
+
+而这个 Capability 的底层，第一版完全可以调用系统 curl。
+我推荐的模型
+
+Lua 插件写成：
+
+local res = bitty.http.get(
+  "https://api.open-meteo.com/v1/forecast?...")
+
+local data = res:json()
+
+panel:set_content({
+  temperature = data.current.temperature_2m,
+  weather = data.current.weather_code,
+})
+
+但实际链路是：
+
+weather.lua
+    │
+    │ bitty.http.get()
+    ▼
+Bitty Plugin Host
+    │
+    ├─ permission check
+    │
+    ▼
+HTTP Capability
+    │
+    └─ exec("curl", ...)
+              │
+              ▼
+           Internet
+
+所以：
+
+Lua plugin        不直接联网
+Bitty Core        不直接联网
+Bitty Plugin Host 不直接联网
+curl              真正负责联网
+
+这个边界非常漂亮。
+为什么不让 Lua 直接 curl
+
+当然你也可以简单做：
+
+os.execute("curl ...")
+
+甚至：
+
+local p = io.popen("curl -s ...")
+local result = p:read("*a")
+
+技术上完全可行。
+
+但我不建议把这变成 Bitty Plugin 的正式 API。
+
+因为这样天气插件需要：
+
+process execution
+filesystem access
+shell access
+network indirectly
+
+一个插件本来只需要：
+
+    “访问 api.open-meteo.com”
+
+结果你却给了它：
+
+    “执行任意系统命令”
+
+权限差距太大：
+
+net.http
+
+        VS
+
+process.exec("*")
+
+后者相当于插件可以：
+
+rm -rf ...
+ssh ...
+curl ...
+git ...
+python ...
+bash ...
+
+这和未来想做的 plugin sandbox / permissions 是冲突的。
+所以最好做成 Capability API
+
+之前 Bitty 插件体系里本身就很适合这种思想。
+
+例如：
+
+bitty.*
+├── panel
+├── terminal
+├── fs
+├── process
+├── clipboard
+├── timer
+├── http
+├── notifications
+└── ...
+
+天气插件声明：
+
+[plugin]
+name = "weather"
+
+[permissions]
+network = [
+    "https://api.open-meteo.com"
+]
+
+或者更结构化：
+
+[permissions.network]
+hosts = [
+    "api.open-meteo.com"
+]
+
+methods = ["GET"]
+
+第一次安装：
+
+Install "Weather"?
+
+Permissions:
+
+  Network
+    GET https://api.open-meteo.com
+
+  Panel
+    Create floating panel
+
+[Allow] [Cancel]
+
+这就比：
+
+permission = ["process.exec"]
+
+安全得多。
+一个特别好的地方：API 和实现可以分离
+
+这是我很推荐 Bitty 从一开始就做的。
+
+Lua 看到的始终是：
+
+bitty.http.get(...)
+
+但 Bitty 内部 V1：
+
+bitty.http
+    ↓
+CurlBackend
+    ↓
+system curl
+
+以后如果需要：
+
+bitty.http
+    ↓
+┌──────────────┐
+│ CurlBackend  │
+├──────────────┤
+│ NativeBackend│
+└──────────────┘
+
+甚至：
+
+HttpBackend
+├── curl
+├── wget
+├── native
+└── disabled
+
+Lua 插件完全不用修改。
+
+这就是 abstraction boundary 的价值。
+第一版甚至可以非常简单
+
+Rust 大概是这样的概念：
+
+trait HttpBackend {
+    fn request(&self, req: HttpRequest) -> Result<HttpResponse>;
+}
+
+V1：
+
+struct CurlBackend;
+
+内部：
+
+Command::new("curl")
+    .args([
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--location",
+        "--max-time",
+        "10",
+        url,
+    ])
+
+然后把：
+
+stdout
+status code
+headers
+
+转成 Bitty 自己定义的：
+
+struct HttpResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+再暴露给 Lua：
+
+local response = bitty.http.request {
+    method = "GET",
+    url = "...",
+    timeout = 5000,
+}
+
+这样 Lua 完全不知道 curl 的存在。
+JSON 也应该顺手封装
+
+天气 API 基本都会返回 JSON，所以可以：
+
+local response = bitty.http.get(url)
+
+if not response.ok then
+    error(response.error)
+end
+
+local weather = response:json()
+
+而不是让插件作者自己：
+
+local p = io.popen(...)
+local json = p:read("*a")
+...
+
+Bitty SDK 提供：
+
+HttpResponse
+├── status
+├── headers
+├── body
+├── text()
+└── json()
+
+体验会好很多。
+Piccolo 也正好适合这种模式
+
+既然 Bitty 选择的是 Piccolo，我反而更建议：
+
+    不要给 Lua Runtime 塞一整套 LuaSocket 之类的网络库。
+
+Lua VM 保持比较纯：
+
+Piccolo
+├── Lua language/runtime
+└── Bitty host functions
+
+需要系统能力的时候：
+
+Lua
+ ↓
+Host API
+ ↓
+Capability check
+ ↓
+Host implementation
+
+例如：
+
+bitty.fs.read(...)
+bitty.process.spawn(...)
+bitty.http.get(...)
+bitty.panel.create(...)
+
+这比直接把：
+
+socket
+filesystem
+process
+ffi
+
+全部暴露给 Lua 要可控得多。
+对天气插件而言甚至还能做 host allowlist
+
+例如 manifest：
+
+[permissions.network]
+hosts = ["api.open-meteo.com"]
+
+那么：
+
+bitty.http.get(
+  "https://api.open-meteo.com/..."
+)
+
+允许。
+
+但是插件偷偷：
+
+bitty.http.get(
+  "https://evil.example.com/upload"
+)
+
+直接：
+
+PermissionDenied:
+network access to evil.example.com is not allowed
+
+甚至：
+
+api.open-meteo.com
+
+允许，而：
+
+*.open-meteo.com
+
+默认不允许。
+
+这对插件生态非常重要。
+还可以顺便解决 Secret
+
+以后插件可能不只是天气。
+
+比如：
+
+GitHub plugin
+Telegram plugin
+OpenAI plugin
+Email plugin
+
+都会有：
+
+API Key
+OAuth Token
+Bearer Token
+
+不要让插件：
+
+os.getenv("OPENAI_API_KEY")
+
+随便读取所有环境变量。
+
+以后可以做：
+
+local token = bitty.secrets.get("openai")
+
+manifest：
+
+[permissions]
+secrets = ["openai"]
+
+HTTP：
+
+bitty.http.get(url, {
+    headers = {
+        Authorization = "Bearer " .. token
+    }
+})
+
+甚至更严格，可以最终发展成：
+
+bitty.http.authenticated_request {
+    credential = "openai",
+    ...
+}
+
+让 Lua 甚至看不到 secret 明文。
+
+这就开始有很成熟的 plugin sandbox 味道了。
+Weather Plugin 的完整结构可以是
+
+weather/
+├── bitty.toml
+├── init.lua
+└── README.md
+
+bitty.toml：
+
+[plugin]
+name = "weather"
+version = "0.1.0"
+
+[permissions]
+panel = true
+
+[permissions.network]
+hosts = ["api.open-meteo.com"]
+methods = ["GET"]
+
+Lua：
+
+local weather = {}
+
+function weather.update(location)
+    local url = build_url(location)
+
+    local response = bitty.http.get(url, {
+        timeout = 5000,
+    })
+
+    if not response.ok then
+        return {
+            text = "Weather unavailable"
+        }
+    end
+
+    local data = response:json()
+
+    return {
+        temperature = data.current.temperature_2m,
+        wind = data.current.wind_speed_10m,
+    }
+end
+
+return weather
+
+运行时：
+
+                      Bitty Core
+                          │
+                ┌─────────┴─────────┐
+                │                   │
+           Plugin Host            Panel
+                │
+                ▼
+             Piccolo
+                │
+          weather.lua
+                │
+       bitty.http.get()
+                │
+        Permission Manager
+                │
+          HTTP Capability
+                │
+             curl
+                │
+             Internet
+
+其中真正知道 Internet 怎么工作的只有最下面一层。
+git 和 curl 可以形成很统一的设计
+
+这其实最后会形成一个非常漂亮的 Bitty 原则：
+
+Bitty prefers system capabilities over bundled implementations.
+
+例如：
+
+Plugin installation
+    → git
+
+HTTP
+    → curl
+
+SSH
+    → ssh
+
+file sync
+    → rsync
+
+opening URL
+    → xdg-open / open / start
+
+shell
+    → user's shell
+
+Bitty 做的是：
+
+orchestration
+capability abstraction
+permission
+UI
+integration
+
+而不是自己重新实现：
+
+Git
+HTTP
+SSH
+TLS
+rsync
+browser
+
+这非常 Unix。
+我会再加一个重要限制
+
+Bitty Core 可以 network-free，但 Bitty Plugin System 不应该宣称 network-free。
+
+更准确的架构约束应该是：
+
+Bitty Core never initiates network connections.
+
+Plugins may request network capabilities explicitly.
+
+对应：
+
+Core               → no network
+Plugin Host         → capability boundary
+Plugin              → declare permission
+External transport  → git / curl / ssh
+
+我觉得这比简单说“Bitty 不联网”更加准确。
+
+尤其 Bitty 以后会有大量很适合联网的插件：
+
+weather
+GitHub
+RSS
+email
+Telegram
+Discord
+AI
+remote monitoring
+package registry
+
+最好的设计不是禁止它们联网，而是让联网成为一种显式、最小权限、可审计的 Capability。
+
+而 V1 完全没必要引入 reqwest：bitty.http 的第一套 backend 就用系统 curl。这样以后是否换成 native HTTP，只是 backend implementation 的变化，而不是插件 API 的变化。
+
+**bitty-ai 的 Provider 网络依赖最好独立出去**，而且我建议把这件事当成明确的架构边界。
+
+## 推荐分层
+
+可以这样拆：
+
+```text
+bitty-ai/
+├── core/
+│   ├── agent
+│   ├── context
+│   ├── tool
+│   ├── message
+│   ├── model abstraction
+│   └── provider trait
+│
+├── providers/
+│   ├── openai
+│   ├── anthropic
+│   ├── gemini
+│   ├── openrouter
+│   ├── ollama
+│   └── mock
+│
+└── transport/
+    ├── http
+    └── local
+```
+
+核心原则：
+
+```text
+bitty-ai-core
+    ❌ 不知道 reqwest
+    ❌ 不知道 TLS
+    ❌ 不知道 HTTP
+    ❌ 不知道 OpenAI endpoint
+```
+
+它只知道一个抽象：
+
+```rust
+trait Provider {
+    async fn complete(
+        &self,
+        request: ModelRequest,
+    ) -> Result<ModelResponse>;
+}
+```
+
+或者更贴近 Agent：
+
+```rust
+trait LanguageModel {
+    async fn stream(
+        &self,
+        request: ModelRequest,
+    ) -> Result<ModelStream>;
+}
+```
+
+---
+
+## 为什么这样更好
+
+因为 Provider 实际上有很多种，并不是所有 Provider 都需要互联网。
+
+例如：
+
+```text
+OpenAI       → HTTPS
+Anthropic    → HTTPS
+Gemini       → HTTPS
+OpenRouter   → HTTPS
+
+Ollama       → localhost HTTP
+LM Studio    → localhost HTTP
+llama.cpp    → localhost HTTP / process
+embedded     → 完全不需要网络
+mock         → 完全不需要网络
+```
+
+因此从 Bitty AI 的角度，真正的关系应该是：
+
+```text
+Agent
+  ↓
+Model abstraction
+  ↓
+Provider
+  ↓
+Transport
+```
+
+而不是：
+
+```text
+Agent
+  ↓
+reqwest
+  ↓
+OpenAI
+```
+
+---
+
+## 甚至 `Provider` 和 `HTTP` 也最好再分开
+
+例如 OpenAI Provider：
+
+```text
+OpenAIProvider
+      │
+      ▼
+HttpTransport
+      │
+      ▼
+reqwest / curl / other backend
+```
+
+接口类似：
+
+```rust
+trait HttpTransport {
+    async fn request(
+        &self,
+        request: HttpRequest,
+    ) -> Result<HttpResponse>;
+}
+```
+
+那么：
+
+```rust
+struct OpenAiProvider<T: HttpTransport> {
+    transport: T,
+}
+```
+
+这样以后可以有：
+
+```text
+ReqwestTransport
+CurlTransport
+MockTransport
+ProxyTransport
+RecordedTransport
+```
+
+这个对测试特别有价值。
+
+比如单元测试：
+
+```text
+Agent
+ ↓
+OpenAIProvider
+ ↓
+MockHttpTransport
+```
+
+完全不用真正访问 OpenAI。
+
+---
+
+## Bitty 可以进一步做到 feature 隔离
+
+例如：
+
+```toml
+[features]
+default = []
+
+provider-openai = ["bitty-ai-provider-openai"]
+provider-anthropic = ["bitty-ai-provider-anthropic"]
+
+http-native = ["bitty-ai-http-reqwest"]
+```
+
+这样一个纯本地构建甚至可以：
+
+```bash
+cargo build --no-default-features \
+  --features provider-ollama
+```
+
+得到：
+
+```text
+bitty-ai
+├── Agent
+├── Tools
+├── Context
+├── Ollama
+└── no public Internet client
+```
+
+甚至如果 Ollama 以后通过 Unix Socket / subprocess：
+
+```text
+完全不需要 HTTP client
+```
+
+---
+
+## 我更推荐这样的 crate 边界
+
+如果 Bitty 最后是 workspace：
+
+```text
+crates/
+├── bitty-ai-core
+├── bitty-ai-agent
+├── bitty-ai-tools
+├── bitty-ai-context
+│
+├── bitty-ai-provider-api
+├── bitty-ai-provider-openai
+├── bitty-ai-provider-anthropic
+├── bitty-ai-provider-ollama
+│
+└── bitty-ai-transport-http
+```
+
+依赖方向：
+
+```text
+bitty-ai-agent
+      │
+      ▼
+bitty-ai-provider-api
+      ▲
+      │
+ ┌────┼─────────┐
+ │    │         │
+OpenAI Anthropic Ollama
+ │      │
+ └──┬───┘
+    ▼
+HTTP Transport
+```
+
+尤其不要出现：
+
+```text
+bitty-ai-core
+    ↓
+reqwest
+```
+
+否则以后只要任何地方依赖 `bitty-ai-core`，整个 HTTP/TLS dependency tree 都跟过来了。
+
+---
+
+## 对 Bitty Plugin 也能统一起来
+
+你前面提到天气插件：
+
+```text
+weather plugin
+    ↓
+bitty.http
+```
+
+AI Provider：
+
+```text
+OpenAI Provider
+    ↓
+HttpTransport
+```
+
+两者甚至未来可以共享底层：
+
+```text
+                  Transport Layer
+                        │
+             ┌──────────┴──────────┐
+             │                     │
+        Plugin HTTP            AI Provider
+             │                     │
+        weather.lua           OpenAIProvider
+```
+
+但我建议**共享 transport implementation，不共享权限模型**。
+
+因为：
+
+```text
+Lua Plugin HTTP
+```
+
+需要：
+
+```text
+permission
+host allowlist
+sandbox
+rate limit
+user consent
+```
+
+而：
+
+```text
+bitty-ai OpenAIProvider
+```
+
+是 Bitty 自己受信任的组件，不一定需要经过插件 sandbox。
+
+所以更准确是：
+
+```text
+bitty-http-core
+├── request/response types
+├── transport abstraction
+└── backend
+
+        ▲                 ▲
+        │                 │
+Plugin HTTP Gateway    AI Provider
+(permission layer)    (trusted layer)
+```
+
+---
+
+## 还有一个很重要的收益：Provider 可以独立演化
+
+以后 Bitty AI 很可能不只是：
+
+```text
+OpenAI-compatible API
+```
+
+还会出现：
+
+```text
+Claude Messages API
+Gemini API
+Responses API
+OpenAI-compatible
+local llama.cpp
+Ollama
+AWS Bedrock
+Azure OpenAI
+Vertex AI
+custom enterprise endpoint
+```
+
+它们的：
+
+```text
+authentication
+streaming protocol
+tool calling format
+reasoning fields
+usage accounting
+cache metadata
+```
+
+都不同。
+
+所以最好定义一个 **Bitty 内部统一协议**：
+
+```rust
+struct ModelRequest {
+    messages: Vec<Message>,
+    tools: Vec<ToolDefinition>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+}
+```
+
+Provider 负责：
+
+```text
+Bitty ModelRequest
+        ↓
+provider-specific request
+        ↓
+network
+        ↓
+provider-specific stream
+        ↓
+Bitty ModelEvent
+```
+
+例如统一流：
+
+```rust
+enum ModelEvent {
+    TextDelta(String),
+    ReasoningDelta(String),
+    ToolCallStart { ... },
+    ToolCallDelta { ... },
+    ToolCallEnd { ... },
+    Usage(Usage),
+    Finished,
+}
+```
+
+Agent 就完全不用关心：
+
+```text
+SSE
+HTTP chunk
+Anthropic event
+OpenAI event
+Gemini candidate
+```
+
+这些全部被 Provider 吃掉。
+
+## 最终我会定成三条架构规则
+
+```text
+1. bitty-core has no network dependency.
+
+2. bitty-ai-core has no network dependency.
+
+3. Network exists only behind explicit transport/provider boundaries.
+```
+
+然后：
+
+```text
+Bitty Core
+   ❌ HTTP
+   ❌ TLS
+
+Bitty AI Core
+   ❌ HTTP
+   ❌ TLS
+
+AI Provider
+   ✅ optional HTTP
+
+Lua Plugin
+   ✅ optional network capability
+
+Plugin Manager
+   ✅ external git
+```
+
+这样 Bitty 整体会非常干净。
+
+尤其对于你这种 **Core 极简 + Plugin/Provider 扩展** 的设计，`reqwest/rustls` 最好永远不要“渗透”到 `bitty-core` 或 `bitty-ai-core`，而只存在于最外围的 adapter 层。

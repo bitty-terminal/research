@@ -1,0 +1,645 @@
+到了图像、视频、语音这一层，我反而不建议继续把一切都叫 `ModelProvider` 然后硬塞进同一个 `complete()` 接口。
+
+截至现在，各家的接口实际上是 **“部分统一，但远没有真正统一”**。例如 Google Gemini 倾向于用统一的内容模型处理 text/image/audio/video 输入，`generateContent` 本身就是多模态接口；但 OpenAI 目前仍然同时存在 Responses、Images、Videos、Audio 等不同 endpoint，视频生成还是典型的异步 job。([Google AI for Developers][1]) Replicate 则走另一条路线：把各种模型统一成 `Prediction`，无论背后是图像、视频还是别的模型，都围绕 create/get/cancel prediction 运作。([Replicate][2])
+
+所以我觉得 Bitty 最适合做的是：**统一“生命周期”和“能力描述”，不要强行统一所有请求参数。**
+
+## Bitty 可以把 AI 模型系统扩展成这样
+
+```text
+bitty-ai
+│
+├── Model Registry
+│
+├── Capability Registry
+│
+├── Routing / Selection
+│
+├── Generation Job
+│
+└── Asset abstraction
+     │
+     ├── LLM / Chat
+     ├── Image
+     ├── Video
+     ├── Speech
+     ├── Transcription
+     ├── Embedding
+     └── Realtime
+```
+
+例如模型不再只是：
+
+```rust
+ModelDescriptor {
+    id,
+    provider,
+    context_window,
+}
+```
+
+而是：
+
+```rust
+ModelDescriptor {
+    id,
+    provider,
+    capabilities: [
+        TextGeneration,
+        ImageGeneration,
+        ImageEditing,
+        VideoGeneration,
+        SpeechSynthesis,
+        Transcription,
+        Embedding,
+    ],
+}
+```
+
+这样：
+
+```text
+GPT 类模型
+    text.generate
+    vision.input
+    tool.call
+
+图像模型
+    image.generate
+    image.edit
+
+Sora / Veo 类
+    video.generate
+    image_to_video
+
+TTS
+    audio.speech
+
+Whisper 类
+    audio.transcribe
+```
+
+全都可以注册进同一个模型目录。
+
+但是**请求本身不要强行做成一个超级 JSON struct**。
+
+---
+
+## 最好是「统一 envelope + 不同 task」
+
+我会更推荐这种：
+
+```rust
+enum InferenceTask {
+    Chat(ChatRequest),
+    Image(ImageRequest),
+    Video(VideoRequest),
+    Speech(SpeechRequest),
+    Transcription(TranscriptionRequest),
+    Embedding(EmbeddingRequest),
+}
+```
+
+然后统一最外层：
+
+```rust
+struct InferenceRequest {
+    model: ModelRef,
+    task: InferenceTask,
+    metadata: RequestMetadata,
+}
+```
+
+于是：
+
+```rust
+ImageRequest {
+    prompt,
+    references,
+    width,
+    height,
+    format,
+}
+
+VideoRequest {
+    prompt,
+    reference_image,
+    duration,
+    resolution,
+}
+
+SpeechRequest {
+    text,
+    voice,
+    format,
+    speed,
+}
+```
+
+各自保持自己的语义。
+
+否则迟早会出现这种怪东西：
+
+```rust
+request.duration
+request.voice
+request.fps
+request.aspect_ratio
+request.temperature
+request.tool_choice
+```
+
+然后 80% 字段对每个模型都没有意义。
+
+这就属于“为了统一而统一”。
+
+---
+
+# 真正应该统一的是 Job
+
+这里反而非常重要。
+
+LLM 一般是：
+
+```text
+request
+ ↓
+stream tokens
+ ↓
+done
+```
+
+图片可能：
+
+```text
+request
+ ↓
+processing
+ ↓
+image asset
+```
+
+而视频经常是：
+
+```text
+submit
+ ↓
+job_id
+ ↓
+queued
+ ↓
+running 37%
+ ↓
+running 81%
+ ↓
+completed
+ ↓
+video asset
+```
+
+OpenAI 当前 Video API 本身就是创建 video generation job 的模式；Replicate 同样围绕 prediction lifecycle，并明确区分 sync / async。([OpenAI 平台][3])
+
+所以 Bitty 可以统一成：
+
+```rust
+trait GenerationJob {
+    fn id(&self) -> JobId;
+    fn status(&self) -> JobStatus;
+    fn progress(&self) -> Option<f32>;
+    fn cancel(&self);
+    fn result(&self) -> Option<GenerationResult>;
+}
+```
+
+状态：
+
+```text
+Queued
+Preparing
+Running
+Streaming
+Completed
+Failed
+Cancelled
+Unknown
+```
+
+这个 `Unknown` 又刚好和我们前面 Bitty execution 的设计哲学一致：
+
+> timeout / connection loss 后不能假设任务失败，必须 reconcile。
+
+尤其视频生成可能已经花了钱、已经在云端跑起来了。
+
+如果 Bitty 网络断了，绝对不能重新：
+
+```text
+generate video
+generate video
+generate video
+```
+
+然后用户发现扣了三次钱。
+
+---
+
+# 输出最好统一成 Asset，而不是 bytes/string
+
+这是 Bitty 很值得提前设计的一层。
+
+例如：
+
+```rust
+enum GenerationOutput {
+    Text(TextOutput),
+    Asset(AssetRef),
+    Assets(Vec<AssetRef>),
+}
+```
+
+`AssetRef`：
+
+```rust
+AssetRef {
+    id,
+    mime_type,
+    source,
+    size,
+    metadata,
+}
+```
+
+比如：
+
+```text
+asset://generation/abc123
+```
+
+metadata：
+
+```text
+image/png
+2048 × 2048
+4.2 MB
+```
+
+或者：
+
+```text
+video/mp4
+1920 × 1080
+8s
+23.1 MB
+```
+
+或者：
+
+```text
+audio/opus
+17.3s
+48 kHz
+```
+
+这样 Agent 上下文里完全没必要塞：
+
+```text
+base64 base64 base64 ...
+```
+
+只保留：
+
+```text
+Generated image:
+asset://generation/abc123
+```
+
+这对 Bitty 特别重要，因为你本身就在非常重视 context token 成本。
+
+---
+
+# 然后 Panel 就非常自然了
+
+比如 Agent：
+
+```text
+> 给我生成三张 Bitty hamster mascot 概念图
+```
+
+Agent 调用：
+
+```text
+image.generate(...)
+```
+
+最后终端聊天里不用输出一堆 URL：
+
+```text
+Generated 3 images.
+[Open gallery]
+```
+
+同时创建一个：
+
+```text
+floating Panel
+┌────────────────────────────────────────┐
+│ Bitty Image Generation                 │
+│                                        │
+│ [ image ] [ image ] [ image ]          │
+│                                        │
+│ 1        2        3                    │
+└────────────────────────────────────────┘
+```
+
+视频：
+
+```text
+┌──────────────────────────────────────┐
+│ Video Generation                     │
+│                                      │
+│ Veo / Sora ...                       │
+│ ███████████████░░░░ 72%              │
+│                                      │
+│ 00:08 · 1920×1080                    │
+│                         Cancel       │
+└──────────────────────────────────────┘
+```
+
+这就非常符合 Bitty 的 Panel 架构。
+
+而且 Agent 不需要拥有 UI：
+
+```text
+AI emits:
+GenerationStarted
+GenerationProgress
+GenerationCompleted(asset://...)
+```
+
+Bitty/plugin 决定怎么展示。
+
+---
+
+# 那到底是不是 Lua 插件？
+
+这里我会做一个很明确的分层：
+
+| 部分                                      | 放哪里                  |
+| --------------------------------------- | -------------------- |
+| `InferenceTask` / capability vocabulary | `bitty-ai Core`      |
+| Model registry                          | `bitty-ai Core`      |
+| job lifecycle                           | `bitty-ai Core`      |
+| `AssetRef`                              | shared/core contract |
+| routing / fallback                      | `bitty-ai Core`      |
+| OpenAI adapter                          | Provider plugin      |
+| Gemini adapter                          | Provider plugin      |
+| Replicate adapter                       | Provider plugin      |
+| fal.ai adapter                          | Provider plugin      |
+| Ollama adapter                          | Provider plugin      |
+| Image Gallery UI                        | Lua plugin           |
+| Video Job Panel                         | Lua plugin           |
+| Audio Player UI                         | Lua plugin           |
+| Model Manager UI                        | Lua plugin           |
+| HTTP/TLS implementation                 | **不要进入 bitty Core**  |
+
+换句话说：
+
+> **Lua 非常适合做 orchestration、UI 和 provider mapping，但不要让 Lua 自己承担所有大型网络传输和二进制生命周期。**
+
+---
+
+## 特别是图像/视频，不建议单纯 `curl + Lua`
+
+文本 API：
+
+```text
+POST JSON
+↓
+SSE
+↓
+一些文本
+```
+
+还比较简单。
+
+视频开始以后会出现：
+
+```text
+multipart upload
+large image input
+几十 MB 视频 download
+polling
+webhook
+resume
+cancel
+timeout
+progress
+binary cache
+temporary file
+```
+
+这时候：
+
+```lua
+bitty.process.spawn({
+    "curl",
+    ...
+})
+```
+
+当然**可以**做。
+
+但作为正式 provider foundation 就不好了。
+
+我会让 Lua 写：
+
+```lua
+bitty.ai.providers.register({
+    id = "replicate",
+
+    capabilities = {
+        "image.generate",
+        "video.generate",
+    },
+
+    generate = function(ctx, request)
+        return ctx.inference:submit(...)
+    end,
+})
+```
+
+真正 HTTP/media transport：
+
+```text
+Lua provider plugin
+        ↓
+bitty-ai provider host
+        ↓
+HTTP / TLS / upload / download
+        ↓
+Provider
+```
+
+也就是把 Lua 当：
+
+> **adapter / policy / configuration layer**
+
+而不是：
+
+> HTTP client implementation language。
+
+---
+
+# 甚至可以做一种很有意思的 Generic Provider
+
+因为像 Replicate 这种平台已经自己统一了大量模型，其 API 基本围绕统一 prediction lifecycle。([Replicate][4])
+
+那么 Bitty 可以有：
+
+```text
+provider-replicate
+provider-fal
+provider-huggingface
+```
+
+安装一个插件以后得到：
+
+```text
+FLUX
+SDXL
+video models
+TTS
+music generation
+upscaler
+background remover
+...
+```
+
+而不需要 Bitty 给每个模型写插件。
+
+所以以后 Model Manager 很可能是：
+
+```text
+Providers
+────────────────────────────
+
+OpenAI
+  GPT ...
+  GPT Image ...
+  Sora ...
+  TTS ...
+
+Google
+  Gemini ...
+  Imagen ...
+  Veo ...
+
+Replicate
+  FLUX
+  Kling
+  ...
+  100+ models
+
+Local
+  Ollama
+  ComfyUI
+  Stable Diffusion
+  ...
+```
+
+这已经不只是“LLM Manager”了。
+
+我甚至会直接把之前说的插件名称从：
+
+```text
+Model Manager
+```
+
+进一步设计成：
+
+```text
+AI Models
+```
+
+或者：
+
+```text
+Model Hub
+```
+
+因为它最终管理的很可能是：
+
+```text
+LLM
+VLM
+Embedding
+Image
+Video
+Audio
+Speech
+Music
+Realtime
+Ranking
+```
+
+---
+
+## 我最推荐 Bitty 采用的抽象
+
+可以浓缩成：
+
+```text
+              Model Registry
+                    │
+             Capability Query
+                    │
+                  Router
+                    │
+             InferenceRequest
+                    │
+      ┌─────────────┼──────────────┐
+      ↓             ↓              ↓
+    Chat           Image          Video
+      ↓             ↓              ↓
+   Provider Adapter / Plugin
+                    │
+                 Job API
+                    │
+             GenerationResult
+                    │
+         ┌──────────┴──────────┐
+         ↓                     ↓
+       Text                 AssetRef
+                               │
+                   ┌───────────┼───────────┐
+                   ↓           ↓           ↓
+                 Image       Video       Audio
+                   │           │           │
+                   └──── Bitty Panel ─────┘
+```
+
+这个结构有一个很大的好处：
+
+**AI Core 并不知道 Sora、Veo、Imagen、Flux 是谁。**
+
+它只知道：
+
+```text
+这个 model:
+supports video.generate
+supports image.input
+max_duration = ...
+async = true
+```
+
+Provider plugin 去理解具体厂商 API。
+
+Lua UI plugin 去理解怎么展示。
+
+Bitty Core 只负责安全的通用 host capability。
+
+我觉得这会比单纯模仿现在的 AI Coding CLI 更适合 Bitty，因为 Bitty 本来就有 **Panel + rich rendering + image protocol + plugin** 这些基础设施。以后 `bitty-ai` 完全有可能从“coding agent”自然扩展成一个真正的 **multimodal agent runtime**，而不需要反过来重构整个 Provider 层。
+
+[1]: https://ai.google.dev/api/generate-content?utm_source=chatgpt.com "Generating content  |  Gemini API  |  Google AI for Developers"
+[2]: https://replicate.com/docs/topics/predictions/create-a-prediction?utm_source=chatgpt.com "Create a prediction - Replicate"
+[3]: https://platform.openai.com/docs/api-reference/videos?lang=csharp&utm_source=chatgpt.com "Videos | OpenAI API Reference"
+[4]: https://replicate.com/docs/reference/http?utm_source=chatgpt.com "HTTP API - Replicate"

@@ -1,0 +1,3378 @@
+请问下之后 bitty-ai 设置智能体团队的话，每一个 agent 是一个进程吗？然后就是 lsp, lint 这些应该是可以复用的吧，这个是这样的，我在使用 opencode 的时候，我在 ~/.config/opencode/opencode.jsonc 中是把 lsp 开启的，结果呢，在一个会话中每一个 subagent 好像都会启动一个独立的 lsp，比如 rust-analyser, ruff, biome 之类的，就导致占用了很多的内存，而且有的时候这些处理的不好即使这个 subagent 已经结束了但是这些 lsp 的进程竟然没有关闭，有的是堆积到了 swap 中了，如果不手动清理就一直堆积了。
+但是我觉得 Bitty 可以把这部分做的更好
+
+对，Bitty AI 这里完全可以做得比「每个 subagent 启一套 LSP」更合理
+
+我会建议把 Agent 生命周期 和 Developer Tooling 生命周期 完全拆开。
+
+核心原则可以直接定成：
+
+    Agent 是消费者，LSP / Linter / Parser / Indexer 是 Workspace 级基础设施。
+
+    不应该 Agent 1 -> rust-analyzer 1、Agent 2 -> rust-analyzer 2。
+
+而应该：
+
+                   bitty-ai
+                      │
+        ┌─────────────┴─────────────┐
+        │        Agent Runtime       │
+        │                            │
+   ┌────▼────┐  ┌────▼────┐  ┌────▼────┐
+   │ Agent A │  │ Agent B │  │ Agent C │
+   └────┬────┘  └────┬────┘  └────┬────┘
+        │             │             │
+        └─────────────┼─────────────┘
+                      │
+                Tool / RPC Layer
+                      │
+       ┌──────────────▼───────────────┐
+       │     Workspace Services       │
+       │                              │
+       │  rust-analyzer       × 1     │
+       │  biome server        × 1     │
+       │  pyright/ruff        × 1     │
+       │  Tree-sitter/indexer × 1     │
+       │  Git service         × 1     │
+       │  diagnostics cache           │
+       └──────────────────────────────┘
+
+这其实很符合你之前给 Bitty 定下来的哲学：终端本身提供 infrastructure，插件/Agent 消费 infrastructure，而不是每个插件自己重新造一套。
+1. 每个 Agent 不一定要是一个 OS Process
+
+这里首先要拆开三个概念：
+
+Agent
+≠
+Process
+≠
+Model Session
+
+一个 Agent 更适合作为逻辑实体：
+
+struct Agent {
+    id: AgentId,
+    role: AgentRole,
+    session: SessionId,
+    workspace: WorkspaceId,
+    permissions: CapabilitySet,
+    state: AgentState,
+}
+
+比如：
+
+Architect Agent
+Coder Agent
+Reviewer Agent
+Test Agent
+Research Agent
+
+它们可以各自有：
+
+    system prompt
+
+    model/context
+
+    task queue
+
+    memory
+
+    permissions
+
+    tool capabilities
+
+但完全没有必要：
+
+Agent A = 一个 Rust 进程
+Agent B = 一个 Rust 进程
+Agent C = 一个 Rust 进程
+
+尤其如果 bitty-ai 本身是 Rust 写的，我更倾向：
+
+bitty-ai daemon/process
+    │
+    ├── tokio task: Agent A
+    ├── tokio task: Agent B
+    ├── tokio task: Agent C
+    ├── tokio task: Scheduler
+    └── tokio task: Tool broker
+
+即：
+
+    Agent 更接近 Actor / async task，而不是 process。
+
+只有真正需要隔离的时候才 fork/spawn：
+
+shell command
+sandbox
+untrusted MCP
+plugin
+language server
+compiler
+
+2. LSP 应该是 Workspace-scoped，而不是 Agent-scoped
+
+你遇到 OpenCode 那个现象，本质上的坏味道就是：
+
+subagent lifecycle
+      ↓
+language server lifecycle
+
+两个生命周期绑死了。
+
+如果 8 个 subagent：
+
+rust-analyzer × 8
+biome         × 8
+ruff          × 8
+pyright       × 8
+
+那就很离谱。
+
+尤其 rust-analyzer 并不是轻量进程。
+
+它可能持有：
+
+    Cargo workspace graph
+
+    syntax trees
+
+    macro expansion
+
+    crate metadata
+
+    symbol index
+
+    type information
+
+    caches
+
+假设一个 workspace 的 rust-analyzer 吃 1~2 GiB：
+
+8 Agents × 1.5 GiB
+≈ 12 GiB
+
+而且绝大多数数据完全相同。
+3. Bitty 可以设计一个 LanguageServiceBroker
+
+我觉得这个甚至可以成为 Bitty AI 很漂亮的一个核心组件：
+
+bitty-ai
+└── WorkspaceServiceManager
+    ├── LanguageServiceBroker
+    ├── DiagnosticService
+    ├── SyntaxService
+    ├── BuildService
+    ├── GitService
+    └── SearchService
+
+例如：
+
+struct LanguageServiceKey {
+    workspace: WorkspaceId,
+    language: LanguageId,
+    config_hash: ConfigHash,
+}
+
+struct LanguageService {
+    process: Child,
+    clients: HashSet<AgentId>,
+    last_used: Instant,
+}
+
+Agent 请求：
+
+Agent A
+    ↓
+goto_definition("src/foo.rs", line=42)
+    ↓
+LanguageServiceBroker
+    ↓
+有没有：
+(workspace=/foo, language=rust)
+    ↓
+YES
+    ↓
+复用 rust-analyzer
+
+Agent B 后面：
+
+Agent B
+    ↓
+references(Foo)
+    ↓
+同一个 rust-analyzer
+
+4. 最重要的是：Agent 甚至不应该直接知道 LSP
+
+我会更进一步。
+
+不要暴露：
+
+agent -> lsp_request(...)
+
+而应该暴露语义化工具：
+
+code.symbols
+code.definition
+code.references
+code.hover
+code.diagnostics
+code.rename
+code.workspace_symbols
+
+例如 Agent 调：
+
+code.definition(
+    file="src/server.rs",
+    symbol="Server"
+)
+
+底层可能使用：
+
+LSP
+
+也可能是：
+
+Tree-sitter
+SCIP
+rustdoc JSON
+compiler metadata
+grep
+custom index
+
+Agent 不应该关心。
+
+于是：
+
+Agent
+ ↓
+Code Intelligence API
+ ↓
+┌───────────────────────────┐
+│ Tree-sitter               │
+│ rust-analyzer             │
+│ Pyright                   │
+│ clangd                    │
+│ SCIP index                │
+│ textual search            │
+└───────────────────────────┘
+
+这和你之前想给 bitty-ai 做的 AST 快速阅读代码能力其实正好能合起来。
+5. lint 更应该共享，而且很多时候甚至不用常驻
+
+这里还要区分：
+Language Server
+
+例如：
+
+rust-analyzer
+typescript-language-server
+pyright
+clangd
+
+适合：
+
+长期驻留
+workspace-scoped
+
+CLI Linter
+
+例如：
+
+ruff check
+cargo clippy
+eslint
+oxlint
+
+很多其实不需要 daemon。
+
+直接：
+
+LintService
+   ↓
+deduplicate request
+   ↓
+run once
+   ↓
+cache result
+
+例如同时有三个 Agent：
+
+Agent A: cargo clippy
+Agent B: cargo clippy
+Agent C: cargo clippy
+
+如果：
+
+workspace revision = abc123
+command = cargo clippy --workspace
+config_hash = 123
+
+完全可以合并：
+
+               ┌ Agent A
+cargo clippy ←─┼ Agent B
+               └ Agent C
+
+只执行一次。
+
+结果 fan-out。
+6. Bitty 可以引入非常有价值的 Workspace Revision
+
+这个我尤其建议。
+
+定义：
+
+WorkspaceRevision
+
+可能由：
+
+git HEAD
++
+dirty file hashes
++
+config hashes
+
+构成。
+
+例如：
+
+rev:
+    git = 4cfe219
+    dirty = {
+        src/main.rs: abc...
+        src/lib.rs: def...
+    }
+
+于是很多昂贵计算：
+
+cargo check
+cargo test
+cargo clippy
+biome check
+symbols index
+dependency graph
+AST summary
+diagnostics
+
+都可以：
+
+cache key =
+workspace_revision
++ tool
++ arguments
+
+7. 这样甚至能解决多个 Agent 重复运行测试的问题
+
+例如你的 Agent Team：
+
+Coder
+Reviewer
+Tester
+
+Coder 完成修改：
+
+revision R42
+
+执行：
+
+cargo check
+
+得到：
+
+R42 / cargo check → PASS
+
+Reviewer 又想：
+
+cargo check
+
+不需要重新运行。
+
+直接：
+
+cache hit
+
+cargo check
+revision: R42
+status: PASS
+duration: 4.3s
+
+Tester 如果没有修改代码，同样复用。
+
+只有出现：
+
+R43
+
+才 invalidation。
+8. 更进一步：统一做 Build Broker
+
+Rust 尤其适合这么干。
+
+因为下面这些：
+
+cargo build
+cargo check
+cargo test
+cargo clippy
+
+本身都会访问：
+
+target/
+Cargo.lock
+incremental compilation
+
+如果十几个 Agent 同时疯狂跑：
+
+cargo check
+cargo test
+cargo clippy
+cargo build
+
+不仅 CPU/内存炸掉，还可能产生大量重复编译。
+
+Bitty 可以有：
+
+BuildBroker
+
+负责：
+
+queue
+dedup
+priority
+cancellation
+cache
+resource limits
+
+例如：
+
+              ┌ cargo check
+Agent A ──────┤
+              │
+Agent B ──────┼──── BuildBroker ─── Cargo
+              │
+Agent C ──────┤
+              └ cargo test
+
+9. 生命周期应该是这样
+
+这也是解决你遇到「subagent 结束但 LSP 还活着」问题的关键。
+
+错误设计：
+
+Agent
+ ├── rust-analyzer
+ ├── ruff
+ └── biome
+
+Agent terminated
+
+???
+
+如果 cleanup 异常，就 orphan process。
+
+Bitty：
+
+bitty session
+    │
+    └── workspace
+          │
+          ├── Agent A
+          ├── Agent B
+          ├── Agent C
+          │
+          └── WorkspaceServices
+                ├── rust-analyzer
+                ├── biome
+                └── indexer
+
+生命周期：
+
+Agent exit
+   ↓
+release handles
+   ↓
+WorkspaceService refcount--
+
+但：
+
+rust-analyzer
+
+不会立即结束。
+
+例如：
+
+refcount = 0
+idle = 10 min
+
+才：
+
+shutdown
+exit
+
+如果 10 分钟内又启动 Agent：
+
+直接复用
+
+10. 我甚至建议做一个 Idle / Memory Pressure 策略
+
+这个特别符合终端长期运行的场景。
+
+例如：
+
+[ai.services]
+idle_timeout = "10m"
+memory_budget = "4GiB"
+
+[ai.services.lsp]
+max_idle = 3
+
+平时：
+
+rust-analyzer
+pyright
+biome
+
+都可以保持 warm。
+
+但系统开始 memory pressure：
+
+Memory pressure
+      ↓
+WorkspaceServiceManager
+      ↓
+LRU eviction
+
+依次关闭：
+
+30min 未使用的 clangd
+20min 未使用的 pyright
+10min 未使用的 biome
+
+11. Linux 下还可以利用 cgroup
+
+Bitty 既然本身对 Linux 很重视，这里能玩得更漂亮。
+
+例如：
+
+bitty-ai.slice
+├── agents/
+├── language-servers/
+├── builds/
+└── sandbox/
+
+然后限制：
+
+MemoryHigh=
+MemoryMax=
+CPUWeight=
+IOWeight=
+
+甚至：
+
+OOM
+
+时优先干掉：
+
+idle worker
+
+而不是把整个桌面拖进 swap。
+
+这正好针对你现在描述的：
+
+    rust-analyzer / ruff / biome 越堆越多，最后进 swap。
+
+12. Agent Team 的 Process Model 我建议这样
+
+最终大概：
+
+bitty
+│
+├── Terminal Runtime
+│
+├── Panel Runtime
+│
+├── Plugin Host
+│
+│
+└── bitty-ai
+     │
+     ├── Agent Scheduler
+     │    ├── Architect Agent ── async task
+     │    ├── Coder Agent ────── async task
+     │    ├── Reviewer Agent ─── async task
+     │    └── Tester Agent ───── async task
+     │
+     ├── Context Manager
+     │
+     ├── Tool Broker
+     │
+     └── Workspace Runtime
+          │
+          ├── Code Intelligence
+          │    ├── Tree-sitter
+          │    └── LSP Broker
+          │          └── rust-analyzer ×1
+          │
+          ├── Diagnostics
+          │
+          ├── Build Broker
+          │    └── cargo
+          │
+          ├── Git Service
+          │
+          ├── Indexer
+          │
+          └── Cache
+
+真正需要单独 process 的部分才成为进程：
+
+rust-analyzer
+cargo
+shell
+MCP server
+sandbox
+external plugin
+
+Agent 自己通常只是：
+
+async state machine
+
+13. Worktree 是唯一比较特殊的情况
+
+你这里还有一个很重要的问题，因为你一直考虑多 Agent + Git worktree。
+
+如果：
+
+Agent A → worktree A
+Agent B → worktree B
+
+那么这两个 workspace 的内容实际上已经不同：
+
+repo/.git
+├── worktree-a/
+└── worktree-b/
+
+这时候：
+
+rust-analyzer × 1
+
+不一定能安全共享。
+
+更合理的是：
+
+LanguageServiceKey =
+(repository, worktree, config, language)
+
+于是：
+
+Main worktree
+   └── rust-analyzer A
+
+Feature worktree
+   └── rust-analyzer B
+
+但同一个 worktree 里的：
+
+Architect
+Coder
+Reviewer
+Tester
+
+全部共享同一个。
+
+也就是说共享单位最好不是：
+
+repo
+
+而是：
+
+    Workspace View
+
+可以定义：
+
+WorkspaceView =
+root
++ worktree
++ environment
++ language configuration
+
+这是非常关键的抽象。
+14. 最终可以形成 Bitty 很有特色的一层
+
+我甚至觉得不要只叫：
+
+LSP Manager
+
+因为它最后管理的东西明显远远超过 LSP。
+
+可以叫：
+
+Workspace Runtime
+
+或者：
+
+Workspace Services
+
+它统一拥有：
+
+Workspace Runtime
+├── LSP
+├── AST
+├── Symbols
+├── Diagnostics
+├── Search
+├── Build
+├── Test
+├── Lint
+├── Git
+├── dependency graph
+└── caches
+
+然后：
+
+Panel
+Plugin
+Agent
+Human
+
+全部消费同一套基础设施。
+
+这会非常符合 Bitty 的架构。
+我认为最值得定下来的 invariant
+
+可以直接写进 bitty-ai RFC：
+
+    Agents do not own language servers. Workspaces do.
+
+再扩展：
+
+    Agents are ephemeral; workspace services are shared and persistent.
+
+以及：
+
+    Expensive developer tooling MUST be deduplicated across agents sharing the same Workspace View.
+
+这三个 invariant 能直接避免你现在在 OpenCode 里看到的那类问题。
+
+而且最后 Bitty 的优势就不只是「AI Agent 能调用 LSP」，而是：
+
+              Human
+                 │
+        ┌────────┴────────┐
+        │ Workspace Runtime│
+        └────────┬────────┘
+                 │
+     ┌───────────┼───────────┐
+    IDE        Plugin      Agent Team
+
+Human / Plugin / AI 共用一套代码智能、诊断、构建和索引基础设施。
+
+这其实已经开始有点像一个轻量化、终端原生的 developer operating environment 了，而不只是给 terminal 塞一个 AI chat。
+
+对，而且如果 Bitty AI 真的走向“大型任务、多 Agent、长期运行”的方向，那么继续坚持：
+
+1 Commander
+   ├── Subagent A
+   ├── Subagent B
+   └── Subagent C
+
+其实很快就会不够用了。
+
+更自然的演化应该是：
+
+    从“单领导者 + 工作者”变成“组织结构 + 多级协调”。
+
+这和现实公司、开源社区、SRE 团队、软件研发组织都很像。
+1. 不应该只有一个 Commander
+
+大型任务可以变成：
+
+                  Mission
+                     │
+              ┌──────▼──────┐
+              │ Coordinator │
+              └──────┬──────┘
+                     │
+        ┌────────────┼────────────┐
+        │            │            │
+   Engineering   Research      QA / Review
+     Leader       Leader          Leader
+        │            │              │
+    ┌───┴───┐    ┌───┴───┐      ┌───┴───┐
+   Agent   Agent  Agent   Agent  Reviewer Tester
+
+这里甚至不必叫所有上层节点 Commander。
+
+可以有不同的组织角色：
+
+Coordinator
+Tech Lead
+Research Lead
+Reviewer
+Implementer
+Tester
+Operator
+Specialist
+
+这样比：
+
+Commander-1
+Commander-2
+Commander-3
+
+语义清晰很多。
+2. Bitty AI 更适合“组织图”，而不是 Agent Tree
+
+最初的 Agent 系统经常是树：
+
+Commander
+├── Worker
+├── Worker
+└── Worker
+
+但现实世界的协作其实不是纯 Tree。
+
+更接近：
+
+Organization Graph
+
+比如：
+
+               Product Lead
+              /            \
+      Backend Lead       Frontend Lead
+          |                   |
+       Backend              Frontend
+       Agents               Agents
+          \                   /
+           \                 /
+              QA Lead
+                 |
+              Tester
+
+QA 可以同时检查：
+
+Backend
+Frontend
+Integration
+
+所以关系可以有：
+
+reports_to
+delegates_to
+reviews
+depends_on
+consults
+owns
+approves
+
+而不只是：
+
+parent -> child
+
+这个抽象会非常重要。
+3. 可以直接参考现实公司的“管理幅度”
+
+现实组织为什么不是：
+
+CEO
+├── 1000 个员工
+
+因为一个 Leader 能有效协调的对象数量有限。
+
+Agent 也是一样。
+
+如果 Commander 同时管理：
+
+30 subagents
+
+它会出现：
+
+    context 爆炸
+
+    task 状态过多
+
+    decision overload
+
+    message routing 混乱
+
+    token 消耗暴涨
+
+所以 Bitty 可以直接引入：
+
+span of control
+
+例如默认：
+
+leader_max_direct_reports = 5
+
+如果任务继续扩大：
+
+Commander
+├── Lead A
+│   ├── Agent
+│   ├── Agent
+│   └── Agent
+├── Lead B
+│   ├── Agent
+│   └── Agent
+└── Lead C
+
+这其实比很多现有 Multi-Agent 系统更合理。
+4. 而且 Leader 自己也应该可以创建团队
+
+比如用户说：
+
+重构 Bitty Plugin System
+
+最顶层的 Coordinator 先分析：
+
+Plugin Runtime
+SDK
+Security
+Docs
+Tests
+Migration
+
+然后创建：
+
+Plugin Runtime Lead
+Security Lead
+Documentation Lead
+
+接下来：
+
+Security Lead
+
+发现任务还比较复杂，可以继续创建：
+
+Permission Model Specialist
+Sandbox Specialist
+Threat Model Reviewer
+
+所以：
+
+Agent spawning
+
+最好不是只有顶层 Commander 有权限。
+
+而是 capability：
+
+agent.spawn
+team.create
+task.delegate
+
+Leader 可以在自己的权限范围内继续组织团队。
+5. 这时候就要区分“管理者”和“执行者”
+
+我觉得 Bitty AI 最重要的 Agent 分类之一就是：
+
+Manager Agent
+Worker Agent
+
+Manager
+
+主要做：
+
+planning
+delegation
+coordination
+review
+resource allocation
+status aggregation
+
+它不应该大量：
+
+读文件
+写代码
+跑测试
+
+否则就又变成一个万能 Agent。
+Worker
+
+专注：
+
+implementation
+research
+testing
+analysis
+
+这样 context 也会更干净。
+
+例如：
+
+Tech Lead
+
+只需要知道：
+
+Agent A:
+  task: refactor parser
+  status: done
+  result: ...
+
+Agent B:
+  task: add caching
+  status: blocked
+  blocker: ...
+
+Agent C:
+  task: benchmark
+  status: running
+
+根本没必要读取每个 Agent 几十万 token 的完整日志。
+6. 这正好对应现实公司的“汇报机制”
+
+非常值得参考现实世界的一点：
+
+    上级看到的不是下级的所有原始工作，而是 summary。
+
+例如：
+
+Worker
+   ↓
+detailed execution log
+   ↓
+Team Lead
+   ↓
+status summary
+   ↓
+Coordinator
+
+所以可以设计：
+
+Agent Output
+├── raw log
+├── artifacts
+├── findings
+├── decisions
+└── executive summary
+
+上级默认只读取：
+
+executive summary
+
+需要调查问题才展开：
+
+raw log
+
+这对 Token 节省会非常明显。
+7. 甚至可以引入“会议”，但不能真的让 Agent 无限聊天
+
+现实团队会有：
+
+standup
+design review
+code review
+incident review
+planning
+
+Bitty 也可以抽象这些。
+
+但不要真的模拟：
+
+Agent A: 我觉得...
+Agent B: 我觉得...
+Agent C: 我同意...
+
+这种会疯狂烧 Token。
+
+更好的做法是结构化：
+
+Design Review
+
+Proposal:
+  ...
+
+Comments:
+  Architect: ...
+  Security: ...
+  Performance: ...
+
+Decision:
+  accepted
+
+Action Items:
+  - ...
+
+也就是说：
+
+    模拟真实组织的工作机制，而不是模拟真实世界的闲聊。
+
+8. 可以有 Team / Department 概念
+
+既然你一直把 Bitty 类比公司，我觉得甚至可以正式引入：
+
+Organization
+└── Team
+    └── Agent
+
+例如：
+
+bitty-ai organization
+
+Engineering
+├── Core Team
+├── Plugin Team
+├── AI Team
+└── Release Team
+
+Research
+├── Architecture
+└── Benchmark
+
+QA
+├── Static Analysis
+├── Testing
+└── Review
+
+当然这不是说用户一定要配置得这么复杂。
+
+小任务：
+
+1 Agent
+
+中任务：
+
+Commander + 3 workers
+
+大任务：
+
+multi-team organization
+
+自动升级即可。
+9. “公司”里还有一个特别重要的东西：资源不是 Agent 私有的
+
+这和我们上一条讨论的 LSP 正好接上。
+
+现实公司不会：
+
+每个员工建一个 Git server
+每个员工建一个 CI
+每个员工建一个数据库
+
+Agent 同样不应该：
+
+每个 Agent 一个 rust-analyzer
+每个 Agent 一个 indexer
+每个 Agent 一套 build cache
+
+而应该是：
+
+Organization
+│
+├── Shared Workspace Runtime
+│   ├── LSP
+│   ├── AST index
+│   ├── Build cache
+│   ├── Test results
+│   ├── Git
+│   └── Search
+│
+└── Teams
+    └── Agents
+
+所以现实公司这个类比不仅适用于“管理结构”，还适用于：
+
+    基础设施共享。
+
+10. 甚至可以有预算和资源调度
+
+这是我觉得 Bitty 后来很可能会自然发展出来的一块：
+
+Task Budget
+
+例如：
+
+mission:
+  token_budget: 2_000_000
+  max_agents: 12
+  max_parallel_agents: 4
+  compute_budget: medium
+
+Coordinator 可以分配：
+
+Research Team:
+  300k tokens
+
+Engineering:
+  1.2M
+
+QA:
+  300k
+
+Leader 再向下分配。
+
+这就真的很像：
+
+公司预算
+
+而且可以避免 Multi-Agent 最大的问题：
+
+    Agent 无限生成 Agent。
+
+11. 可以借鉴现实世界的 RACI
+
+企业里很常见的一个项目管理模型：
+
+RACI
+
+即：
+
+Responsible
+Accountable
+Consulted
+Informed
+
+Bitty 特别适合。
+
+例如：
+
+Task: redesign plugin permissions
+
+Responsible:
+  Security Agent
+
+Accountable:
+  Security Lead
+
+Consulted:
+  Plugin Runtime Agent
+  Architecture Agent
+
+Informed:
+  QA Lead
+
+比简单的：
+
+task.owner = agent1
+
+丰富很多。
+12. 对代码开发来说，还可以参考真实 Software Engineering 流程
+
+比如：
+
+Requirement
+    ↓
+Architecture
+    ↓
+Design Review
+    ↓
+Implementation
+    ↓
+Code Review
+    ↓
+Testing
+    ↓
+Integration
+    ↓
+Release
+
+Bitty AI 不一定要让一个 Agent 从头做到尾。
+
+可以：
+
+Architect Agent
+      ↓
+design artifact
+      ↓
+Implementer Team
+      ↓
+PR / patch
+      ↓
+Reviewer Agent
+      ↓
+Tester Agent
+
+这实际上解决一个常见的问题：
+
+    同一个 Agent 写代码又 review 自己的代码。
+
+现实世界都知道这不是最好的工作方式。
+
+Multi-Agent 正好天然可以 separation of duties。
+13. 也可以有“临时项目组”
+
+不是所有 Team 都应该永久存在。
+
+例如用户：
+
+帮我完成 Windows backend
+
+Bitty 创建：
+
+Windows Porting Task Force
+
+成员：
+
+Platform Lead
+Win32 Specialist
+PTY Specialist
+Tester
+Reviewer
+
+任务完成：
+
+Team dissolved
+
+但：
+
+decision
+artifact
+lessons learned
+
+被保存在 project memory。
+
+这和现实里的：
+
+task force
+working group
+
+非常像。
+14. 我会把 Bitty AI 的最终模型设计成四层
+
+Mission
+   │
+Organization
+   │
+Team
+   │
+Agent
+
+其中：
+Mission
+
+“实现 Windows 支持”
+
+Organization
+
+整个执行组织。
+Team
+
+Platform
+Testing
+Docs
+
+Agent
+
+真正执行工作的个体。
+
+然后另外存在共享层：
+
+Workspace Runtime
+Memory
+Artifact Store
+Tooling
+Scheduler
+
+完整一点：
+
+                    Mission
+                      │
+              Organization Runtime
+                      │
+        ┌─────────────┼─────────────┐
+        │             │             │
+ Engineering       QA Team      Research
+    Team              │             │
+     │                │             │
+  Agents            Agents        Agents
+
+        └─────────────┬─────────────┘
+                      │
+              Shared Services
+                      │
+       ┌──────────────┼──────────────┐
+       │              │              │
+ Workspace Runtime   Memory       Artifacts
+       │
+ LSP / AST / Git / Build / Test
+
+15. 这里其实可以形成 Bitty AI 一个很核心的设计思想
+
+我觉得以后 RFC 甚至可以明确一句：
+
+    Bitty AI models organizations, not just agents.
+
+因为单个 Agent 已经没什么稀奇的了。
+
+真正难的是：
+
+coordination
+delegation
+shared infrastructure
+resource allocation
+information flow
+review
+authority
+failure recovery
+
+这些恰恰都是人类组织过去几百年一直在研究的问题。
+
+所以你说“参考现实世界工作流程”这个方向非常对，而且我觉得 Bitty 不应该只参考“公司”。还可以同时参考：
+
+    Software Engineering：issue → design → implementation → review → CI → release
+
+    SRE / Incident Command：Incident Commander、Operations、Communication、Timeline
+
+    军队式 command hierarchy：适合严格 delegation，但不要照搬强层级
+
+    开源社区：Maintainer / Reviewer / Contributor / CODEOWNERS
+
+    科研团队：PI / researcher / experiment / peer review
+
+    OS scheduler：资源、优先级、抢占、生命周期
+
+最后可能形成一种很有 Bitty 味道的东西：
+
+不是：
+AI Agent Framework
+
+而是：
+AI Organization Runtime
+
+Agent 只是这个 Runtime 里面的“人”。真正有价值的是组织、权限、共享基础设施、任务流、知识流和资源调度。这条路线也和 Bitty 本身“终端 + Panel + Plugin + IPC + AI”的系统化方向非常契合。
+
+因为命令日志是可以隐藏的，以及文件读写都是可以节省很多部分的，因为之前说的 treesitter 那些的，那么就可以节省很多 token输入了，而且很多时候都是保留关键信息。
+那么可以讨论下上下文 Context 这个部分的设计吗，然后 agent 之间怎么通信呢？Agent 应该是可以通过 IPC 在各个 Workspace 的各个 Panel 或者不需要 Panel 中穿梭的
+
+可以，而且我觉得 Context 设计会直接决定 bitty-ai 最后是不是“真的能跑大型 Agent Team”。
+
+你前面已经有几个非常好的前提：
+
+    command log 可以折叠，只保留摘要；
+
+    文件读取可以通过 Tree-sitter / AST / symbols 做结构化压缩；
+
+    LSP / lint / build 都可以作为共享 Workspace Service；
+
+    Agent 不一定绑定 Panel；
+
+    Bitty 本身已经有 Workspace / Panel / IPC 这种基础抽象。
+
+所以我会把 bitty-ai 的 Context 设计成一种：
+
+    按需取用、引用优先、分层缓存、可压缩、可迁移的 Context Graph。
+
+而不是传统 Agent 那种“不断往 messages[] 里面追加文本”。
+1. 首先不要把 Context 等同于 Chat History
+
+很多 Agent Framework 实际上是：
+
+Context
+=
+system prompt
++ user prompt
++ tool output
++ file contents
++ shell output
++ agent messages
+
+最后：
+
+messages = [
+  ...,
+  200 KB cargo test output,
+  50 KB source file,
+  30 KB grep output,
+  ...
+]
+
+这是非常浪费的。
+
+Bitty 应该定义：
+
+Context ≠ History
+
+而是：
+
+Context =
+Working Set
++ References
++ State
++ Memory
++ Artifacts
+
+Agent 真正收到的只是当前需要的部分。
+2. 我建议把 Context 分成 6 层
+
+可以设计成：
+
+Context
+├── L0 Identity
+├── L1 Mission
+├── L2 Workspace
+├── L3 Task
+├── L4 Working Set
+└── L5 Episodic / Memory
+
+L0：Agent Identity
+
+非常小，而且稳定。
+
+例如：
+
+agent:
+  id: reviewer-3
+  role: reviewer
+  team: core-runtime
+  permissions:
+    - code.read
+    - git.diff
+    - diagnostics.read
+    - review.submit
+
+再加：
+
+你的职责是什么
+你可以做什么
+你不能做什么
+你向谁汇报
+
+一般只有几百 token。
+3. L1：Mission Context
+
+描述：
+
+“整个团队现在到底在干什么”
+
+例如：
+
+mission:
+  id: windows-backend
+  objective: "Add Windows backend support"
+  constraints:
+    - "Do not break Unix PTY support"
+    - "Preserve public API"
+  milestones:
+    - backend abstraction
+    - ConPTY implementation
+    - integration tests
+
+但这里不放所有执行细节。
+
+Manager Agent 看多一点，Worker Agent 只看自己相关的部分。
+4. L2：Workspace Context
+
+这就是我们之前说的：
+
+WorkspaceView
+
+例如：
+
+workspace:
+  root: /repo/bitty
+  revision: abc42
+  worktree: win32-backend
+
+  languages:
+    - rust
+    - lua
+
+  services:
+    rust-analyzer: ready
+    tree-sitter: ready
+    git: ready
+
+  structure:
+    crates:
+      - bitty-core
+      - bitty-pty
+      - bitty-ui
+
+注意：
+
+Agent 不需要直接收到整个 repo。
+
+它只知道：
+
+repo structure
+important modules
+current revision
+available services
+
+5. L3：Task Context
+
+这是 Agent 当前真正负责的任务。
+
+例如：
+
+task:
+  id: T-104
+  title: "Implement ConPTY backend"
+
+  inputs:
+    - design://windows-pty-v2
+    - code://crates/bitty-pty/src/backend.rs
+
+  dependencies:
+    - T-101
+
+  acceptance:
+    - cargo test passes
+    - Unix backend unchanged
+
+它可以很小。
+6. L4：Working Set
+
+这是最重要的一层。
+
+即：
+
+    当前模型 invocation 真正塞进去的 Context。
+
+例如 Agent 正在修改：
+
+crates/bitty-pty/src/windows.rs
+
+那么模型可能只需要：
+
+Task summary              400 tokens
+Relevant symbols          800
+Target function           1200
+Related trait definition  500
+Diagnostics               300
+Recent decisions          300
+
+总共可能：
+
+3500 tokens
+
+而不是：
+
+整个 repository 300k tokens
++
+历史 shell log 100k
++
+完整聊天记录 50k
+
+7. L5：Memory / Episodic Context
+
+这一层默认不注入。
+
+比如：
+
+以前为什么不用 async_trait？
+为什么选 Lua？
+Windows backend 曾经踩过什么坑？
+
+存起来：
+
+memory://decision/023
+memory://incident/014
+memory://lesson/008
+
+Agent 需要时检索。
+
+这和你之前 carryctx / ctxctl 对“上下文可恢复、任务状态化”的思路其实非常接近，只不过 bitty-ai 会把它做成 Runtime 原生能力。
+8. 最关键的设计：Context 中优先保存 Reference，而不是 Content
+
+例如不要：
+
+{
+  "file": "这里是 5000 行 Rust..."
+}
+
+而应该：
+
+code://bitty/crates/bitty-core/src/session.rs#Session
+
+或者：
+
+artifact://design/windows-backend-v3
+command://build/1842
+diagnostic://workspace/current
+task://T-104
+agent://reviewer-2/report/latest
+
+Context 就变成：
+
+references
+
+需要内容时才 resolve。
+9. 可以设计统一的 ContextRef
+
+例如：
+
+enum ContextRef {
+    File(FileRef),
+    Symbol(SymbolRef),
+    Command(CommandRef),
+    Artifact(ArtifactRef),
+    Task(TaskRef),
+    AgentMessage(MessageRef),
+    Decision(DecisionRef),
+    Diagnostic(DiagnosticRef),
+}
+
+于是 Agent 之间交流也不用复制文本。
+
+Agent A：
+
+我完成了实现：
+
+artifact://patch/T-104-v3
+
+关键修改：
+code://bitty-pty/windows.rs#spawn
+
+测试：
+command://cargo-test/814
+
+Agent B 收到的不是几十 KB。
+
+只是几个引用。
+10. Command Log 这里非常适合三层结构
+
+你之前说隐藏命令输出，这个可以直接变成 Context System。
+
+例如：
+
+CommandRecord
+├── Summary
+├── Structured Result
+└── Raw Output
+
+例如：
+
+command://cargo-test/814
+
+默认返回：
+
+command: cargo test
+status: failed
+duration: 11.2s
+
+summary:
+  passed: 247
+  failed: 2
+
+failures:
+  - windows_spawn
+  - resize_conpty
+
+Agent 如果需要：
+
+command.read(
+    id=814,
+    section="failure:windows_spawn"
+)
+
+才读取：
+
+具体 stderr
+stack trace
+相关输出
+
+绝大部分 raw log 永远不会进入模型。
+11. 文件读取也做成 Progressive Disclosure
+
+比如：
+
+code.open("session.rs")
+
+第一层返回：
+
+session.rs
+├── struct Session
+├── enum SessionState
+├── impl Session
+│   ├── new
+│   ├── spawn
+│   ├── resize
+│   └── close
+└── tests
+
+如果 Agent：
+
+code.inspect("Session::resize")
+
+再返回：
+
+fn resize(...)
+
+相关：
+
+calls
+called_by
+types
+diagnostics
+
+只有真的需要，才：
+
+code.read_lines(...)
+
+这其实应该成为 bitty-ai 最核心的 token efficiency 来源之一。
+12. Agent 之间不要“聊天”，而应该 Message Passing
+
+这里就和你说的 IPC 直接结合起来了。
+
+不要设计：
+
+Agent A -> 把一大段自然语言塞给 Agent B
+
+而是：
+
+Agent A
+   ↓
+Message Bus
+   ↓
+Agent B mailbox
+
+每个 Agent 有自己的：
+
+Mailbox
+
+消息类型是结构化的。
+13. 可以设计这些消息
+
+例如：
+
+enum AgentMessage {
+    TaskAssign,
+    TaskUpdate,
+    Request,
+    Response,
+    Finding,
+    Proposal,
+    Review,
+    Blocker,
+    Decision,
+    Notification,
+}
+
+具体：
+
+type: Request
+from: coder-1
+to: reviewer-2
+
+subject: "Review PTY resize implementation"
+
+refs:
+  - artifact://patch/983
+  - code://bitty-pty/windows.rs#resize
+
+priority: normal
+
+而不是：
+
+“你好，我刚刚修改了这个文件，以下是完整代码……”
+
+14. Agent IPC 可以分三层
+
+我会设计：
+
+Local Agent Bus
+Workspace IPC
+Bitty Global IPC
+
+第一层：Local Agent Bus
+
+同一个 bitty-ai runtime 内。
+
+例如：
+
+Agent A
+    ↓ channel
+Agent B
+
+Rust 里可能就是：
+
+tokio::mpsc
+broadcast
+watch
+oneshot
+
+这种基本不需要真的 Unix IPC。
+15. 第二层：Workspace IPC
+
+用于：
+
+不同 plugin process
+不同 sandbox
+不同 MCP
+不同 Agent worker process
+
+可能走：
+
+Unix Domain Socket
+Named Pipe
+
+Windows：
+
+Named Pipe
+
+Unix：
+
+UDS
+
+统一抽象：
+
+bitty IPC transport
+
+16. 第三层：Bitty Global IPC
+
+这就非常有意思了。
+
+因为你的 Bitty 本来就有：
+
+Workspace
+Panel
+Floating Panel
+Headless Panel
+Plugin
+
+所以 Agent 不应该绑定 UI。
+
+应该：
+
+Agent
+    │
+    └── exists in Runtime
+
+Panel 只是：
+
+View / Attachment
+
+17. 所以 Agent 和 Panel 的关系应该是 many-to-many
+
+不要：
+
+Panel owns Agent
+
+而是：
+
+Agent Runtime
+    ↑
+ attachment
+    ↓
+Panel
+
+例如：
+
+Agent A
+
+可以没有 Panel：
+
+headless
+
+之后用户：
+
+打开 AI Panel
+
+Attach：
+
+Panel 7
+   ↕
+Agent A
+
+再把 Panel 移到另一个 Workspace：
+
+Workspace 1
+  Panel 7
+       ↓ move
+
+Workspace 3
+  Panel 7
+
+Agent 不需要重启。
+18. 更进一步，Agent 自己甚至可以“出现在”不同 Panel
+
+比如：
+
+Architect Agent
+
+默认 headless。
+
+但是出现重大设计决策时：
+
+event:
+needs_user_decision
+
+Bitty 自动：
+
+spawn floating panel
+
+显示：
+
+Architect asks:
+
+A. ...
+B. ...
+C. ...
+
+用户选择完：
+
+Panel closes
+Agent continues headless
+
+这个交互会非常 Bitty。
+19. Panel 应该只是 Agent 的一个 Projection
+
+可以类似：
+
+Agent State
+     │
+     ├── Chat Projection
+     ├── Task Projection
+     ├── Log Projection
+     ├── Diff Projection
+     └── Status Projection
+
+例如同一个 Agent：
+
+Workspace A：
+
+聊天 Panel
+
+Workspace B：
+
+任务状态 Panel
+
+甚至一个 HUD：
+
+Reviewer: waiting
+Coder: running
+Tester: blocked
+
+背后都是同一个 Agent。
+20. Agent 也可以跨 Workspace 工作，但必须区分 execution context
+
+这里需要非常小心。
+
+比如：
+
+Agent Architect
+
+可能同时观察：
+
+Workspace A
+Workspace B
+
+这没问题。
+
+但 Worker Agent 如果实际：
+
+写文件
+执行 cargo
+
+必须绑定一个：
+
+ExecutionContext
+
+例如：
+
+execution_context:
+  workspace: bitty
+  worktree: feature/windows
+  cwd: /repo/bitty
+  env: dev
+
+否则很容易写错地方。
+21. 所以 Agent 可以有两个概念
+
+Home
+
+和：
+
+Attachments
+
+例如：
+
+agent:
+  id: windows-worker
+
+home:
+  workspace: feature/windows
+
+attachments:
+  - panel://workspace-main/3
+  - panel://workspace-debug/8
+
+执行永远在：
+
+home workspace
+
+但展示可以 everywhere。
+22. Manager Agent 更适合完全 Headless
+
+其实大型 Agent Team 中绝大多数 Manager 根本不需要 Panel。
+
+例如：
+
+Coordinator
+├── Engineering Lead
+├── QA Lead
+└── Research Lead
+
+都可以：
+
+headless
+
+用户真正看到一个：
+
+Mission Control Panel
+
+里面展示：
+
+Mission: Windows Backend
+
+Engineering     ███████░ 78%
+QA              ███░░░░░ 32%
+Docs            █████░░░ 61%
+
+Blocked:
+- resize API mismatch
+
+Decision required:
+- use ConPTY fallback?
+
+而不是打开 15 个 Agent chat。
+23. 这时候 Context 也不应该跟 Panel 生命周期绑定
+
+例如：
+
+用户关闭 Panel
+
+不能：
+
+Agent Context destroyed
+
+应该：
+
+Panel destroy
+        ↓
+detach()
+        ↓
+Agent keeps running
+
+Context 存在：
+
+Context Store
+
+而不是 UI。
+24. Context Store 可以设计成 DAG / Graph
+
+我觉得这里特别适合 Graph。
+
+例如：
+
+Task T-104
+ ├── depends_on → T-101
+ ├── modified → windows.rs
+ ├── produced → Patch 983
+ ├── verified_by → Test 814
+ ├── reviewed_by → Review 52
+ └── decided_by → Decision 17
+
+Agent：
+
+Reviewer
+
+需要 T-104 时，就遍历：
+
+task
+→ patch
+→ changed symbols
+→ diagnostics
+→ relevant decisions
+
+得到一个最小 Context Bundle。
+25. Context Compiler
+
+这里我甚至建议 Bitty AI 有一个非常核心的组件：
+
+Context Compiler
+
+它的工作不是：
+
+存聊天记录
+
+而是：
+
+Context Graph
+      +
+Agent Role
+      +
+Current Task
+      +
+Token Budget
+      ↓
+Compiled Context
+
+例如：
+
+ContextCompiler.compile(
+    agent=reviewer,
+    task=T104,
+    budget=12k
+)
+
+输出：
+
+2k Mission/Task
+3k relevant symbols
+2k patch
+1k diagnostics
+1k previous decisions
+3k spare
+
+26. 甚至可以根据角色选择不同 Context
+
+同一个 Task：
+
+Coder
+
+需要：
+
+implementation
+types
+API
+diagnostics
+
+Reviewer：
+
+diff
+requirements
+tests
+design decisions
+
+Tester：
+
+acceptance criteria
+public API
+previous failures
+
+Architect：
+
+module boundaries
+dependencies
+RFC
+
+所以：
+
+    Context 应该是 Role-aware 的。
+
+27. Agent 通信也应该经过 Context Compiler
+
+假设：
+
+Coder -> Reviewer
+
+Coder 发：
+
+type: review_request
+
+task: T104
+
+refs:
+  - patch://983
+  - test://814
+
+summary:
+  "Implemented ConPTY resize handling."
+
+Reviewer 收到后：
+
+Message
+   ↓
+ContextCompiler
+   ↓
+自动补充：
+- requirement
+- diff
+- touched symbols
+- relevant tests
+- design decision
+
+Coder 不需要自己把所有东西打包发过去。
+28. 这样 Agent Communication 的 token 成本会非常低
+
+甚至大量 Agent-to-Agent 消息根本不需要 LLM。
+
+例如：
+
+Task completed
+Build passed
+Agent idle
+Dependency resolved
+Review requested
+
+都是：
+
+structured event
+
+直接 Runtime 处理。
+
+只有：
+
+“这个 API 应该采用哪种设计？”
+
+才真的调用另一个 Agent。
+
+这非常重要。
+29. 可以把整个系统想象成这种结构
+
+                       User
+                         │
+                  Mission Control
+                         │
+                    Bitty IPC
+                         │
+        ┌────────────────┴────────────────┐
+        │                                 │
+   Organization Runtime              Panel Runtime
+        │                                 │
+   ┌────┴─────┐                    ┌──────┴─────┐
+   │ Agents   │                    │ Views      │
+   │          │                    │            │
+   │headless  │◄──── attach ──────►│Chat Panel  │
+   │          │                    │Task Panel  │
+   └────┬─────┘                    │Diff Panel  │
+        │                          └────────────┘
+        │
+   Agent Message Bus
+        │
+        ▼
+   Context Runtime
+        │
+   ┌────┼─────────────┐
+   │    │             │
+ Graph Store      Context Compiler
+   │                    │
+   │                    ▼
+   │                LLM Request
+   │
+   ├── Tasks
+   ├── Artifacts
+   ├── Decisions
+   ├── Messages
+   ├── Command Records
+   └── Code References
+        │
+        ▼
+ Workspace Runtime
+        │
+  ┌─────┼──────────────┐
+  AST   LSP   Build   Git
+
+30. 这里可以定几个非常关键的 invariant
+
+我觉得甚至可以直接写 RFC：
+
+    Panels do not own agents.
+
+    Agents do not own context. Context belongs to the runtime.
+
+    Agent communication passes references and structured events before raw text.
+
+    Raw tool output is never inserted into model context unless explicitly requested.
+
+    Context is compiled on demand, not accumulated indefinitely.
+
+再加上前面那个：
+
+    Agents do not own language servers. Workspaces do.
+
+这几个原则组合起来，其实已经把 bitty-ai 和很多传统 Harness 区分开了。
+最终我会把 bitty-ai 的核心拆成这几个东西
+
+bitty-ai
+├── Organization Runtime
+├── Agent Runtime
+├── Scheduler
+├── Message Bus
+├── Context Store
+├── Context Compiler
+├── Artifact Store
+├── Workspace Runtime
+└── IPC Bridge
+
+这里面真正最值得重点设计的，我认为甚至不是 Model Provider，而是：
+
+Context Compiler
++
+Workspace Runtime
++
+Message Bus
+
+因为模型本身随时可以换，Claude、GPT、Gemini、local model 都行；但如何只把最必要的信息交给模型、如何让几十个 Agent 不重复读取/计算/通信、如何让 Agent 与 UI 解耦，才会决定 Bitty AI 能不能从普通 Agent Harness 变成你前面说的那种 AI Organization Runtime。
+
+那么 agent 会不会直接操控 panel 呢，或者很多时候 agent 都是拥有 headless 的panel 呢？因为 headed 的 panel 一般是用户创建的，但是 agent 可以进入 headed panel 不过一般用不上，比如用户想知道自己执行了个东西报错失败了，那么 agent 就可以来到用户这个 panel 来看历史日志进行解决。另一方面，很多时候用户是插入不了 headless 的 panel ，因为这些主要是 agent 的工作区，不过 agent 可以觉得自己是否跳出自己所在的 panel 和决定一个 panel 的生命周期，因为 panel 结束并不能说明 agent 结束了，因为这个 panel 可能会被别的 agent 占用，agent 结束也不能说明 panel 结束，因为 agent 可以保留原来的 panel的很多需要的和有用的信息带入到另个 panel 继续工作。也就是这个 panel 和 agent 的生命周期应该也需要考虑下如何设计。
+然后就是之后应该会有专门的看板或者说控制台来看各个 agent 情况和各个 panel 的输出情况等等
+
+对，这里最好不要把 Agent 和 Panel 设计成父子关系
+
+我觉得你现在这个方向已经很清晰了：
+
+Agent ≠ Panel
+Agent 不拥有 Panel
+Panel 也不拥有 Agent
+
+两者应该是 独立生命周期 + 动态关联。
+
+更准确地说：
+
+    Agent 是执行主体，Panel 是执行/观察/交互的 Surface。
+
+所以关系应该是：
+
+Agent  N ↔ M  Panel
+
+而不是：
+
+Agent 1 → 1 Panel
+
+这会直接解决你说的所有情况。
+1. 先给 Panel 重新定义一下
+
+Bitty 里的 Panel 不应该只是“一个显示窗口”。
+
+我会把它定义成：
+
+    一个具有状态、历史、I/O、环境以及可选 UI Projection 的工作表面。
+
+因此：
+
+Panel
+├── state
+├── history
+├── cwd
+├── environment
+├── command/session history
+├── artifacts
+├── input/output streams
+├── attached agents
+└── optional UI
+
+这样：
+
+headed panel
+
+只是：
+
+Panel + visible UI projection
+
+而：
+
+headless panel
+
+就是：
+
+Panel - visible UI projection
+
+底层其实完全可以是同一种对象。
+
+这一点很重要，因为这样就不用维护两套架构。
+2. 我甚至建议 Bitty 内部只存在 Panel
+
+然后：
+
+enum PanelPresentation {
+    Headed,
+    Headless,
+    Detached,
+}
+
+或者更进一步：
+
+Panel Core
+     │
+     ├── zero UI attachments   -> headless
+     ├── one UI attachment     -> normal panel
+     └── multiple projections  -> mirrored panel
+
+那么：
+
+    Headless 并不是特殊 Panel 类型，而只是“当前没有用户可见 Projection 的 Panel”。
+
+这会非常漂亮。
+3. Agent 默认应该拥有自己的 Headless 工作环境，但不是“所有权”
+
+这里“拥有”这个词我会稍微改成：
+
+lease
+
+即：
+
+    Agent 默认获得一个 Panel Lease，而不是 Panel Ownership。
+
+比如：
+
+Agent coder-17
+        │
+        │ lease
+        ▼
+Panel p-42
+(headless)
+
+里面：
+
+cwd=/repo/bitty-worktree-17
+shell=zsh
+history=...
+environment=...
+
+Agent 可以：
+
+exec
+read output
+change cwd
+run tests
+inspect files
+
+但 Panel 本身仍属于：
+
+Bitty Panel Runtime
+
+这样 agent 消亡的时候：
+
+lease released
+
+而不是：
+
+Panel destroyed
+
+4. 这正好解决你说的第一个生命周期问题
+
+例如：
+
+Agent A
+    │
+    ▼
+Panel P
+
+Agent A 完成任务：
+
+Agent A terminated
+
+但 P 里面还有：
+
+cargo test failure
+debug logs
+temporary environment
+important command history
+
+所以：
+
+Agent A ✕
+Panel P ✓
+
+Panel 可以进入：
+
+orphaned / idle
+
+状态。
+
+然后：
+
+Agent B
+    │
+    └── attach/lease → Panel P
+
+继续工作。
+
+这非常合理。
+5. 反过来也一样
+
+Panel 可以关闭，但 Agent 不必结束。
+
+例如：
+
+Agent A
+  │
+  ├── Panel P1
+  │
+  └── Context Store
+
+Agent 判断：
+
+P1 已经没价值了
+
+于是：
+
+release(P1)
+close(P1)
+
+然后：
+
+create P2
+attach(P2)
+
+继续工作。
+
+Agent 的：
+
+Task Context
+Memory
+Artifacts
+Decisions
+Messages
+
+全部不在 Panel 里面。
+
+因此：
+
+Panel death != Agent death
+
+6. 最关键的是 Agent 可以“带着 Context 离开 Panel”
+
+你这里说得非常重要。
+
+例如 Agent 在：
+
+Panel A
+
+发现：
+
+cargo test failed
+failure = PTY resize race
+
+它不需要把 Panel A 整个带走。
+
+Context Runtime 可以留下：
+
+command://A/182
+diagnostic://PTY-42
+artifact://failure-analysis-17
+
+然后 Agent：
+
+detach Panel A
+        ↓
+attach Panel B
+
+Context 仍然有：
+
+Relevant findings:
+- PTY resize race
+- failing test: ...
+- suspect symbol: ...
+
+所以最好形成：
+
+Panel = working surface
+Context = portable knowledge
+Agent = reasoning/execution actor
+
+三者彻底分开。
+7. Agent 进入用户 Headed Panel 是非常合理的
+
+你举的例子正是 Bitty 相比普通 Agent Harness 非常有意思的地方。
+
+用户：
+
+cargo test
+
+然后：
+
+FAILED
+
+这时候用户可以：
+
+Alt+A
+
+或者：
+
+ask agent
+
+Agent 不需要：
+
+重新运行 cargo test
+
+而可以：
+
+attach/read current panel
+
+直接看到：
+
+Panel history
+     ↓
+CommandRecord
+     ↓
+cargo test
+     ↓
+2 failures
+
+并读取：
+
+command://current/182
+
+然后开始分析。
+
+这就是为什么 Bitty 自己是 Terminal Emulator 会给 AI 很大的天然优势。
+8. 但是 Agent 进入用户 Panel 应该有 Access Mode
+
+这个建议一定要设计。
+
+不要只有：
+
+attach
+
+而应该至少：
+
+observe
+assist
+control
+
+observe
+
+只能：
+
+读取历史
+读取命令记录
+读取 cwd/env
+读取 terminal state
+
+不能输入。
+
+非常适合：
+
+    “帮我看看刚才为什么报错。”
+
+assist
+
+可以：
+
+分析
+生成建议
+prepare command
+highlight output
+
+但：
+
+不能未经用户确认执行命令
+
+比如 Panel 显示：
+
+Agent suggests:
+cargo test pty::resize -- --nocapture
+
+用户回车才执行。
+control
+
+Agent 可以：
+
+输入
+执行
+中断
+切换 cwd
+运行程序
+
+这就是真正接管这个 Panel。
+
+所以最好存在：
+
+enum PanelAccess {
+    Observe,
+    Assist,
+    Control,
+}
+
+9. Headless Panel 则可以默认给 Agent Control
+
+例如：
+
+Agent's workspace panel
+
+access:
+  coder-1: control
+  reviewer-1: observe
+
+这又带来一个非常好的可能：
+
+同一个 Panel 多 Agent 协作
+
+比如：
+
+Coder       Control
+Reviewer    Observe
+Manager     Observe
+
+Reviewer 不需要另外启动：
+
+cargo build
+
+它可以直接看 Coder 已经运行过的结果。
+
+这又能进一步减少：
+
+重复命令
+重复 LSP
+重复 context
+
+10. Panel 最好引入 Lease
+
+这会让整个生命周期特别清晰。
+
+例如：
+
+Panel P42
+
+leases:
+  coder-1:
+    access: control
+    reason: task:T104
+
+  reviewer-2:
+    access: observe
+    reason: review:T104
+
+Agent 离开：
+
+release lease
+
+如果：
+
+leases = 0
+
+也不意味着立即关闭。
+
+而是：
+
+P42 -> idle
+
+11. Panel 生命周期可以这样设计
+
+我会考虑：
+
+Created
+   ↓
+Active
+   ↓
+Idle
+   ↓
+Archived
+   ↓
+Destroyed
+
+另外：
+
+Active
+  │
+  └── Headed / Headless
+
+注意：
+
+Headed / Headless
+
+不是生命周期状态。
+
+它是 presentation state。
+
+所以：
+
+Active + Headless
+Active + Headed
+Idle + Headless
+
+都可以存在。
+12. Archived Panel 很有价值
+
+这是普通终端很少认真处理，而 Bitty AI 非常值得做的。
+
+比如一个 Agent 完成：
+
+修复 PTY bug
+
+它的 Panel 有：
+
+132 commands
+23 MB raw logs
+debug session
+
+没必要一直保持一个 shell process。
+
+可以：
+
+Panel
+  ↓ freeze
+ArchivedPanel
+
+只保留：
+
+CommandRecords
+summaries
+important outputs
+artifacts
+cwd/env metadata
+timeline
+
+真正的 PTY：
+
+terminated
+
+这样节省资源。
+
+以后 Agent 想查看：
+
+archive://panel/P42
+
+仍然可以读取。
+13. 于是 Panel 和 Session 其实也最好分离
+
+再往下推一步，我会建议：
+
+Panel
+≠
+PTY Session
+
+因为 Panel 可以：
+
+attach PTY
+detach PTY
+attach Agent view
+show diff
+show logs
+show dashboard
+
+可以：
+
+Panel
+├── Presentation
+├── State/History
+└── Backend Session?
+
+例如：
+
+Terminal Panel
+    ↓
+PTY Session
+
+Agent Dashboard Panel
+    ↓
+Organization Runtime
+
+Diff Panel
+    ↓
+Artifact
+
+Archived Panel
+    ↓
+History Store
+
+这样 Panel 才真正成为 Bitty 的通用 UI primitive。
+14. Agent 可以决定 Panel 生命周期，但不能无限制
+
+你说：
+
+    Agent 可以决定是否跳出自己所在 Panel 和决定 Panel 生命周期
+
+我同意，但是应该有 capability：
+
+panel.create
+panel.attach
+panel.detach
+panel.close
+panel.archive
+panel.present
+
+例如普通 Worker：
+
+panel.create(headless)
+panel.close(own leased panel)
+
+但是可能不能：
+
+panel.close(user panel)
+
+Leader 可能：
+
+create panel for worker
+archive inactive panels
+
+而用户 Panel：
+
+requires explicit permission
+
+这样权限边界比较清楚。
+15. Agent 应该可以主动“跳出” Panel
+
+比如：
+
+Agent A
+   │
+   ▼
+P1: build
+
+然后它发现需要：
+
+运行 server
+
+但 server 是长期进程。
+
+它完全可以：
+
+create headless P2
+
+于是：
+
+Agent A
+├── P1 build shell
+└── P2 server
+
+再创建：
+
+P3 logs
+
+最终：
+
+Agent A
+├── P1 build
+├── P2 server
+└── P3 logs
+
+这和人类开发者自己开多个 terminal 非常接近。
+16. 一个 Agent 本身就应该允许 attach 多个 Panel
+
+所以不要：
+
+agent.panel_id
+
+而应该：
+
+agent.panel_leases[]
+
+例如：
+
+agent: backend-worker
+
+panels:
+  - id: p11
+    role: primary
+    access: control
+
+  - id: p12
+    role: server
+    access: control
+
+  - id: p13
+    role: logs
+    access: observe
+
+  - id: p-user-3
+    role: incident-source
+    access: observe
+
+这个表达能力会强很多。
+17. Panel 自己也应该知道 Purpose
+
+否则 Agent 开几十个 Panel 后会混乱。
+
+比如：
+
+panel:
+  id: p42
+
+  purpose:
+    type: build
+    task: T104
+
+  labels:
+    - windows
+    - pty
+    - debugging
+
+或者：
+
+purpose:
+  shell
+  test
+  server
+  debugger
+  research
+  logs
+  scratch
+
+Agent Manager 可以根据 purpose 做调度。
+18. 这也正好对应你说的“Agent 控制台”
+
+我觉得这个应该成为 Bitty AI 非常重要的一个官方 Panel：
+
+Mission Control
+
+或者：
+
+Agent Control Center
+
+但它不只是 Agent List。
+
+应该同时看：
+
+Organization
+Agents
+Tasks
+Panels
+Resources
+Messages
+
+19. 我脑子里的 UI 大概是这样
+
+┌────────────────────────────────────────────────────────────┐
+│ Mission: Windows backend                         RUNNING   │
+├───────────────────┬────────────────────────────────────────┤
+│ Organization      │ Agents                                 │
+│                   │                                        │
+│ Coordinator ●     │ coder-1      RUNNING    T104           │
+│ ├─ Eng Lead ●     │ reviewer-1   WAITING    T104           │
+│ │  ├─ coder-1     │ tester-2     BLOCKED    T108           │
+│ │  └─ coder-2     │ architect    IDLE                        │
+│ └─ QA Lead ●      │                                        │
+│                   │                                        │
+├───────────────────┼────────────────────────────────────────┤
+│ Panels            │ Selected: coder-1                      │
+│                   │                                        │
+│ p12 HEADLESS ●    │ Task: Implement ConPTY backend         │
+│   cargo build     │ Workspace: win32                       │
+│                   │ Model: ...                             │
+│ p13 HEADLESS ●    │ Tokens: 12.4k                         │
+│   test server     │ Context: 8.1k                          │
+│                   │                                        │
+│ p4  HEADED ●      │ Attached Panels:                       │
+│   user terminal   │ p12(control) p13(control) p4(observe) │
+└───────────────────┴────────────────────────────────────────┘
+
+然后可以：
+
+Enter   -> inspect
+F       -> focus/show panel
+K       -> kill agent
+A       -> archive panel
+M       -> message
+T       -> reassign task
+
+非常符合 Bitty 本身 keyboard-first 的设计。
+20. Panel 也应该有自己的 Timeline
+
+比如点开：
+
+p12
+
+看到：
+
+17:21 Agent coder-1 attached
+17:22 cargo check
+17:22 PASS
+17:24 edited windows.rs
+17:25 cargo test
+17:25 FAIL 2 tests
+17:26 reviewer-1 attached (observe)
+17:28 coder-1 detached
+17:28 tester-2 attached
+
+这对于：
+
+debug
+audit
+AI 可解释性
+
+都会特别有价值。
+21. Agent 也应该有 Timeline
+
+对应：
+
+coder-1
+
+17:20 spawned
+17:21 assigned T104
+17:21 attached p12
+17:24 modified ...
+17:26 requested review
+17:28 detached p12
+17:29 attached p17
+17:35 completed
+
+这样你就能从两种角度看系统：
+
+Agent-centric
+Panel-centric
+
+22. 这其实应该形成一个双向索引
+
+Agent → Panels
+
+Panel → Agents
+
+比如：
+
+agent://coder-1/panels
+
+返回：
+
+p12
+p13
+p4
+
+反过来：
+
+panel://p12/agents
+
+返回：
+
+coder-1
+reviewer-1
+
+这样 Context Compiler 也可以利用。
+23. 用户也应该是一个特殊 Actor
+
+这是一个非常漂亮的统一方式：
+
+Actor
+├── User
+├── Agent
+├── Plugin
+└── System
+
+Panel lease：
+
+Actor ↔ Panel
+
+所以：
+
+User owns UI projection
+Agent obtains observe lease
+
+就非常自然。
+
+甚至某种意义：
+
+用户进入 Panel
+
+和：
+
+Agent 进入 Panel
+
+在 Runtime 层可以使用同一套 attach protocol。
+
+只是权限不同。
+24. Agent 到用户 Panel 的“来到”其实可以有两种意义
+
+这里最好不要混淆。
+Logical attach
+
+Agent：
+
+attach(user-panel, observe)
+
+它能读取，但用户 UI 没有发生任何变化。
+
+这是最常见的。
+Visible presence
+
+Agent 真的：
+
+present itself
+
+例如 Panel 顶部显示：
+
+● coder-1 observing
+
+甚至出现：
+
+Agent sidebar
+
+这个应该是 UI projection。
+
+所以：
+
+Agent attachment != Agent UI presence
+
+否则后台 Agent 一 attach，屏幕到处跳，会很烦。
+25. Agent 主动跳到用户 Panel 也应该尽量不抢 Focus
+
+例如检测到用户报错：
+
+Agent attaches in background
+
+然后：
+
+Panel status:
+🤖 investigating...
+
+如果需要用户：
+
+notification
+
+而不是：
+
+强制切换 Workspace / Focus
+
+只有用户配置允许时：
+
+agent.can_focus_panel = true
+
+才能真正把 Panel 拉到前台。
+
+这点可以参考 window manager 对：
+
+focus stealing prevention
+
+的处理哲学。
+26. 最后整个生命周期关系可以画成这样
+
+                   ┌───────────────┐
+                   │ Context Store │
+                   └───────▲───────┘
+                           │
+                      references
+                           │
+                     ┌─────┴─────┐
+                     │   Agent   │
+                     └─────┬─────┘
+                           │ leases
+            ┌──────────────┼───────────────┐
+            │              │               │
+            ▼              ▼               ▼
+       ┌────────┐      ┌────────┐     ┌────────┐
+       │Panel A │      │Panel B │     │Panel C │
+       │headless│      │headless│     │ headed │
+       └───┬────┘      └───┬────┘     └───┬────┘
+           │               │              │
+        PTY/build        server          User
+
+任何一个节点退出，都不要求其他节点跟着退出。
+
+这是重点。
+27. 我会给 Bitty 定下这几个生命周期 invariant
+
+这次可以在前面那些 invariant 上继续增加：
+
+    Agents do not own panels; they acquire leases on panels.
+
+    Panels do not own agents.
+
+    Agent lifetime and Panel lifetime are independent.
+
+    Context survives Panel transitions.
+
+    Headless and headed panels share the same underlying Panel model.
+
+    Closing an Agent does not imply closing its Panels.
+
+    Closing a Panel does not imply terminating attached Agents.
+
+    Agent attachment does not imply visible UI presence or focus.
+
+再加一个：
+
+    Panels preserve work; Agents preserve intent.
+
+我觉得最后这一句其实很能概括两者关系：
+
+Panel
+→ “这里发生过什么”
+
+Agent
+→ “我要完成什么”
+
+Context
+→ “我知道什么”
+
+Task
+→ “现在应该做什么”
+
+这几个对象一旦分干净，后面的 Agent Team、跨 Workspace、headless execution、用户介入、恢复任务、Agent handoff 都会变得非常自然。
+
+而你说的那个总控制台，我觉得几乎应该成为 bitty-ai 的核心官方插件之一：它不是聊天窗口，而是整个 AI Organization 的 Mission Control。在那里用户应该能同时看到“谁在工作、做什么、在哪个 Workspace、占用了哪些 Panel、哪些 Panel 在跑什么、用了多少 CPU/RAM/token、谁阻塞了、哪些决定等待用户”。这会比现在常见的“左边几个 subagent 名字 + 一堆聊天记录”高一个抽象层级。
+

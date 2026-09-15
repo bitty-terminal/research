@@ -1,0 +1,1645 @@
+今天 16:05
+你知道什么是 33x81 吗
+
+知道，不过 “33x81” 本身并不是一个只有唯一含义的固定术语。
+
+如果你指的是数学表达式，那就是：
+33×81=2673
+
+但如果你说的是网络上的 “33x81”，那我猜你问的不是乘法。刚才检索了一下，公开搜索里 33x81 最常见的结果反而是 33 × 81 英寸的展架尺寸，没有直接出现一个公认的网络梗/术语定义。
+
+所以你可以告诉我你是在哪里看到“33x81”的——比如 B 站、二次元、推理圈、游戏、编程、某个作品/人物相关——我应该就能准确定位你说的那个 33x81。
+
+请问下在 geocities, neocities 中有很多用户会用类似 github README.md 中的 shields，那么这种的叫做什么来着
+
+你想到的应该是 Web Badges（网页徽章），更具体一点通常叫 88×31 buttons / 88×31 badges。
+https://images.openai.com/static-rsc-4/x35Td4buZS3x1A58K5s4ioZ7Gh-4Y9CpiU7RbjGzZbLokQq4Wjv-TRTgF9iYKIWmQr_UpNcyYpj6h-fCE8qqSzLW9gu3ClNzvAJRU1Hr-rieHwja2d17_inPXSfos8olGP2jAubp2SzrcTvbXaOtJttqkzwCVP3oh204kMIT3vSyTPRbgbJHBAk74gz1Rxs7?purpose=fullsize
+https://images.openai.com/static-rsc-4/wPATGAcxszoFwL8hukYocgmwHgbbeBxGZa1uUJycAcQCTG1bI1T6Z9SRcozAjQawf2XTsHI6D5yaFajXZJ_4n-r5cxeSyqQ4a-PYujObkA8qzpUcxb8n3uV4mfq-0iUSO6W9GT12VM5yZx81SzDBzJydm5wN0YqKuPrWBiLH9to59e0_72Fx67KYI3aX4MPV?purpose=fullsize
+https://images.openai.com/static-rsc-4/2b-1d7hRimKO0C4Nbx17VUdZ9zxSMg_oAkHSeQdLAKiQRL64SZYfGkIaqpcc1qJVOBh8i6ZnWlMV2rmeh1rT9T0AtI3LKhfu0oSi7nQq5pR219ZKZS_Kxkf3aZHpF9ffrbmU7F0gvmsEzUDEW1sD0yaoHE39it_efjB2Oz1sr0aciux--RBUwRLyBzSDWG_h?purpose=fullsize
+7
+
+这是 GeoCities、个人主页时代非常典型的一种元素：
+
+    88×31 是最经典的尺寸，所以直接搜索 88x31 buttons 就能找到大量合集。
+
+    也叫 web buttons、web badges、site badges、micro buttons。
+
+    用途和今天 GitHub README 里的 Shields.io badges 很像：展示「Made with...」「Best viewed with...」「Linux」「Firefox」之类的信息。
+
+    另一大用途是作为友情链接/站点身份标识：站长给自己的网站制作一个 88×31 button，别人把它放进自己的 Links 页面。
+
+    经常是 GIF，带像素字体、闪烁、滚动等典型 Old Web / Web 1.0 风格。
+
+你前面说的 33×81，很可能其实是把 88×31 记反/记混了 😄。你想找的应该就是 88×31 Web Buttons。
+
+那么这种的是怎么做出来的呢
+
+88×31 Web Button 是怎么做的？
+
+其实非常简单。88×31 本质上就是一张 88×31 px 的普通图片，通常是 GIF/PNG。它没有特殊的 Web 标准；真正形成文化的是大家约定俗成地采用这个尺寸。
+https://images.openai.com/static-rsc-4/D-kioaFDavjfCX4mF6bQSciQWvYuvj16HDpQlDGRAUtFbMhQ5nLNkH8G2OeYIL-7Z2Ze1TfVCAM3tUlla6Xr-lqDfcGBFYzn2ITISzgGyIBSa8Vcf_KzZ-Ag1vZJqv2PXhXHJA1U0diHghYbvPvzHQNb8VebqW2SYU9iJjlFVCJKeRWCVhwYUz6SevQ8HJbA?purpose=fullsize
+https://images.openai.com/static-rsc-4/wPATGAcxszoFwL8hukYocgmwHgbbeBxGZa1uUJycAcQCTG1bI1T6Z9SRcozAjQawf2XTsHI6D5yaFajXZJ_4n-r5cxeSyqQ4a-PYujObkA8qzpUcxb8n3uV4mfq-0iUSO6W9GT12VM5yZx81SzDBzJydm5wN0YqKuPrWBiLH9to59e0_72Fx67KYI3aX4MPV?purpose=fullsize
+https://images.openai.com/static-rsc-4/BIp_E14EIpKAbmCU8_mRJwXlghycJN2jh0S180hXa11mU9Ummv60mCj3Xa4zrHNJSY-40GSjdPyKpvtNctybv12vZtL5aubJ7lMqXQqrX4cItWnO-rlBotscjZ1xr8Pz0dzaqwmUZ0Gs6Uby2auEJuTEtRHCUBmafKAe9J9XHp6EpVMSijYQ6YY057v1KRzI?purpose=fullsize
+5
+1. 最传统：像素级手工绘制
+
+GeoCities 年代常见做法就是用 Photoshop、Paint Shop Pro、GIMP 等工具：
+
+Canvas: 88 × 31 px
+        ↓
+画背景 / 边框
+        ↓
+放 Logo / icon
+        ↓
+加入像素字体
+        ↓
+GIF / PNG 导出
+
+例如 Bitty 完全可以做：
+
+┌──────────────────────┐
+│ 🐹  BITTY TERMINAL   │
+└──────────────────────┘
+       88 × 31
+
+因为画布极小，Pixel Art 的思路反而非常合适。不要先做 880×310 再缩小，而是直接以 88×31 为目标进行 pixel-perfect 设计。
+2. 动态版本就是 Animated GIF
+
+你看到那些特别有 Web 1.0 味道的 badge，例如：
+
+[ Linux User ]
+     ↓
+[ Linux ♥   ]
+     ↓
+[ Linux User ]
+
+本质就是几张 88×31 frame：
+
+frame-01.png ─┐
+frame-02.png ─┼─→ animated GIF
+frame-03.png ─┘
+
+可以使用 Aseprite，它特别适合这种东西：
+
+New Sprite
+→ 88 × 31
+→ Pixel Art
+→ Timeline 添加 Frames
+→ Export → GIF
+
+如果你在 Arch Linux：
+
+sudo pacman -S aseprite
+
+也可以使用 GIMP、ImageMagick 等。
+3. HTML 中没有任何特殊之处
+
+最终通常就是：
+
+<a href="https://bitty.run">
+  <img
+    src="/badges/bitty.gif"
+    width="88"
+    height="31"
+    alt="Bitty Terminal"
+  />
+</a>
+
+于是其他个人网站可以直接把你的 badge 放进：
+
+Cool Sites
+────────────────────────
+
+[bitty] [neocities] [firefox]
+[linux] [rust]      [vim]
+
+这也是它和 Shields.io 最大的文化区别。
+
+Shields.io：
+
+build | passing
+license | MIT
+version | 0.4.0
+
+主要表达 machine/project status。
+
+88×31：
+
+[Firefox NOW!]
+[Made with Vim]
+[Linux Powered]
+[My Cool Website]
+[bitty.run 🐹]
+
+更多表达 identity / affiliation / recommendation / personality。
+Bitty 其实非常适合做一个
+
+尤其你已经有 Bitty 仓鼠 mascot + modular b logo，完全可以设计一组官方 88×31：
+
+┌──────────────────────┐
+│ [b]  BITTY TERMINAL  │
+└──────────────────────┘
+
+┌──────────────────────┐
+│ 🐹  powered by bitty │
+└──────────────────────┘
+
+┌──────────────────────┐
+│ >_  bitty.run        │
+└──────────────────────┘
+
+甚至可以故意采用 1-bit / dithering / pixel font / animated GIF，而不是现代 Shields.io 那种 flat badge 风格。
+
+然后在 bitty.run 提供一个 Badges 页面，让用户复制：
+
+<a href="https://bitty.run">
+  <img src="https://bitty.run/badges/bitty.gif"
+       alt="Bitty Terminal">
+</a>
+
+这样它就不仅是 Logo，而是一个很符合 Unix / hacker / personal web 文化的 Bitty 小标识。
+
+如果你想实际做一张，我也可以直接给 Bitty 生成一套 88×31 Pixel Art badges，包括静态版和适合做 GIF 动画的几个 frame。
+
+对，这个方向和 Bitty 很契合，而且我觉得你这里其实可以把 “像素吉祥物”做成 Bitty 的一套统一视觉语言，不只是初始化时显示一下。
+为什么比 ASCII 更合适
+
+ASCII art 的问题正是你说的：占终端空间，而且信息密度低。
+
+例如 ASCII 吉祥物通常至少需要：
+
+       /\_/\
+      ( o.o )
+       > ^ <
+
+如果复杂一点，很容易占 6~10 行。
+
+而一个真正的 raster pixel mascot，例如：
+
+32×32
+48×48
+64×64
+
+它在支持 image protocol 的终端里可以直接占一个很小区域，而且视觉辨识度远高于字符画。
+
+特别是 Bitty 本身就是终端模拟器，你完全可以原生支持：
+
+    Kitty Graphics Protocol
+
+    Sixel
+
+    iTerm2 Inline Images
+
+    Bitty 自己的 internal image surface
+
+这样：
+
+bitty init
+
+启动时可以出现一个很小的仓鼠：
+
+[ 32×32 hamster ]
+
+Welcome to Bitty.
+
+✓ config created
+✓ plugin directory initialized
+✓ shell integration enabled
+
+视觉上会比一个大 ASCII Logo 干净很多。
+Pixel Art 也很适合桌宠
+
+这里优势更明显。
+
+桌宠本质上不需要高帧率动画。
+
+你说的：
+8 frames/second
+
+已经足够做很多 Pixel Art 动画。
+
+比如一个 idle animation：
+
+Frame 1  standing
+Frame 2  blink
+Frame 3  standing
+Frame 4  ear twitch
+Frame 5  standing
+Frame 6  blink
+Frame 7  tail move
+Frame 8  standing
+
+甚至没必要 8 张都完全不同。
+
+可能：
+
+idle:
+4 frames
+
+walk:
+6 frames
+
+sleep:
+4 frames
+
+typing:
+6 frames
+
+look-around:
+4 frames
+
+整个 mascot animation set 可能几十张小图就够了。
+
+而且如果：
+
+64×64
+RGBA
+
+即使完全不压缩：
+64×64×4=16KB/frame
+
+8 帧也才：
+128KB
+
+实际 PNG/GIF 会小得多。
+
+对一个终端程序来说几乎可以忽略。
+我甚至不建议最终用 GIF 作为内部格式
+
+GIF 适合：
+
+    README
+
+    网站展示
+
+    Neocities / 88×31
+
+    社交媒体
+
+但 Bitty 内部更适合：
+
+sprite sheet
+
+比如：
+
+mascot.png
+
+┌────┬────┬────┬────┐
+│idle│idle│idle│idle│
+├────┼────┼────┼────┤
+│walk│walk│walk│walk│
+├────┼────┼────┼────┤
+│sleep ...              │
+└────┴────┴────┴────┘
+
+再配一个：
+
+[animation.idle]
+frames = [0, 1, 2, 1]
+fps = 4
+
+[animation.walk]
+frames = [4, 5, 6, 7, 8, 9]
+fps = 8
+
+[animation.sleep]
+frames = [10, 11, 12, 11]
+fps = 2
+
+或者 Lua：
+
+mascot.animation {
+  name = "idle",
+  fps = 4,
+  frames = { 0, 1, 2, 1 },
+}
+
+这样以后桌宠插件就很好控制。
+Bitty 可以形成完整 mascot system
+
+我觉得可以分成三个层次。
+CLI / onboarding mascot
+
+用于：
+
+bitty
+bitty init
+bitty doctor
+bitty update
+
+例如状态不同，仓鼠表情不同：
+
+success    happy
+warning    confused
+error      panic
+waiting    sleeping
+building   typing
+updating   carrying box
+
+这样 mascot 不只是 decoration，而是：
+
+    visual status indicator
+
+Desktop / floating pet
+
+结合你之前 Bitty 的 floating panel 设计，可以做：
+
+mascot panel
+
+它是一个透明、无边框的小 floating panel。
+
+例如：
+
+┌──────────────────────────────────┐
+│ terminal                         │
+│                                  │
+│                           🐹     │
+└──────────────────────────────────┘
+
+仓鼠可以：
+
+    坐在 tab bar 上
+
+    趴在 panel 边缘
+
+    跟着 active pane
+
+    command running 时睡觉
+
+    command fail 时惊讶
+
+    AI Agent 工作时打字
+
+    git push 成功后庆祝
+
+这个和 Bitty 的 Panel 系统天然适配。
+Plugin API
+
+甚至可以把它开放成：
+
+local pet = require("bitty.pet")
+
+pet:set_animation("typing")
+
+pet:on("command:start", function()
+  pet:set_animation("watching")
+end)
+
+pet:on("command:success", function()
+  pet:set_animation("happy")
+end)
+
+pet:on("command:error", function()
+  pet:set_animation("panic")
+end)
+
+那之后用户甚至可以：
+
+    替换 Bitty 官方仓鼠
+
+比如：
+
+cat
+slime
+robot
+duck
+fox
+custom mascot
+
+这就会变成一个很有意思的插件生态。
+这也正好适合你前面说的 Pixel Agent Skill
+
+这个 Skill 最实际的用途可能根本不是让 Agent 随便画画，而是：
+
+    专门维护 Bitty 的 pixel asset pipeline。
+
+比如：
+
+skills/
+└── pixel-artist/
+    ├── SKILL.md
+    ├── palette.md
+    ├── mascot-style.md
+    └── animation-rules.md
+
+里面规定：
+
+Canvas:
+64×64
+
+Palette:
+最多 12 色
+
+Outline:
+1~2 px
+
+Lighting:
+top-left
+
+Character:
+Bitty hamster
+
+Style:
+retro terminal pixel art
+
+Animation:
+4~8 FPS
+
+然后你可以直接给 Agent：
+
+    给 Bitty 仓鼠增加一个 git push success 动画。
+
+Agent 就：
+
+读取现有 sprite
+↓
+理解 character proportions
+↓
+设计 6 frames
+↓
+逐 pixel 编辑
+↓
+检查 animation continuity
+↓
+输出 sprite sheet
+
+这样它不是每次“重新创作一个不同的仓鼠”，而是在维护一个 consistent character design system。
+
+这一点非常重要。
+像素风还有一个很大的优势：一致性容易控制
+
+生图模型最难解决的是：
+
+Frame 1:
+仓鼠耳朵很圆
+
+Frame 2:
+耳朵突然变尖
+
+Frame 3:
+脸型变了
+
+Frame 4:
+眼睛位置变了
+
+也就是 temporal consistency。
+
+Pixel Art 因为结构简单：
+
+64×64
+limited palette
+fixed proportions
+
+Agent 可以直接复制上一帧，只修改：
+
+6~30 pixels
+
+例如眨眼：
+
+Frame A
+
+●       ●
+
+Frame B
+
+─       ─
+
+可能只需要修改四五个像素。
+
+所以对于动画来说：
+
+    Pixel editing Agent 甚至可能比生图模型更合适。
+
+可以建立一个 canonical mascot
+
+建议固定一张：
+
+bitty-hamster-reference.png
+
+作为 canonical model sheet：
+
+Front
+Side
+Back
+
+Idle
+Happy
+Sad
+Sleep
+Typing
+
+Palette
+
+Eye position
+Ear size
+Body ratio
+
+类似游戏开发里的：
+
+    character model sheet
+
+以后所有动画都遵循这个。
+
+甚至保存：
+
+mascot/
+├── palette.json
+├── proportions.json
+├── reference/
+├── idle/
+├── walk/
+├── sleep/
+├── typing/
+└── reactions/
+
+88×31 badge 也可以复用这套视觉资产
+
+这就又和我们前面讨论的东西接起来了。
+
+Bitty 的视觉系统可以是：
+
+             Bitty Hamster
+                  │
+        ┌─────────┼──────────┐
+        │         │          │
+      CLI       Desktop     Website
+     mascot       pet        mascot
+        │                     │
+        │                  88×31 badge
+        │                     │
+        └──────── README ─────┘
+
+例如官方 88×31：
+
+[🐹 bitty terminal]
+
+里面直接用 16×16 或 24×24 版本仓鼠。
+
+这样 GitHub、bitty.run、终端 UI、桌宠插件实际上共享同一种 visual identity。
+
+我觉得这已经不只是“给 Bitty 做个吉祥物”了，而是可以形成：
+
+    Bitty Pixel Visual System
+
+包含 mascot、sprites、animations、badges、icons、CLI onboarding 和 pet plugin。
+
+而且因为全部是低分辨率 pixel assets，维护成本确实非常低，非常适合一个偏 Hacker / Retro Terminal 气质的项目。
+
+对了，你可以看看 bitty 或者说别的终端，也就是 kitty, ghostty, wezterm 这些的图像支持协议吗，也就是 kitty 和 sixel ，然后这个输出的尺寸跟什么有关，然后就是终端设置的文字大小会影响什么，比如我是用的 Jetbrains Mono 14px 的字体，那么这个字体渲染跟什么有关呢
+
+对，这个问题和你前面设想的 Bitty pixel mascot / pet 直接相关。关键是先区分三个尺寸：
+Image Pixels=Terminal Cells=Screen Pixels​
+
+而 font size 正是把 Terminal Cell 和 Screen Pixel 联系起来的重要因素之一。
+1. 现代终端本质还是 Cell Grid
+
+传统 terminal 可以抽象成：
+
+Terminal
+┌────┬────┬────┬────┬────┐
+│ A  │ B  │ C  │ D  │ E  │
+├────┼────┼────┼────┼────┤
+│    │    │    │    │    │
+└────┴────┴────┴────┴────┘
+
+80 columns × 24 rows
+
+但是每个 cell 在显示器上其实占一块 pixel rectangle：
+
+        cell width
+      <----------->
+      ┌───────────┐  ↑
+      │           │  │
+      │     A     │  │ cell height
+      │           │  │
+      └───────────┘  ↓
+
+假设某个环境计算出来：
+
+cell = 9 × 18 physical/logical pixels
+
+那么：
+
+80 × 24 cells
+
+对应内容区域大约就是：
+720×432 px
+
+实际还会涉及 padding、DPI scaling、window decorations 等。
+
+Kitty Graphics Protocol 官方文档甚至明确建议应用查询 window pixel size + rows/columns，从而获得 cell pixel dimensions；也可以通过 CSI 16 t 查询单个 cell 的 pixel dimensions。
+2. JetBrains Mono 14 并不意味着 cell = 14×14 px
+
+这是一个很容易混淆的地方。
+
+假设配置：
+
+font-family = JetBrains Mono
+font-size   = 14
+
+这个 14 通常是 typographic size，很多终端配置表达的是 points，而不是“每个字符 14×14 pixels”。
+
+例如 Ghostty 明确把 font-size 定义为 points，然后结合显示环境映射到实际 pixel size；Linux GTK 下还会受到 display scaling/text scaling 影响。
+
+大致关系可以理解为：
+font sizeDPI / scale
+​font pixel sizefont metrics
+​cell width / height
+
+例如：
+
+JetBrains Mono
+14 pt
+   ↓
+DPI / display scale
+   ↓
+glyph rasterization
+   ↓
+font metrics
+
+advance width
+ascent
+descent
+line gap
+   ↓
+terminal cell
+≈ 9 × 18 px    ← 仅举例，不是固定值
+
+所以不同字体即使都是：
+
+14 pt
+
+cell geometry 也可能不同。
+
+WezTerm 文档也明确说明，默认 cell width 是由 font + font size + font designer 定义的字体比例间接决定的；base font 的 metrics 决定 terminal grid 的 cell metrics。
+3. 这就涉及 Kitty Graphics Protocol
+
+Kitty Graphics Protocol 和“拿 Unicode 字符假装图片”完全不同。
+
+它是真的允许：
+
+    把 raster pixels 交给 terminal emulator。
+
+Kitty 协议可以传输：
+
+24-bit RGB
+32-bit RGBA
+PNG
+
+例如原始数据：
+
+64 × 64 RGBA
+
+就是：
+64×64×4=16384 bytes
+
+然后 Terminal 把它作为 texture/image 管理。
+
+最重要的是，它把：
+
+Image
+
+和：
+
+Placement
+
+分开了。
+
+Image
+64 × 64 px
+   │
+   └──── Image ID = 42
+
+Placement A
+   ├── position
+   ├── rows
+   ├── columns
+   ├── offsets
+   └── z-index
+
+同一张 image 甚至可以有多个 placement。
+
+这对 Bitty 将来的 Panel / mascot 系统其实很值得参考。
+4. 那么图片显示多大？
+
+这里就是你真正关心的问题。
+
+Kitty Graphics Protocol 可以告诉 terminal：
+
+c = columns
+r = rows
+
+例如：
+
+c=4
+r=4
+
+意思不是：
+
+    图片是 4×4 pixels。
+
+而是：
+
+    把图片放进 4×4 terminal cells 的 rectangle。
+
+Kitty 会根据这个区域缩放图片。
+
+假设当前：
+
+cell = 9 × 18 px
+
+那么：
+
+4 columns = 36 px
+4 rows    = 72 px
+
+于是 placement area：
+36×72
+
+注意终端 cell 通常不是正方形。
+
+所以：
+
+4×4 cells
+
+绝对不等于：
+
+square
+
+这点对于 Pixel Art mascot 非常重要。
+5. Font size 会直接改变 cell-based 图片的显示尺寸
+
+假设 Bitty 仓鼠原图：
+
+64 × 64 px
+
+你要求它占：
+
+8 columns × 4 rows
+
+Font size 较小时
+
+假设：
+
+cell = 8 × 16 px
+
+那么：
+8×8=64px 4×16=64px
+
+刚好：
+
+64 × 64
+
+Font size 放大以后
+
+假设：
+
+cell = 10 × 20 px
+
+同样：
+
+8 × 4 cells
+
+就变成：
+80×80px
+
+于是同一张 64×64 mascot 被显示为：
+
+80 × 80 screen pixels
+
+所以如果 placement 是以 cells 定义的，font size 会影响图片最终显示尺寸。
+6. Kitty 还有 Pixel-level positioning
+
+这也是 Kitty Graphics Protocol 很强的一点。
+
+图片默认从当前 cursor 所在 cell 左上角开始，但协议还有：
+
+X = pixel offset inside first cell
+Y = pixel offset inside first cell
+
+并且 source rectangle 可以使用：
+
+x
+y
+w
+h
+
+按照 pixels 裁剪。
+
+所以它实际上同时拥有：
+
+Terminal coordinate system
+
+Cell space:
+    column / row
+
+Pixel space:
+    x / y / width / height
+
+Image space:
+    source pixels
+
+可以理解成：
+
+Image Space
+64×64
+   │
+   │ crop / scale
+   ▼
+Placement
+   │
+   │ c=8 r=4
+   ▼
+Terminal Grid
+8×4 cells
+   │
+   │ font metrics
+   ▼
+Screen Rectangle
+64×64 / 80×80 / ...
+
+7. SIXEL 的思路又不太一样
+
+SIXEL 是更老的 raster graphics protocol，历史可以追到 DEC terminal。
+
+它的核心思想更接近：
+
+    通过 terminal escape sequences 编码 raster graphics。
+
+而 Kitty Graphics Protocol 是现代 GPU terminal 时代重新设计的一套协议，除了传输图片，还认真处理：
+
+    image ID
+
+    placement
+
+    alpha
+
+    z-index
+
+    source rectangle
+
+    animation
+
+    deletion
+
+    shared memory/file transmission
+
+    Unicode placeholder
+
+等等。
+
+因此对于 Bitty，我会认为：
+
+    Kitty Graphics Protocol 比 SIXEL 更值得作为主要参考架构。
+
+SIXEL 更多应该考虑 compatibility。
+8. Kitty Graphics Protocol 甚至原生有 animation
+
+这个对你的仓鼠尤其有意思。
+
+Kitty 协议本身就定义了 animation frame composition/control，包括 frame gap：
+
+z = frame duration
+
+以及：
+
+start
+stop
+current frame
+loop count
+frame composition
+
+默认 frame gap 甚至定义为 40ms。
+
+所以你刚才说：
+
+Bitty hamster
+8 frames
+8 FPS
+
+完全属于这种 graphics protocol 很擅长表达的内容。
+9. Ghostty / WezTerm 的现状也值得 Bitty参考
+
+Ghostty 官方目前明确支持 Kitty Graphics Protocol。
+
+WezTerm 的图像协议覆盖面更广，目前文档列出了：
+
+    Kitty Graphics
+
+    Sixel
+
+    iTerm2 image protocol
+
+其中 SIXEL 在 WezTerm 文档里仍标为 experimental。
+
+所以现代 terminal ecosystem 已经明显出现：
+
+                   Raster Graphics
+                         │
+          ┌──────────────┼─────────────┐
+          │              │             │
+        SIXEL          Kitty         iTerm2
+        legacy         modern         OSC
+
+10. 对 Bitty 来说，最好把这几个坐标空间彻底分开
+
+如果你之后实现 Bitty，我非常建议内部不要出现这种模糊 API：
+
+draw_image(image, 4, 4);
+
+因为这里的 4 到底是什么？
+
+应该明确区分：
+
+ImageSize {
+    width_px: 64,
+    height_px: 64,
+}
+
+CellPosition {
+    col: 20,
+    row: 10,
+}
+
+CellSize {
+    cols: 8,
+    rows: 4,
+}
+
+PixelOffset {
+    x: 2,
+    y: 3,
+}
+
+最终 renderer：
+
+                         Font
+                          │
+                    JetBrains Mono
+                          │
+                       14 pt
+                          │
+                    DPI / scaling
+                          │
+                          ▼
+                    Font Metrics
+                          │
+                          ▼
+                    ┌───────────┐
+                    │ Cell Size │
+                    │  W × H px │
+                    └─────┬─────┘
+                          │
+          ┌───────────────┼───────────────┐
+          │                               │
+          ▼                               ▼
+      Text Grid                    Image Placement
+     120 × 40 cells                  8 × 4 cells
+          │                               │
+          └──────────────┬────────────────┘
+                         ▼
+                    GPU Renderer
+                         │
+                         ▼
+                     framebuffer
+
+这里就出现了一个很漂亮的统一关系：
+ScreenPxx​=Col×CellWidth+PixelOffsetx​​ ScreenPxy​=Row×CellHeight+PixelOffsety​​
+
+而：
+CellWidth, CellHeight=f(Font, FontSize, FontMetrics, DPI, Scale, LineHeight,…)
+这对 Bitty 仓鼠有一个非常实际的结论
+
+不要把 mascot 的逻辑尺寸绑定到 font size。
+
+我会把仓鼠保存成真正的：
+
+32×32
+64×64
+
+pixel sprite，然后提供两种 placement：
+
+PixelPerfect
+64 × 64 px
+
+CellBound
+8 cols × 4 rows
+
+PixelPerfect 特别适合你的 Pixel Art：一个 source pixel 尽量映射为整数倍 screen pixel，例如 1× / 2× / 3×，并使用 nearest-neighbor，避免 64×64 仓鼠被缩成 73×73 后产生模糊。
+
+CellBound 则适合：
+
+bitty init
+TUI
+inline image
+scrolling content
+
+因为它天然跟 terminal layout 一起工作。
+
+而桌宠 / floating panel 反而应该更多工作在 pixel coordinate space，不应该因为用户把 JetBrains Mono 14 改成 JetBrains Mono 18，仓鼠突然跟着大一圈。
+
+这也意味着 Bitty 内部其实很适合明确建立 Cell Space / Pixel Space / Image Space 三层坐标体系；Kitty Graphics Protocol 已经提供了一个相当成熟的参考设计。
+
+那么 Bitty 的图像渲染是什么协议呢，然后这个 pet 插件是这样的，因为Bitty 的 Panel 是有好几个 Mode 的，因为这个就是借鉴平铺式桌面管理器的，那么 Bitty 应该是 Floating 的吧，这样桌宠应该不会随着终端的缩放而改变吧？如果桌宠也随着变化的话那就有问题了吧。Bitty 终端模拟器自己有缩放的，默认键是 Ctrl+"+"/"-" ，其他终端模拟器也有的，就像浏览器也是可以改变 DPR 缩放的，那么是不是这个是不是可以做到只改变 focus 状态的 panel，其他没有选中的 panel 不会缩放呢，就像浏览器那样，可以选择对有的网站进行缩放，不同的网站缩放率是可以不一样的
+
+可以，而且我觉得这里应该明确区分 Terminal 内容缩放、Panel 缩放、Floating Pet 的视觉尺寸 三个层级。它们不应该绑死在一起。
+
+我刚看了 Bitty 当前仓库，默认分支里暂时没有检索到已经实现的 Kitty/SIXEL 图像协议或 Panel zoom 相关代码，所以这里更适合按你现在的架构方向来设计，而不是说“Bitty 现在已经采用某个协议”。
+1. Bitty 的图像协议：建议 Kitty Graphics 为主，SIXEL 为兼容
+
+对于终端应用自身输出图片，我建议：
+
+Primary:
+Kitty Graphics Protocol
+
+Compatibility:
+SIXEL
+
+Optional:
+iTerm2 image protocol
+
+原因很直接：Ghostty 已经支持 Kitty Graphics，WezTerm 同时支持 Kitty Graphics、SIXEL 和 iTerm2 image protocol。Kitty Graphics 本身还提供 image ID、placement、z-index、sub-cell positioning 等现代能力，比 SIXEL 更适合 Bitty 这种复杂 Panel 系统。
+
+可以把 Bitty 内部抽象成：
+
+enum GraphicsProtocol {
+    Kitty,
+    Sixel,
+    Iterm2,
+}
+
+但这只是 PTY 中的应用程序 → Bitty terminal renderer 的协议。
+
+比如：
+
+Neovim image.nvim
+        ↓
+Kitty Graphics escape sequence
+        ↓
+PTY
+        ↓
+Bitty parser
+        ↓
+Image object
+        ↓
+Renderer
+
+而 Bitty 自己的插件，例如 pet，其实没有必要经过 Kitty Graphics Protocol。
+2. Pet 插件不应该走终端图像协议
+
+这个非常重要。
+
+如果：
+
+shell program → Kitty Graphics → terminal
+
+那 Kitty protocol 是合理的。
+
+但：
+
+Bitty pet plugin → Bitty renderer
+
+Bitty 已经掌握 renderer 了，完全没必要：
+
+plugin
+ ↓
+encode Kitty escape sequence
+ ↓
+terminal parser
+ ↓
+decode
+ ↓
+renderer
+
+应该直接：
+
+pet plugin
+    ↓
+Bitty Plugin API
+    ↓
+Image/Sprite API
+    ↓
+Renderer
+
+例如：
+
+local pet = bitty.sprite {
+    source = "hamster.png",
+    width = 64,
+    height = 64,
+    filtering = "nearest",
+}
+
+所以 Bitty 最好有两个系统：
+
+External terminal graphics
+Kitty / SIXEL / iTerm2
+        ↓
+ Terminal Surface
+
+Internal graphics API
+Plugin / Panel / UI
+        ↓
+ Renderer directly
+
+这样架构会干净很多。
+3. Pet 确实应该是 Floating Panel
+
+你这个判断我赞同。
+
+因为 Pet 本质上不是：
+
+    terminal content
+
+而是：
+
+    UI overlay / independent visual object
+
+所以更适合：
+
+PanelMode::Floating
+
+甚至未来可以细分：
+
+enum PanelMode {
+    Tiled,
+    Floating,
+    Overlay,
+    Headless,
+}
+
+Pet 可能更接近 Floating 或 Overlay。
+
+例如：
+
+┌─────────────────────────────────────────┐
+│ Bitty Window                            │
+│                                         │
+│ ┌──────────── Terminal ───────────────┐ │
+│ │                                    │ │
+│ │ $ cargo test                       │ │
+│ │ ...                                │ │
+│ │                                    │ │
+│ └────────────────────────────────────┘ │
+│                              🐹         │
+└─────────────────────────────────────────┘
+
+这里仓鼠的位置应该是：
+
+Window / Panel pixel space
+
+而不是：
+
+terminal cell space
+
+这样才合理。
+4. Pet 不应该随着 Terminal Font Zoom 改变
+
+这也是我认为最关键的 invariant：
+
+    Terminal zoom affects terminal content, not independent floating UI.
+
+假设：
+
+Ctrl++
+
+把当前 Terminal Panel 从：
+
+JetBrains Mono 14
+
+放大到：
+
+JetBrains Mono 18
+
+发生的应该是：
+
+font size ↑
+cell width ↑
+cell height ↑
+columns ↓
+rows ↓
+
+但是：
+
+pet = 64 × 64 logical pixels
+
+保持不变。
+
+也就是：
+
+Before
+
+Terminal cell: 8×16
+Pet: 64×64
+
+After Ctrl++
+
+Terminal cell: 10×20
+Pet: 64×64
+
+而不是：
+
+Pet: 80×80   ❌
+
+否则确实会非常奇怪。
+5. 这里最好区分三种 Scale
+
+Bitty 内部我会明确区分：
+
+UI Scale
+Terminal Zoom
+Content Scale
+
+UI Scale
+
+类似：
+
+OS DPI
+Wayland scale
+macOS Retina
+Windows 150%
+
+它影响整个 Bitty：
+
+buttons
+panels
+icons
+pet
+terminal
+
+例如：
+
+1 logical px → 2 physical px
+
+这是 DPI / HiDPI。
+Terminal Zoom
+
+例如：
+
+Ctrl++
+Ctrl+-
+
+它只改变：
+
+font size
+cell metrics
+terminal grid
+
+不改变：
+
+window chrome
+tab bar
+floating panels
+pet
+
+Panel Content Scale
+
+这就是你现在想到的更高级的一层：
+
+    每一个 Panel 自己可以有自己的 zoom。
+
+我觉得非常值得做。
+6. Ctrl +/- 完全可以只作用于 Focused Panel
+
+这其实非常合理，而且比很多传统 terminal 更符合 Bitty 的 Panel 哲学。
+
+比如现在：
+
+Workspace
+
+┌────────────────┬────────────────┐
+│ Terminal A     │ Terminal B     │
+│                │                │
+│ 14pt           │ 18pt           │
+│                │                │
+├────────────────┴────────────────┤
+│ Logs                            │
+│ 11pt                            │
+└─────────────────────────────────┘
+
+如果 focus 在 Terminal B：
+
+Ctrl++
+
+只改变：
+
+Terminal B
+18pt → 20pt
+
+其它 Panel：
+
+Terminal A = 14pt
+Logs       = 11pt
+
+全部保持。
+
+这个设计我觉得甚至比：
+
+    整个 window 一个 font-size
+
+更符合 Bitty。
+7. 很像浏览器的 per-site zoom，但其实更像 per-pane zoom
+
+你的浏览器类比是成立的。
+
+浏览器：
+
+site A = 90%
+site B = 125%
+site C = 100%
+
+Bitty 可以：
+
+panel A = 100%
+panel B = 125%
+panel C = 80%
+
+不过 Bitty 的单位可以不是百分比，而是：
+
+font_size
+
+例如：
+
+panel {
+    zoom = 1.0,
+}
+
+panel {
+    zoom = 1.25,
+}
+
+或者 terminal：
+
+terminal {
+    font_size = 14,
+}
+
+8. 最好建立一个继承体系
+
+我会设计成：
+
+Global default
+   ↓
+Workspace override
+   ↓
+Panel override
+
+例如：
+
+config.font_size = 14
+
+workspace("coding", {
+    font_size = 13,
+})
+
+panel("logs", {
+    zoom = 0.85,
+})
+
+最终：
+
+effective_zoom =
+global
+× workspace
+× panel
+
+或者更简单一点：
+
+effective_font_size =
+panel.font_size
+?? workspace.font_size
+?? global.font_size
+
+我个人更倾向第二种，比较 predictable。
+9. Panel 类型不同，Zoom 的含义也可以不同
+
+这是 Bitty 很值得利用的一点。
+Terminal Panel
+
+Ctrl++
+→ font size ↑
+→ cell size ↑
+→ grid reflow
+
+Markdown Panel
+
+Ctrl++
+→ content zoom ↑
+
+类似浏览器。
+Image Panel
+
+Ctrl++
+→ image zoom
+
+File Explorer
+
+Ctrl++
+→ icon/text scale
+
+Pet Panel
+
+Ctrl++
+→ maybe nothing
+
+或者：
+
+Pet 有自己的 explicit scale
+
+比如：
+
+pet {
+    scale = 2,
+}
+
+注意 Pixel Art 最好：
+
+1×
+2×
+3×
+4×
+
+而不是：
+
+1.37×
+
+这样 nearest-neighbor 才保持 pixel-perfect。
+10. Pet 应该使用 Logical Pixel Size
+
+例如 canonical sprite：
+
+32×32 source pixels
+
+显示时：
+
+1× = 32×32
+2× = 64×64
+3× = 96×96
+
+如果当前显示器：
+
+DPR = 2
+
+renderer 最后：
+
+64 logical px
+→ 128 physical px
+
+这是正常的。
+
+这里：
+
+Pet logical size
+
+不应该受：
+
+font size
+terminal cell
+Ctrl+/-
+
+影响。
+
+真正关系应该是：
+
+Source Sprite
+32×32
+   ↓
+Pet scale = 2×
+   ↓
+64×64 logical pixels
+   ↓
+DPR = 2
+   ↓
+128×128 framebuffer pixels
+
+和 Terminal 完全独立。
+11. Bitty 最终可以有四个坐标空间
+
+这其实会让 renderer 架构非常清晰：
+
+1. Image Space
+   sprite pixels
+
+2. Cell Space
+   terminal col/row
+
+3. Panel Space
+   logical px inside panel
+
+4. Window Space
+   logical px inside Bitty window
+
+再由 GPU renderer 转为：
+
+Physical Pixel Space
+
+例如 Terminal：
+CellSpace→PanelSpace
+
+Pet：
+ImageSpace→PanelSpace
+
+Floating Panel：
+PanelSpace→WindowSpace
+
+最终：
+WindowSpace×DPR→PhysicalPixels
+
+这会比把所有东西硬绑到 terminal cells 上舒服得多。
+12. Floating Pet 甚至可以独立于 Terminal Panel
+
+例如：
+
+Workspace
+│
+├── Terminal A
+├── Terminal B
+├── Git Panel
+│
+└── Pet Floating Panel
+
+Pet 不属于：
+
+Terminal A
+
+所以：
+
+focus Terminal A
+Ctrl++
+
+只改变 Terminal A。
+
+如果：
+
+focus Pet
+Ctrl++
+
+你甚至可以定义为：
+
+Pet scale 2× → 3×
+
+或者直接：
+
+Ctrl++ ignored
+
+看你的 UX 设计。
+
+我更推荐：
+
+    Ctrl +/- 是一个 generic panel zoom action，具体由 Panel 决定如何解释。
+
+例如：
+
+trait Panel {
+    fn zoom_in(&mut self);
+    fn zoom_out(&mut self);
+}
+
+Terminal：
+
+zoom_in() => font_size += 1
+
+Image：
+
+zoom_in() => scale *= 1.1
+
+Pet：
+
+zoom_in() => sprite_scale += 1
+
+这样 Bitty 的快捷键体系就非常统一。
+我觉得最适合 Bitty 的模型
+
+可以总结成：
+
+                 Bitty Window
+                      │
+        ┌─────────────┴─────────────┐
+        │                           │
+    Workspace                    UI Layer
+        │                           │
+   ┌────┴─────┐                 Floating
+   │          │                    Pet
+Terminal A Terminal B              🐹
+  14pt       18pt                 64px
+   │          │                    │
+ Ctrl+       Ctrl+                 │
+   │          │                    │
+ only A      only B                │
+                                     │
+                             unaffected
+
+所以你的想法是对的：不要让终端 font zoom 成为一个全局视觉缩放。
+
+Bitty 如果真的采用 Panel-first 架构，那么 zoom 最自然的 scope 应该就是：
+
+    Focused Panel
+
+而不是：
+
+    Window / Workspace 全局。
+
+只有真正的 UI Scale / DPI Scale 才应该全局作用。
+
+这个设计其实非常符合你一直在做的“把 Bitty 当成一个 terminal-oriented window manager / workspace”思路。
+

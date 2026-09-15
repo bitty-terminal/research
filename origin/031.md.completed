@@ -1,0 +1,913 @@
+那么现在 bitty 本身有哪些是没有实现完的？这里说的是 bitty-ai 需要的部分，也就是如果 bitty 没有实现的话，那么 bitty-ai 并行完成的话就会受阻
+是的。按我刚刚重新检查的 **当前 `bitty` main + `bitty-ai-docs`**，如果问题限定为：
+
+> **“哪些 Bitty 侧没有完成，会让 bitty-ai 即使并行开发完成也无法真正接入 Bitty？”**
+
+那么可以把问题收敛得很清楚：**真正的 P1 硬阻塞目前主要就是 G-2 和 G-3。** 其他还有几个 P2 集成缺口，但不会阻止 `bitty-ai-runtime` 本身继续开发。`bitty-ai` 的 vertical slice 文档也明确把 G-2/G-3 称为 *load-bearing findings*。
+
+## 当前依赖关系
+
+我会把状态概括成：
+
+| Bitty 侧能力                                               | 当前状态                            | 对 bitty-ai 的影响         |
+| ------------------------------------------------------- | ------------------------------- | ---------------------- |
+| `bitty-ipc` framing / wire / scope / auth               | ✅ 基本已有                          | 不阻塞                    |
+| `bitty-agent` generic protocol                          | ✅ 已实现，尚未 Verified               | 基本不阻塞                  |
+| **`terminal.snapshot` host service**                    | ❌ **缺失**                        | 🔴 P1 硬阻塞              |
+| **Generic Tool Dispatch host service**                  | ❌ **缺失**                        | 🔴 P1 硬阻塞              |
+| Authorization / Consent → real effect enforcement       | 🟡 primitives 有，host wiring 未完整 | 🔴 effectful tools 硬阻塞 |
+| Generic `ExecutionContext` / supervised exec            | 🟡 设计未落定                        | 🔴 `exec` 硬阻塞          |
+| Structured execution outcome / `Unknown` reconciliation | 🟡 设计有，host 实现不足                | 🔴 安全执行阻塞              |
+| Bridge Client SDK                                       | ❌ 未形成稳定外部 SDK                   | 🟠 P2                  |
+| Rich Scene fragment transport                           | ❌ 未实现                           | 🟠 UI 集成阻塞             |
+| AI consent → generic IPC scope mapping                  | 🟡 未完全统一                        | 🟠 P2                  |
+| Panel projection                                        | 🟡 已有很多基础设施                     | 🟢 不应成为 AI runtime 阻塞  |
+| Persistence                                             | 未定                              | 🟢 v0.1 不阻塞            |
+| LSP / AST / multi-agent                                 | 主要属于 bitty-ai                   | 🟢 不是 Bitty 当前 blocker |
+
+---
+
+# 1. 最大的 blocker：`terminal.snapshot`
+
+这是现在最明确的一项。
+
+`bitty-ipc` **已经知道这个方法存在**：
+
+```rust
+"terminal.snapshot" => Some(Scope::TerminalInspect)
+```
+
+也就是说：
+
+```text
+method registry        ✅
+terminal.inspect scope ✅
+authorization model    ✅
+wire protocol          ✅
+
+真实 handler           ❌
+```
+
+`Scope` 本身也已经定义了：
+
+```text
+terminal.inspect
+terminal.input
+terminal.manage
+...
+process.spawn
+```
+
+而且 MCP/Agent 默认就是 read-only scopes。
+
+但是现在缺的是这一段：
+
+```text
+bitty-ai
+   │
+   │ IPC
+   ▼
+terminal.snapshot
+   │
+   ▼
+Bitty Host Dispatcher
+   │
+   ▼
+Terminal / View / SemanticZone state
+   │
+   ▼
+bounded structured snapshot
+```
+
+pressure test 对这个定义非常准确：
+
+> G-2：method registry 已经知道 `terminal.snapshot -> terminal.inspect`，但是 **没有 host dispatcher 注册 bounded `terminal.snapshot` handler**，也没有 generic panel-context read service。
+
+这会直接阻塞 bitty-ai 的：
+
+```text
+ContextProvider
+├── terminal context
+├── current command
+├── current output
+├── SemanticZone
+├── selected Panel/Terminal
+└── terminal history/context
+```
+
+所以现在 bitty-ai 可以把：
+
+```rust
+trait TerminalContextProvider
+```
+
+全部写好，可以用 FakeHost 测试。
+
+但是最终：
+
+```text
+bitty-ai ContextProvider
+          ↓
+       live Bitty
+```
+
+目前还接不上。
+
+### 这个应该优先在 Bitty 做
+
+我建议最终形成类似：
+
+```rust
+terminal.snapshot({
+    terminal_id,
+    generation,
+    zone,
+    max_bytes,
+})
+```
+
+返回：
+
+```rust
+TerminalSnapshot {
+    terminal_id,
+    generation,
+    cwd,
+    semantic_zones,
+    text,
+    truncated,
+    is_untrusted_surface,
+    ...
+}
+```
+
+特别重要的是：
+
+> **不要返回整个 Grid 内部对象。**
+
+应该是 bounded snapshot DTO。
+
+这正符合 Bitty → bitty-ai 的进程边界。
+
+---
+
+# 2. 第二个最大 blocker：Generic Tool Dispatch
+
+这个甚至比 Provider 更重要。
+
+现在 bitty-ai 已经可以产生：
+
+```text
+ToolCall
+```
+
+也可以：
+
+```text
+validate
+authorize hook
+budget
+cancel
+Unknown
+ToolResult
+```
+
+Agent loop 当前也已经实现了 Tool Bus 这一套 deterministic skeleton。
+
+但问题是最后一步：
+
+```text
+ToolCall
+   ↓
+真实 Bitty capability
+```
+
+没有通。
+
+现在实际上是：
+
+```text
+bitty-ai
+    │
+    ▼
+ ToolBus
+    │
+    ▼
+ Fake / Stub
+```
+
+而应该最终成为：
+
+```text
+bitty-ai
+    │
+    │ authenticated IPC
+    ▼
+Generic Tool Dispatch
+    │
+    ├── fs.read
+    ├── fs.write
+    ├── process.spawn
+    ├── terminal.*
+    ├── view.*
+    ├── config.*
+    └── plugin.*
+```
+
+pressure-test 的 G-3 明确写的是：
+
+> `bitty-ipc` 已经有 MCP client transport/correlation stub，但是 **host-side registration 和 consent-bound dispatch 不存在**。
+
+所以现在：
+
+```text
+Tool protocol       ✅
+MCP client stub     ✅
+scope system        ✅
+ConsentLedger       ✅
+
+host tool registry  ❌
+host dispatch       ❌
+effect enforcement  ❌
+```
+
+这就是第二个真正的硬 blocker。
+
+---
+
+# 3. `Authorization` 有零件，但是“真正执行前的 gate”还没串起来
+
+这点很容易误以为已经完成。
+
+`bitty-ipc` 其实已经做了很多：
+
+```text
+PeerCredentials
+Scope
+ScopeSet
+ConsentLedger
+authorize_method()
+rate limiting
+bounded framing
+```
+
+而且做得已经比较完整。
+
+但是：
+
+```text
+有 Authorization primitive
+≠
+所有真实 Tool effect 都已经经过 Authorization
+```
+
+目前缺的是：
+
+```text
+ToolCall
+   │
+   ▼
+Schema validation
+   │
+   ▼
+resolve captured target/generation
+   │
+   ▼
+Scope check
+   │
+   ▼
+ConsentLedger
+   │
+   ▼
+Effect policy
+   │
+   ▼
+Execution backend
+```
+
+特别是：
+
+```text
+read_file
+write_file
+edit
+exec
+terminal.send
+spawn process
+```
+
+不能只是：
+
+```rust
+tool.execute()
+```
+
+而要经过一个共同的 Host Effect Gateway。
+
+这就是 docs 里的 **AIQ-33**：
+
+> unified authorization/isolation backend 必须在真实 tool dispatch 之前存在。
+
+因此我认为 **G-3 和 AIQ-33 最好一起解决**，而不是：
+
+```text
+先做 Generic Tool Dispatch
+以后再补 security
+```
+
+最好直接：
+
+```text
+Generic Host Dispatch
+        =
+routing
++ authorization
++ consent
++ captured target
++ budget
++ attribution
++ outcome
+```
+
+---
+
+# 4. `exec` 所需要的 Generic Execution Backend 也还不完整
+
+这个是下一层非常重要的 blocker。
+
+Bitty 本身当然已经有：
+
+```text
+PTY
+process
+terminal
+Panel
+```
+
+但这不等于 bitty-ai 已经可以安全执行：
+
+```text
+cargo test
+cargo check
+git diff
+pytest
+npm test
+```
+
+你之前的设计其实已经把正确方向定出来了：
+
+```text
+agent.exec()
+    ↓
+ExecutionContext
+    ↓
+supervised process / PTY
+    ↓
+bounded evidence
+    ↓
+structured result
+```
+
+而不是：
+
+```text
+Agent
+ ↓
+Panel
+ ↓
+shell command
+```
+
+`command-tool-architecture` 也已经把 mandatory Headless Panel 模型否掉了，改成：
+
+```text
+Agent -> ExecutionContext <- optional Panel
+```
+
+因此真正缺的是一个 generic Bitty primitive：
+
+```rust
+ExecutionRequest {
+    executable,
+    args,
+    cwd,
+    env_policy,
+    target,
+    timeout,
+    output_budget,
+}
+```
+
+然后返回：
+
+```rust
+ExecutionResult {
+    execution_id,
+    status,
+    exit_code,
+    stdout_summary,
+    stderr_summary,
+    truncated,
+    evidence_refs,
+    effect_state,
+}
+```
+
+其中：
+
+```text
+effect_state =
+    Completed
+    Failed
+    Canceled
+    Unknown
+```
+
+## 为什么这是 Bitty 侧能力？
+
+因为真正的：
+
+```text
+process
+PTY
+lifecycle
+kill
+cleanup
+target
+isolation
+Panel projection
+```
+
+都是 Host 资源。
+
+bitty-ai 应该决定：
+
+```text
+“我要执行什么”
+```
+
+而 Bitty 应该负责：
+
+```text
+“这个进程怎么被安全执行和监督”
+```
+
+所以一旦你准备实现真正的：
+
+```text
+exec tool
+```
+
+这个就会成为硬 blocker。
+
+---
+
+# 5. Structured Result / `Unknown` 也不能省
+
+这个可能看起来只是一个 struct，但实际上很关键。
+
+例如 agent 发：
+
+```text
+git checkout foo
+```
+
+然后中间 IPC 断开。
+
+Agent 不能假设：
+
+```text
+失败了，再执行一次
+```
+
+因为真实情况可能是：
+
+```text
+命令执行成功
+↓
+response 没回来
+```
+
+所以必须允许：
+
+```text
+Unknown
+```
+
+你的 bitty-ai runtime 已经对此建模：
+
+```text
+Completed
+Failed
+Canceled
+Unknown
+```
+
+而且明确规定 `Unknown` 必须 reconciliation，不能盲目 retry。
+
+但是 Bitty host execution backend 也必须能给出对应语义，否则 AI runtime 再正确也没用。
+
+所以：
+
+```text
+bitty-ai semantics     ✅
+Bitty real evidence    🟡/❌
+```
+
+这也是 real `exec` integration 前必须补齐的一部分。
+
+---
+
+# 6. `bitty-bridge` / 外部 Client SDK：不是今天的硬 blocker，但迟早要做
+
+这个是 G-1。
+
+现在 `bitty-ai-slice` 为了复用真正的 `bitty-ipc`，是：
+
+```text
+bitty-ai
+   ↓
+pinned Git revision
+   ↓
+bitty-ipc
+```
+
+甚至需要：
+
+```text
+cargo-deny allow-git
+```
+
+因为 `bitty-ipc`：
+
+```toml
+publish = false
+```
+
+pressure-test 因此提出：
+
+```text
+bitty-bridge
+```
+
+或者：
+
+```text
+bitty-ipc-client
+```
+
+作为真正供外部进程使用的 SDK。
+
+我很赞成这个方向。
+
+以后最好不是：
+
+```text
+bitty-ai ──dependency──> 整个 bitty-ipc internal crate
+```
+
+而是：
+
+```text
+                  bitty
+                    │
+             server implementation
+                    │
+              Bitty Bridge v1
+                    │
+       ┌────────────┼──────────────┐
+       ▼            ▼              ▼
+   bitty-ai      CLI/MCP       devtools
+```
+
+这个 **现在不阻塞开发**，因为 pinned git revision 可以继续工作。
+
+但会阻塞：
+
+```text
+稳定 release
+versioning
+independent repository build
+clean dependency boundary
+```
+
+所以是 P2。
+
+---
+
+# 7. Rich streaming transport 还没真正跨进程
+
+`bitty-rich` 本身已经有：
+
+```text
+Scene
+RichBlock
+SceneNode
+damage
+semantic representation
+```
+
+但是：
+
+```text
+bitty-ai external process
+          ↓
+       IPC
+          ↓
+bitty-rich Scene
+```
+
+这条路还没真正完成。
+
+pressure-test 的 G-4 就是：
+
+> `Scene` / `RichBlock` 不能由 out-of-process producer 直接消费，并且没有 bounded scene-fragment ingestion method。
+
+所以未来需要类似：
+
+```text
+rich.fragment.publish
+```
+
+或者：
+
+```text
+panel.scene.update
+```
+
+传：
+
+```text
+MarkdownFragment
+DiffFragment
+ToolCardFragment
+```
+
+而不是把内部 Rust `SceneNode` 直接序列化出去。
+
+但这个不会阻止 Agent 真正工作。
+
+最开始完全可以：
+
+```text
+bitty-ai
+  ↓
+text chunks
+  ↓
+simple panel
+```
+
+之后再 Rich。
+
+所以它是：
+
+> 🟠 UI blocker，不是 Agent runtime blocker。
+
+---
+
+# 8. `ai_panel.rs` 现在反而需要“去耦”，而不是继续往里面堆 AI
+
+我也检查了现在 Bitty 的：
+
+```text
+crates/bitty-runtime/src/ai_panel.rs
+```
+
+这里其实已经有不少东西：
+
+```text
+AgentWorkspace
+AgentMemory
+Panel
+MCP bounds
+AI context budget
+ai.provider
+ai.stream
+ai.model
+agent.context.terminal
+agent.context.workspace
+mcp.invoke:*
+```
+
+甚至有 AI Panel lifecycle / capability helper 等。
+
+但这里存在一个架构问题：
+
+> 这些代码出现得比现在独立 `bitty-ai` 架构更早。
+
+所以 pressure-test 将它标成 G-5，要求重新检查：
+
+```text
+ai.provider
+ai.stream
+ai.model
+agent.context.*
+```
+
+是否应该存在于 Terminal Core。
+
+我觉得现在答案已经越来越明确：
+
+```text
+bitty-runtime
+不应该拥有
+AI provider
+AI model
+Agent memory
+AgentWorkspace policy
+```
+
+Bitty 应该拥有：
+
+```text
+Panel
+Execution
+IPC
+Context snapshots
+Capabilities
+Rich projection
+Process / PTY
+```
+
+bitty-ai 才拥有：
+
+```text
+Provider
+Agent
+Session
+Context projection
+Memory policy
+Tool orchestration
+Model selection
+```
+
+因此 `ai_panel.rs` 未来更合理的结构甚至可能是：
+
+```text
+Bitty generic Panel
+      ↑
+      │ bridge
+      │
+bitty-ai UI plugin
+```
+
+而不是继续扩张 `ai_panel.rs`。
+
+这项本身不阻塞 bitty-ai，但**现在就应该避免继续往这里加入新的 AI 逻辑**。
+
+---
+
+# 9. 哪些目前其实已经够用了
+
+这点也需要区分，否则容易觉得 Bitty 什么都没完成。
+
+### `bitty-ipc` 基础协议已经够用了
+
+目前已经有：
+
+```text
+256 KiB framing
+bounded channels
+WireEnvelope v1
+ScopeSet
+ConsentLedger
+PeerCredentials
+rate limiting
+MCP stub
+request correlation
+timeout
+```
+
+所以不用重新做 IPC。
+
+### `bitty-agent` generic vocabulary 已经有了
+
+它已经有：
+
+```text
+AgentId
+AgentMessage
+ToolSpec
+ToolCall
+ToolResult
+AgentObservation
+SideQueue
+AgentSession
+```
+
+而且它明确声明：
+
+```text
+NO LLM I/O
+NO Provider
+NO Context Assembly
+NO real tool execution
+```
+
+这些本来就应该属于独立 bitty-ai 或 Host dispatch。
+
+所以不要等：
+
+> “把 bitty-agent 做成完整 AI Agent 后，bitty-ai 才开始。”
+
+完全不用。
+
+事实上 `bitty-agent` 保持小才是对的。
+
+---
+
+# 10. 因此并行开发可以这样切
+
+现在最合理的 DAG 是：
+
+```text
+                     ┌────────────────────────┐
+                     │      bitty-ai          │
+                     │                        │
+                     │ AgentLoop              │
+                     │ Session                │
+                     │ Context L0/L1          │
+                     │ Tool contracts         │
+                     │ FakeProvider           │
+                     │ Provider abstraction   │
+                     │ Streaming              │
+                     │ Prefix caching         │
+                     │ Prompt layering        │
+                     │ AST/code tools         │
+                     └───────────┬────────────┘
+                                 │
+                           可以继续并行
+                                 │
+                  ───────────────┼───────────────
+                                 │
+                     Integration Boundary
+                                 │
+              ┌──────────────────┴───────────────────┐
+              │               bitty                  │
+              │                                       │
+              │ 🔴 terminal.snapshot                  │
+              │ 🔴 generic tool dispatch              │
+              │ 🔴 auth + consent effect gate         │
+              │ 🔴 ExecutionContext backend           │
+              │ 🔴 structured effect outcome          │
+              │                                       │
+              │ 🟠 bridge client SDK                  │
+              │ 🟠 rich fragment transport            │
+              └───────────────────────────────────────┘
+```
+
+换句话说，**现在完全没有必要停下 bitty-ai 等 Bitty**。
+
+bitty-ai 可以独立完成非常多，大概一直做到：
+
+```text
+FakeHost
+FakeProvider
+FakeToolExecutor
+```
+
+全部稳定。
+
+真正碰到墙是在：
+
+```text
+FakeHost → LiveBittyHost
+```
+
+这里。
+
+---
+
+# 我建议 Bitty 现在优先做的顺序
+
+如果你准备让两个项目真正并行，我会直接把 Bitty 侧工作排成：
+
+1. **`terminal.snapshot`**
+2. **Generic Host Tool Dispatch + authorization/consent**
+3. **Generic `ExecutionContext` + structured `ExecutionResult`**
+4. Bridge Client SDK
+5. Rich fragment ingestion
+6. 清理/迁移 `ai_panel.rs` 中 AI-specific ownership
+
+其中 **1 + 2 是当前文档已经明确确认的 P1**；3 是你开始让 Agent 真正 `exec` 时马上会遇到的 blocker；4/5 可以晚一些。
+
+所以从项目管理角度，现在其实很适合拆成两条并行线：
+
+```text
+bitty-ai team
+→ 把 Agent Kernel 做完整
+
+bitty team
+→ 把 Host Capability Gateway 做完整
+```
+
+最后在：
+
+```text
+Bitty Bridge
+```
+
+汇合。
+
+**这可能比继续给 bitty-ai 增加功能还更重要：目前真正决定 bitty-ai 能不能从“独立 Agent framework”变成“Bitty 原生 AI 子平台”的，已经不是 Provider 或 Agent Loop，而是这几个 generic host primitives。**
+

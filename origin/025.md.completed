@@ -1,0 +1,1404 @@
+## 核心原则
+
+对于 bitty-ai，提高缓存命中率最重要的一条其实是：
+
+$$
+\boxed{\text{尽量让每一轮请求的前缀保持完全一致}}
+$$
+
+因为 Prefix Cache 基本上依赖 **Longest Common Prefix**。所以 Agent Harness 的 Context 组织应该围绕“稳定前缀”来设计，而不是简单把所有东西按方便顺序拼进去。
+
+我会建议 bitty-ai 把完整 Context 分成几层：
+
+```text
+[1] Runtime Protocol / Core System Prompt     ← 最稳定
+[2] Stable Tool Schemas                       ← 很稳定
+[3] Stable Loaded Skills                      ← 较稳定
+[4] Project / Workspace Context               ← 中等稳定
+[5] Conversation / Agent History              ← 持续增长
+[6] Tool Results / Runtime State              ← 高频变化
+[7] Current Turn                              ← 最动态
+```
+
+也就是：
+
+$$
+stable \rightarrow dynamic
+$$
+
+越稳定的内容越靠前。
+
+---
+
+# 1. System Prompt 必须稳定
+
+这是最重要的。
+
+不要这样：
+
+```text
+Current time: ...
+Current cwd: ...
+Current branch: ...
+Current model: ...
+You are bitty-ai...
+```
+
+因为：
+
+```text
+time 每轮变化
+↓
+第二三个 token 就不同
+↓
+整个后续 prefix cache 几乎报废
+```
+
+应该改成：
+
+```text
+You are bitty-ai.
+Core behavior...
+Safety...
+Tool protocol...
+Agent rules...
+```
+
+然后把动态数据放后面：
+
+```text
+<runtime_state>
+cwd=/foo/bar
+branch=main
+time=...
+</runtime_state>
+```
+
+即：
+
+```text
+Stable Core
+Stable Core
+Stable Core
+-------------
+Dynamic Runtime
+```
+
+不要：
+
+```text
+Dynamic
+Stable
+Stable
+Stable
+```
+
+---
+
+# 2. Tool Schema 必须 deterministic
+
+这一点对 bitty-ai 极重要。
+
+假设你有：
+
+```text
+read
+write
+edit
+bash
+grep
+glob
+lsp
+tree
+git
+panel
+task
+```
+
+不要每轮按照：
+
+```rust
+HashMap
+```
+
+遍历出来。
+
+因为 `HashMap` 顺序可能变化：
+
+```text
+请求 A:
+read
+write
+bash
+grep
+
+请求 B:
+grep
+bash
+read
+write
+```
+
+语义一样，但 token sequence 不一样。
+
+直接 Cache Miss。
+
+应该规定 canonical ordering：
+
+```text
+filesystem.read
+filesystem.write
+filesystem.edit
+
+search.grep
+search.glob
+search.symbol
+
+process.exec
+
+lsp.*
+
+git.*
+
+panel.*
+
+agent.*
+```
+
+甚至 schema 内部字段顺序也应该固定：
+
+```json
+{
+  "name": "...",
+  "description": "...",
+  "parameters": {
+    ...
+  }
+}
+```
+
+不要有时：
+
+```json
+"name"
+"description"
+"parameters"
+```
+
+有时：
+
+```json
+"description"
+"parameters"
+"name"
+```
+
+对模型来说它们是完全不同的 token stream。
+
+---
+
+# 3. Serialization 必须完全确定
+
+bitty-ai 最好专门有：
+
+```rust
+ContextSerializer
+```
+
+而不是各模块自己：
+
+```rust
+format!()
+serde_json::to_string()
+```
+
+随便拼。
+
+例如这些都应该 canonical：
+
+```text
+Tool ordering
+Skill ordering
+JSON key ordering
+Whitespace
+Newline
+Section ordering
+Path normalization
+Boolean representation
+Numbers
+```
+
+比如：
+
+```text
+{"a":1,"b":2}
+```
+
+和：
+
+```text
+{
+  "b": 2,
+  "a": 1
+}
+```
+
+人类看来一样。
+
+Prefix Cache 看来：
+
+```text
+完全不一样
+```
+
+所以最好定义：
+
+```text
+Canonical Context Encoding
+```
+
+我甚至会把它当作 bitty-ai 一个正式协议。
+
+---
+
+# 4. Skills 不要每轮动态重新排列
+
+你之前考虑：
+
+```text
+/skills
+```
+
+以及项目：
+
+```text
+.bitty/
+  skills/
+```
+
+那么一个问题是：
+
+> Skills 到底什么时候加载？
+
+如果每轮：
+
+```text
+Agent 自动挑 10 个 skill
+```
+
+下一轮：
+
+```text
+自动挑另外 8 个 skill
+```
+
+那么很容易破坏 Prefix Cache。
+
+更好的结构是：
+
+```text
+Core Prompt
+Core Tools
+Core Skills
+-------------------
+Session Skills
+-------------------
+Dynamic Context
+```
+
+其中：
+
+### Core Skills
+
+例如：
+
+```text
+use-terminal
+use-filesystem
+use-git
+use-lsp
+```
+
+在整个 session 内固定。
+
+### Session Skills
+
+当用户显式：
+
+```text
+/skills add rust-debugging
+```
+
+或者 Agent 确定进入 Rust Debug Session：
+
+```text
+session skillset version++
+```
+
+之后保持不变。
+
+不要每一轮都重新挑。
+
+---
+
+# 5. MCP / Plugins 也应该做“Session Snapshot”
+
+同样适用于：
+
+```text
+/mcp
+/plugins
+```
+
+比如用户安装：
+
+```text
+GitHub MCP
+Postgres MCP
+Browser MCP
+```
+
+不要每轮都实时 enumerate：
+
+```text
+tool list
+```
+
+然后把结果重新排序、重新描述。
+
+应该创建：
+
+```text
+ToolRegistrySnapshot
+```
+
+例如：
+
+```rust
+struct ToolRegistrySnapshot {
+    version: u64,
+    tools: Vec<ToolDefinition>,
+    digest: Hash,
+}
+```
+
+Session 开始：
+
+```text
+toolset version = 42
+```
+
+整个 Agent Session 内：
+
+```text
+version 42
+```
+
+一直保持。
+
+只有：
+
+```text
+/plugin enable
+/plugin disable
+/mcp add
+```
+
+才产生：
+
+```text
+version 43
+```
+
+这样 cache invalidation 是显式的。
+
+这个思想很像：
+
+```text
+immutable snapshot
+```
+
+而不是：
+
+```text
+mutable global registry
+```
+
+---
+
+# 6. 不要把完整 Runtime State 放在最前面
+
+Agent 很容易出现这种 Prompt：
+
+```text
+cwd
+git status
+current branch
+current time
+open files
+terminal size
+panel id
+workspace id
+agent id
+token budget
+context usage
+
+System Prompt...
+```
+
+这是 Cache Disaster。
+
+这些东西应该尽可能靠后：
+
+```text
+Stable Prefix
+----------------
+
+Conversation
+----------------
+
+<runtime>
+cwd=...
+branch=...
+panel=...
+</runtime>
+
+<current_user_message>
+...
+</current_user_message>
+```
+
+甚至有些状态根本没必要每轮发送。
+
+---
+
+# 7. 状态应该“按需获取”，而不是塞进 Context
+
+这是 Agent 设计里非常重要的一点。
+
+比如：
+
+```text
+git status
+当前所有文件
+所有 panel 状态
+所有 agent 状态
+所有环境变量
+```
+
+不要全部放 Prompt。
+
+提供工具：
+
+```text
+git.status()
+panel.inspect()
+workspace.inspect()
+agent.list()
+env.get()
+```
+
+让模型需要时调用。
+
+这同时：
+
+1. 减少 input tokens
+2. 增加 Prefix Cache 命中率
+3. 避免 stale state
+
+所以 bitty-ai 的原则应该是：
+
+> **Dynamic state should preferably be addressable, not embedded.**
+
+也就是：
+
+```text
+Context ≠ Database
+```
+
+Context 不应该成为状态仓库。
+
+---
+
+# 8. Tool Result 不要随便修改历史内容
+
+例如：
+
+```text
+User
+Assistant tool call
+Tool result
+Assistant
+```
+
+进入历史以后尽量 immutable。
+
+不要后台突然：
+
+```text
+原始 tool output
+↓
+重新压缩
+↓
+替换历史 message
+```
+
+因为这样：
+
+```text
+历史 Context 从中间变化
+↓
+后面所有 KV invalid
+```
+
+如果要压缩，最好有明确的 checkpoint。
+
+例如：
+
+```text
+──── Checkpoint 17 ────
+Summary of turns 1-40
+──── New Epoch ────────
+turn 41
+turn 42
+...
+```
+
+也就是说你可以把一次 `/compact` 看作：
+
+```text
+Cache Epoch Boundary
+```
+
+压缩完成之后：
+
+```text
+旧 cache 放弃
+↓
+建立新的稳定 prefix
+↓
+后面继续复用
+```
+
+这比“不停对历史做微小修改”更容易管理。
+
+---
+
+# 9. `/compact` 应该是低频结构性操作
+
+这跟你之前提到的 DCP 特别相关。
+
+一种设计：
+
+```text
+每隔几轮：
+修改早期某个 tool result
+修改另一段
+压缩另一段
+```
+
+看起来每次只改一点。
+
+但是 Prefix Cache 看的是：
+
+```text
+第一个变化位置
+```
+
+假设：
+
+```text
+100K Context
+```
+
+你修改第：
+
+```text
+5K
+```
+
+的位置。
+
+那么：
+
+```text
+后面 95K cache 全失效
+```
+
+所以从 Cache 角度：
+
+> “局部修改”不一定真的局部。
+
+这是非常重要的。
+
+### 更好的方法
+
+尽量压缩：
+
+```text
+最靠后的可压缩 segment
+```
+
+而不是一直回头修改非常早的历史。
+
+或者采用：
+
+```text
+Immutable Segments
+```
+
+例如：
+
+```text
+Segment A: Core
+Segment B: Session Summary 1
+Segment C: Recent History
+Segment D: Current Turn
+```
+
+当 C 太大：
+
+```text
+C -> Summary C'
+```
+
+然后开始新的：
+
+```text
+Segment D
+```
+
+形成：
+
+```text
+Core
+Summary A
+Summary B
+Recent...
+```
+
+而不是不停修改 `Summary A`。
+
+---
+
+# 10. 可以设计“Context Epoch”
+
+我觉得这个非常适合 bitty-ai。
+
+例如：
+
+```rust
+ContextEpoch {
+    id,
+    system_version,
+    toolset_version,
+    skillset_version,
+    project_context_version,
+    summary_version,
+}
+```
+
+只要这些没有变化：
+
+```text
+Cache Prefix Stable
+```
+
+一旦：
+
+```text
+/compact
+/plugins enable xxx
+/skills add xxx
+/model switch
+```
+
+就：
+
+```text
+epoch++
+```
+
+然后接受一次：
+
+```text
+cold prefill
+```
+
+后面重新享受高 hit rate。
+
+这样 cache invalidation 是：
+
+```text
+explicit
+```
+
+而不是神秘发生。
+
+---
+
+# 11. Agent Loop 内尤其容易做到高命中
+
+比如：
+
+```text
+User
+ ↓
+LLM
+ ↓
+bash
+ ↓
+LLM
+ ↓
+read file
+ ↓
+LLM
+ ↓
+edit
+ ↓
+LLM
+```
+
+如果 Context 是 append-only：
+
+```text
+Request 1:
+A B C
+
+Request 2:
+A B C D
+
+Request 3:
+A B C D E
+
+Request 4:
+A B C D E F
+```
+
+这是 Prefix Cache 最理想的形式。
+
+每次：
+
+```text
+previous request
+```
+
+都是下一次请求的完整前缀。
+
+理论上：
+
+$$
+HitRate \rightarrow 很高
+$$
+
+所以 Agent loop 最重要的 Context property 其实是：
+
+> **Append-only**
+
+---
+
+# 12. 不要每轮重新生成 System Prompt
+
+例如有些 Agent 会：
+
+```rust
+build_system_prompt(state)
+```
+
+里面动态插：
+
+```text
+There are currently 14 tools.
+You have 8182 weighted tokens left.
+Current project has 821 files.
+It is 23:17.
+```
+
+那么 system prompt 永远不同。
+
+应该：
+
+```rust
+build_static_system_prompt()
+```
+
+固定。
+
+另外提供：
+
+```text
+<turn_context>
+remaining_budget=8182
+...
+</turn_context>
+```
+
+放最后。
+
+---
+
+# 13. Token Budget 信息也尽量不要放前面
+
+比如：
+
+```text
+You have 12983 tokens left.
+```
+
+下一轮：
+
+```text
+You have 11822 tokens left.
+```
+
+如果它在 System Prompt 第 10 行：
+
+```text
+cache boom
+```
+
+应该放：
+
+```text
+末尾
+```
+
+甚至只有模型需要知道时才发。
+
+---
+
+# 14. Repository Context 也不要每轮重新扫描注入
+
+比如 bitty-ai 有你之前设想的：
+
+```text
+Tree-sitter
+AST outline
+LSP symbol
+project map
+```
+
+不要：
+
+```text
+每轮扫描 repo
+↓
+生成新的 project summary
+↓
+塞在 system 后面
+```
+
+因为文件稍微变化：
+
+```text
+整个 project context 变化
+```
+
+后面 cache 全失效。
+
+更好的方式：
+
+```text
+Project Snapshot v17
+```
+
+保持 immutable。
+
+变化时：
+
+```text
+delta:
+src/foo.rs changed
+```
+
+放在当前 turn 后面。
+
+等到显式：
+
+```text
+/project refresh
+```
+
+再：
+
+```text
+Snapshot v18
+```
+
+这和数据库的：
+
+```text
+snapshot + WAL
+```
+
+其实很像。
+
+---
+
+# 15. 这甚至可以借鉴 Git
+
+我认为 bitty-ai Context 可以直接采用类似 Git 的思想：
+
+```text
+Base Snapshot
++
+Append-only commits
+```
+
+而不是：
+
+```text
+Mutable giant document
+```
+
+例如：
+
+```text
+Context Root
+ ├─ System@hash1
+ ├─ Tools@hash2
+ ├─ Skills@hash3
+ ├─ Project@hash4
+ └─ History
+      ├─ turn1
+      ├─ turn2
+      ├─ turn3
+      └─ turn4
+```
+
+每个部分都有：
+
+```text
+content hash
+```
+
+这样你能知道：
+
+```text
+system unchanged
+tools unchanged
+skills unchanged
+project unchanged
+```
+
+那么整个 prefix 的稳定性是可计算的。
+
+---
+
+# 16. 可以给所有 Context Block 做 Content Addressing
+
+例如：
+
+```rust
+ContextBlock {
+    kind: ContextKind,
+    content: Arc<str>,
+    hash: blake3::Hash,
+}
+```
+
+然后：
+
+```text
+System:
+hash = abc
+
+Tools:
+hash = def
+
+Skills:
+hash = 123
+```
+
+如果 hash 不变：
+
+```text
+不重新 serialize
+```
+
+甚至底层 inference backend 如果允许，也可以：
+
+```text
+prefix cache key = hash(prefix_tokens)
+```
+
+这样很自然。
+
+---
+
+# 17. Multi-Agent 时 Cache 更值得设计
+
+你之前 Bitty 有：
+
+```text
+Agent A
+Agent B
+Agent C
+```
+
+而且可能共享：
+
+```text
+workspace
+project
+tools
+skills
+```
+
+那么可以有：
+
+```text
+Shared Prefix
+```
+
+例如：
+
+```text
+System
+Tools
+Project
+Skills
+```
+
+三个 agent 一样：
+
+```text
+                    ┌ Agent A history
+Shared Prefix ──────┼ Agent B history
+                    └ Agent C history
+```
+
+理论上 inference backend 支持 prefix cache 的话：
+
+> 多个 Agent 也可能共享同一个 Prefix Cache。
+
+这非常适合 bitty 的 Multi-Agent 架构。
+
+---
+
+# 18. Panel 状态不要直接进入 Agent Prefix
+
+你的 Agent / Panel 是解耦的。
+
+那就更应该避免：
+
+```text
+当前 Panel width = 103
+当前 Panel height = 31
+Panel focused = true
+```
+
+放进稳定 Prompt。
+
+Panel 应该是资源：
+
+```text
+panel://12
+```
+
+Agent 可以：
+
+```text
+panel.inspect(12)
+panel.history(12)
+```
+
+需要的时候读取。
+
+所以：
+
+```text
+Agent Context
+```
+
+和：
+
+```text
+Panel State
+```
+
+最好也是分离的。
+
+---
+
+# 19. Provider Routing 也会影响 Cache
+
+如果以后 bitty-ai 支持：
+
+```text
+OpenAI
+Anthropic
+Gemini
+Local llama.cpp
+vLLM
+SGLang
+```
+
+你不能认为 Cache 能跨 Provider。
+
+应该把 Cache Scope 定义成类似：
+
+```text
+CacheKey = (
+    provider,
+    model,
+    model_revision,
+    tokenizer,
+    sampling/runtime config,
+    prefix_hash
+)
+```
+
+至少：
+
+```text
+model
+tokenizer
+prefix
+```
+
+必须兼容。
+
+所以 OmniRoute 一类模型路由如果自动：
+
+```text
+Claude → GPT → Gemini
+```
+
+虽然 Context 一样：
+
+```text
+KV Cache = 不能直接复用
+```
+
+---
+
+# 20. Sticky Routing 对自托管尤其重要
+
+如果以后 Bitty 支持：
+
+```text
+vLLM cluster
+```
+
+比如：
+
+```text
+GPU0
+GPU1
+GPU2
+GPU3
+```
+
+Session 第一轮去了：
+
+```text
+GPU1
+```
+
+下一轮最好：
+
+```text
+GPU1
+```
+
+否则 Prefix Cache 可能只存在 GPU1。
+
+因此应该考虑：
+
+```text
+session_id
+↓
+cache-aware router
+↓
+same worker
+```
+
+这叫：
+
+* session affinity
+* prefix-aware routing
+* cache-aware routing
+
+---
+
+# 21. 我会给 bitty-ai 设计一个 `Context Planner`
+
+不是简单：
+
+```rust
+Vec<Message>
+```
+
+而是：
+
+```rust
+ContextPlan {
+    stable_prefix,
+    semi_stable_prefix,
+    history,
+    runtime_delta,
+    current_turn,
+}
+```
+
+比如：
+
+```rust
+struct ContextPlan {
+    core: CoreContext,
+    registry: RegistrySnapshot,
+    skills: SkillSnapshot,
+    project: ProjectSnapshot,
+    history: ConversationLog,
+    runtime: RuntimeDelta,
+    current: CurrentTurn,
+}
+```
+
+然后 Planner 负责：
+
+```text
+ordering
+canonicalization
+compaction
+cache affinity
+token budget
+```
+
+这样 `/context` 可以直接展示：
+
+```text
+Context: 72,184 tokens
+
+Stable prefix:
+  system        3,102
+  tools         8,921
+  skills        4,122
+  project       9,801
+  ------------------
+  cached       25,946
+
+History        39,012
+Runtime           312
+Current          6,914
+
+Estimated cache reuse: 91%
+```
+
+这会是一个非常有价值的 bitty-ai feature。
+
+---
+
+# 22. `/context` 可以显示“Cache Friendliness”
+
+甚至可以把它做成开发者指标：
+
+```text
+/context
+
+Prefix stability
+────────────────────────
+System       ██████████ 100%
+Tools        ██████████ 100%
+Skills       ██████████ 100%
+Project      █████████░  96%
+History      ████████░░  81%
+
+Last invalidation:
+  /compact at token 31,244
+
+Estimated reusable prefix:
+  31,244 / 34,121 tokens
+  91.6%
+```
+
+这样调试 Agent 本身会非常方便。
+
+---
+
+# 23. 我认为 bitty-ai 可以明确几个设计 invariant
+
+最值得写进 RFC 的可能是这几个：
+
+```text
+1. Context is append-only by default.
+
+2. Stable content precedes dynamic content.
+
+3. Tool/skill serialization is deterministic.
+
+4. Dynamic runtime state is referenced, not embedded,
+   whenever possible.
+
+5. Context mutation creates an explicit epoch boundary.
+
+6. Tool/skill/plugin registry changes are versioned.
+
+7. Compaction is a structural operation, not silent mutation.
+
+8. Cache locality is part of scheduling.
+```
+
+其中最重要的其实是：
+
+$$
+\boxed{
+Append\text{-}only + StablePrefix + DeterministicSerialization
+}
+$$
+
+---
+
+## 最终可以形成这样的 bitty-ai Context Pipeline
+
+```text
+                  bitty-ai
+                     │
+              Context Planner
+                     │
+        ┌────────────┴────────────┐
+        │                         │
+ Stable / versioned          Dynamic / append-only
+        │                         │
+   Core Prompt               Recent History
+   Tool Snapshot             Tool Results
+   Skill Snapshot            Runtime Delta
+   Project Snapshot          Current Turn
+        │                         │
+        └────────────┬────────────┘
+                     │
+            Canonical Serializer
+                     │
+              Token Sequence
+                     │
+             Prefix Cache Key
+                     │
+              Model Runtime
+```
+
+这样 bitty-ai 做的就不只是：
+
+> “减少 token”。
+
+而是同时优化三个不同指标：
+
+$$
+\boxed{
+Context\ Size
+}
+$$
+
+$$
+\boxed{
+Prefix\ Stability
+}
+$$
+
+$$
+\boxed{
+Cache\ Hit\ Rate
+}
+$$
+
+这三个应该被视为独立指标。尤其是 **Context 更短不一定更快**：如果为了少几千 token，不断重写很靠前的历史，导致几十万 token 的 Prefix Cache 失效，实际 latency 和 inference cost 反而可能更差。

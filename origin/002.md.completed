@@ -1,0 +1,1272 @@
+对于 Bitty 这个终端模拟器，这个 Hyprland 式的 panel 是不是可以使得终端的 UI 可自定程度变得很高呢？比如未来可能都是可以把这个终端作为一个实用的程序，可以做到浏览网页、文件资源管理器、连接各个其他应用比如查看邮件、Telegram 等等，一个 panel 就是相当于一个应用程序，可以聊天展示等等操作呢？都可以自定义成一个 IDE 了？因为 Neovim 的高度可自定义，Neovim 本身确实可以有很多插件可以把自己变成一个 IDE，集成 Git, LSP 等等功能，那么 Bitty 是不是也是可以这样高度可自定义呢？
+
+是的。如果 Bitty 的 panel 不是简单的“分屏终端”，而是一个真正的 first-class UI container，那么它完全可以把 Bitty 从“终端模拟器”推向一种高度可组合的桌面工作环境 / developer workspace。
+
+而且你拿 Hyprland + Neovim 来类比，其实非常合适。
+1. Panel 可以成为 Bitty 最重要的抽象之一
+
+传统终端大概是：
+
+Terminal
+└── Tab
+    └── PTY
+        └── Shell
+
+但 Bitty 可以变成：
+
+Bitty Workspace
+├── Panel: Terminal
+├── Panel: File Explorer
+├── Panel: Git
+├── Panel: Markdown
+├── Panel: Browser
+├── Panel: AI Chat
+├── Panel: Email
+├── Panel: Telegram
+├── Panel: Logs
+└── Panel: Custom Plugin
+
+也就是说：
+
+    Panel 不等于 Terminal。
+
+    Terminal 只是 Panel 的一种实现。
+
+这个差别非常关键。
+
+如果一开始就这么设计，Bitty 的上限会高很多。
+2. 最终确实可以做到类似 IDE
+
+例如：
+
+┌───────────────┬─────────────────────────────┐
+│ File Explorer │         Editor / Vim        │
+│               │                             │
+│ src/          │                             │
+│ tests/        │                             │
+├───────────────┼─────────────────────────────┤
+│ Git           │ Terminal                    │
+│ M  main.rs    │ $ cargo test                │
+│ M  lib.rs     │                             │
+├───────────────┴─────────────────────────────┤
+│                AI Chat                     │
+└─────────────────────────────────────────────┘
+
+这已经跟 VS Code、Zed、JetBrains 很接近了。
+
+甚至：
+
+bitty
+├── terminal
+├── editor
+├── lsp
+├── git
+├── file explorer
+├── debugger
+├── AI agent
+└── task runner
+
+那么 Bitty 实际上就可以成为一个 IDE shell。
+
+但最大的区别是：
+
+    IDE 只是 Bitty 的一种 configuration，而不是 Bitty 本身。
+
+类似 Neovim：
+
+Neovim + plugins
+    ↓
+LazyVim
+    ↓
+IDE-like environment
+
+Bitty 可以是：
+
+Bitty + plugins + layout
+    ↓
+Developer workspace
+
+甚至：
+
+Bitty + different plugins
+    ↓
+SysAdmin Dashboard
+
+或者：
+
+Bitty + mail + telegram + browser + ssh
+    ↓
+Communication Workspace
+
+3. 和 Hyprland 的思想确实很像
+
+Hyprland 本质上管理：
+
+Window
+
+Bitty 可以管理：
+
+Panel
+
+于是很多 Window Manager 的概念都能自然映射进来。
+
+例如：
+Hyprland	Bitty
+window	panel
+workspace	workspace
+split	split
+floating window	floating panel
+fullscreen	zoom panel
+workspace rule	panel rule
+keybind	keybind
+window class	panel type
+special workspace	scratch panel
+
+甚至可以有：
+
+panelrule {
+    type = "telegram"
+    float = true
+    width = 800
+    height = 600
+}
+
+或者：
+
+bitty.bind("SUPER", "E", function()
+    bitty.panel.toggle("file-explorer")
+end)
+
+这时候体验就很像：
+
+    一个运行在窗口内部的 programmable tiling compositor。
+
+这个概念我认为非常适合 Bitty。
+4. Panel 最好采用统一生命周期
+
+例如所有 panel：
+
+trait Panel {
+    fn mount(&mut self, ctx: &PanelContext);
+    fn render(&mut self, frame: &mut Frame);
+    fn handle_event(&mut self, event: Event);
+    fn resize(&mut self, size: Size);
+    fn focus(&mut self);
+    fn blur(&mut self);
+    fn suspend(&mut self);
+    fn resume(&mut self);
+    fn unmount(&mut self);
+}
+
+这样 TerminalPanel：
+
+TerminalPanel
+
+和：
+
+GitPanel
+BrowserPanel
+MarkdownPanel
+ChatPanel
+FilePanel
+
+在 compositor 看来都一样。
+
+这其实就是非常典型的：
+
+Panel Runtime
+       │
+       ├── layout
+       ├── focus
+       ├── input
+       ├── rendering
+       ├── lifecycle
+       └── IPC
+            │
+            ▼
+         Plugins
+
+Bitty core 不关心这个 Panel 究竟是：
+
+terminal
+browser
+AI
+Git
+Telegram
+
+5. Panel 之间甚至应该能通信
+
+这是进一步提升 extensibility 的关键。
+
+比如：
+
+File Explorer
+     │
+     │ open
+     ▼
+Editor
+
+或者：
+
+Terminal
+   │
+   │ cwd changed
+   ▼
+File Explorer
+
+甚至：
+
+Git Panel
+   │
+   │ diff
+   ▼
+AI Panel
+
+因此可以提供：
+
+Event Bus
+
+例如：
+
+bitty.events.emit("file.open", {
+    path = "/home/foo/main.rs"
+})
+
+其他插件：
+
+bitty.events.on("file.open", function(event)
+    editor.open(event.path)
+end)
+
+那么 Bitty 就会出现一种非常有意思的能力：
+
+    插件不只是“加 UI”，还可以组成 workflows。
+
+6. 甚至可以做到应用组合
+
+例如你提到 Telegram。
+
+Telegram panel 不一定需要重新写一个 Telegram client。
+
+可以有几种方式：
+Web application
+
+Telegram Web
+      ↓
+WebView Panel
+
+类似：
+
+BrowserPanel
+├── Gmail
+├── Telegram
+├── GitHub
+├── Grafana
+└── Linear
+
+这样开发成本最低。
+Native plugin
+
+例如：
+
+Git Plugin
+Mail Plugin
+SSH Plugin
+Docker Plugin
+Kubernetes Plugin
+
+直接调用 API：
+
+plugin
+   ↓
+HTTP / DBus / socket / CLI
+
+例如：
+
+kubectl
+git
+gh
+docker
+systemctl
+
+Bitty 只负责 UI。
+CLI adapter
+
+甚至：
+
+Plugin UI
+   ↓
+CLI
+
+比如：
+
+git
+gh
+kubectl
+aws
+gcloud
+nmcli
+bluetoothctl
+
+其实大量 Linux 工具天然适合 Bitty。
+
+这甚至可能成为它非常大的优势：
+
+    GUI for CLI without abandoning CLI.
+
+7. Bitty 可以形成一个「Terminal-native application platform」
+
+如果继续走下去，我会把它分成几个层次：
+
+Bitty
+│
+├── Terminal Engine
+│
+├── UI Runtime
+│   ├── Panel
+│   ├── Layout
+│   ├── Widget
+│   └── Input
+│
+├── Plugin Runtime
+│   ├── Lua
+│   ├── native
+│   └── WASM
+│
+├── Services
+│   ├── PTY
+│   ├── filesystem
+│   ├── network
+│   ├── notifications
+│   ├── clipboard
+│   └── process
+│
+└── Applications
+    ├── terminal
+    ├── git
+    ├── files
+    ├── browser
+    ├── markdown
+    └── AI
+
+这个时候 Bitty 的定位就发生变化了：
+
+terminal emulator
+        ↓
+programmable terminal
+        ↓
+terminal workspace
+        ↓
+extensible application shell
+
+我觉得第三个阶段尤其适合作为长期定位：
+
+    Programmable Terminal Workspace
+
+而不是一上来宣传：
+
+    Desktop Environment inside a terminal
+
+否则 scope 会失控。
+8. 和 Neovim 最相似的其实是这一点
+
+Neovim 真正厉害的地方并不是：
+
+    “它有很多功能。”
+
+而是：
+
+    它提供了一套足够稳定、足够通用的 primitive，让插件作者自己组合功能。
+
+比如：
+
+buffer
+window
+tabpage
+autocmd
+keymap
+LSP
+Lua API
+
+Bitty 也应该有自己的一组 primitive：
+
+panel
+workspace
+layout
+command
+keybinding
+event
+widget
+service
+plugin
+
+例如：
+
+Panel
+Command
+Event
+Service
+Layout
+Widget
+
+如果这些抽象设计好，那么以后：
+
+bitty.nvim-like ecosystem
+
+几乎是自然出现的。
+
+而不是 Bitty core 自己实现：
+
+Email
+Telegram
+GitHub
+Docker
+Kubernetes
+
+这些应该交给插件。
+9. 一个很重要的设计原则
+
+我会建议你坚持：
+
+    Bitty Core should know as little as possible about applications.
+
+Core 只应该知道：
+
+Panel
+Plugin
+Layout
+Command
+Event
+Capability
+
+而不知道：
+
+Telegram
+GitHub
+Gmail
+Docker
+Kubernetes
+
+否则项目最终很容易变成：
+
+huge application
+
+而不是：
+
+platform
+
+比如 Neovim core 不知道：
+
+LazyGit
+Copilot
+Telescope
+Harpoon
+
+这正是它高度可扩展的原因。
+10. 但 Browser Panel 要特别谨慎
+
+你提到：
+
+    浏览网页
+
+这个技术上当然可以。
+
+例如：
+
+WebKitGTK
+WebView2
+WKWebView
+
+或者未来做类似：
+
+WebView Panel
+
+但这是一个很明显的复杂度分界线。
+
+因为一旦嵌 Chromium/WebKit，Bitty 就会从：
+
+small terminal
+
+变成：
+
+terminal + browser runtime
+
+依赖规模会瞬间膨胀。
+
+所以最好设计为：
+
+bitty-webview
+
+optional plugin/backend。
+
+类似：
+
+bitty core
+     │
+     └── panel API
+           │
+           └── WebView plugin
+
+而不是 core dependency。
+
+这样没有 WebView 的 Bitty 仍然非常轻。
+11. 我甚至觉得可以产生一种非常有意思的配置生态
+
+例如：
+
+Bitty Distribution
+
+类似 Neovim distribution。
+
+比如：
+
+bitty-minimal
+
+只有：
+
+terminal
+tabs
+splits
+
+bitty-dev
+
+包含：
+
+terminal
+files
+git
+AI
+task runner
+LSP
+
+bitty-cloud
+
+包含：
+
+SSH
+Kubernetes
+Docker
+Logs
+Grafana
+AWS
+
+bitty-social
+
+包含：
+
+Telegram
+Discord
+Email
+Browser
+RSS
+
+甚至社区最终可能出现：
+
+awesome-bitty
+
+里面全部是：
+
+plugins
+layouts
+themes
+configurations
+
+这就很接近 Neovim 生态了。
+12. 所以 Bitty 的长期形态可能很有意思
+
+我会这样描述它：
+
+              Traditional Terminal
+                       │
+                       ▼
+                    Bitty
+                  /       \
+                 /         \
+          CLI Workspace   UI Workspace
+              │               │
+       Terminal / SSH      Panel / Widget
+              │               │
+              └──────┬────────┘
+                     ▼
+                Plugin Platform
+                     │
+          ┌──────────┼───────────┐
+          ▼          ▼           ▼
+         DevOps      IDE       Applications
+
+也就是说它不是简单地：
+
+    “把 terminal 做得功能更多。”
+
+而是：
+
+    “让 terminal window 成为一个 programmable workspace container。”
+
+这两个定位区别非常大。
+我觉得 Bitty 最值得坚持的几个核心 abstraction
+
+如果你真的准备长期往这个方向发展，我会把 API 稳定性优先级排成：
+
+1. Panel
+2. Workspace
+3. Layout
+4. Command
+5. Keybinding
+6. Event
+7. Capability
+8. Service
+9. Widget
+10. Plugin
+
+其中尤其重要的是：
+
+Panel + Event + Command + Capability
+
+它们几乎决定了 Bitty 插件生态的上限。
+
+所以你现在这个 Hyprland-style Panel 的思路，并不只是一个 UI feature。设计得好的话，它其实可能成为 Bitty 整个 application model 的基础抽象。
+
+长期来看，Bitty 最有潜力的形态可能不是单纯和 Kitty / Ghostty / Alacritty 比“谁的终端渲染更快”，而是：
+
+    Ghostty / Kitty 提供优秀的 terminal；Neovim 提供 programmable editor；Hyprland 提供 programmable compositor；Bitty 则可以尝试成为 programmable terminal workspace。
+
+这个定位会明显更有辨识度。
+
+那么对于那个 IPC 可以有哪些天然优势呢
+
+IPC 对 Bitty 这种架构非常天然
+
+如果 Bitty 要走“programmable terminal workspace”这条路线，那么 IPC（Inter-Process Communication）实际上会成为一个非常重要的基础设施。
+
+因为 Bitty 天然会同时存在：
+
+Bitty Core
+├── UI / compositor
+├── PTY processes
+├── plugins
+├── external CLI tools
+├── background services
+├── agents
+└── other Bitty instances
+
+这些东西本身就不是一个进程。
+
+所以 IPC 不是为了“炫技”，而是非常自然地解决这些组件之间的通信。
+1. 最大优势：任何程序都能控制 Bitty
+
+例如提供：
+
+bitty msg panel open terminal
+bitty msg panel focus git
+bitty msg workspace switch dev
+bitty msg notify "cargo test finished"
+
+实际上就是：
+
+bitty CLI
+   │
+   │ Unix Socket
+   ▼
+Bitty daemon / main process
+   │
+   ▼
+Panel Manager
+
+这样 shell script 都能控制 Bitty：
+
+cargo test && bitty msg notify "Tests passed"
+
+甚至：
+
+git checkout feature-x
+
+bitty msg workspace create feature-x
+bitty msg panel open terminal
+bitty msg panel open git
+
+这就是非常强的 Unix composability。
+2. 与 shell 天然融合
+
+这是 Bitty 相比传统 GUI IDE 非常大的潜在优势。
+
+VS Code 的很多操作：
+
+GUI → extension API → VS Code
+
+Bitty 可以同时支持：
+
+Lua Plugin ─────┐
+Rust Plugin ────┤
+Shell ──────────┤
+Python ─────────┤
+Agent ──────────┤── IPC ──> Bitty
+systemd ────────┤
+Git hook ───────┤
+CI tool ────────┘
+
+例如 Python：
+
+client.panel_open("logs")
+
+shell：
+
+bitty msg panel open logs
+
+Rust：
+
+client.panel_open("logs").await?;
+
+底层其实都是同一个 IPC protocol。
+
+这会导致一个很重要的结果：
+
+    Bitty 的 automation API 不绑定某一种编程语言。
+
+这比只有 Lua Plugin API 更开放。
+3. 插件可以真正做到进程隔离
+
+例如：
+
+Bitty
+ │
+ ├── Terminal Plugin
+ │
+ ├── Git Plugin Process
+ │
+ ├── AI Plugin Process
+ │
+ └── Telegram Plugin Process
+
+插件挂了：
+
+telegram plugin
+      💥
+
+Bitty 本身不一定挂：
+
+Bitty
+├── Terminal ✅
+├── Git ✅
+└── Telegram ❌ restart
+
+如果插件全部 in-process：
+
+Bitty
+└── dlopen(plugin.so)
+
+一个：
+
+segfault
+
+可能直接把整个 Bitty 带走。
+
+IPC 就可以提供：
+
+Fault Isolation
+Crash Isolation
+Resource Isolation
+Permission Isolation
+
+对于第三方插件平台非常重要。
+4. 插件甚至不需要统一语言
+
+这是 IPC 最漂亮的一点。
+
+假设协议是：
+
+JSON-RPC
+
+或者：
+
+MessagePack / protobuf
+
+那么：
+
+Rust plugin
+Python plugin
+Go plugin
+Node plugin
+Lua runtime
+
+全部都可以接。
+
+Bitty 只关心：
+
+IPC Protocol
+
+而不是：
+
+Plugin ABI
+
+后者实际上困难得多。
+
+尤其 Rust ABI 本身就不适合直接做长期稳定插件 ABI。
+
+所以：
+
+Native ABI
+
+和：
+
+IPC Protocol
+
+相比，我会更看好后者作为 Bitty 的长期 extension boundary。
+5. 对版本兼容特别有利
+
+比如：
+
+{
+  "protocol": 1,
+  "method": "panel.open",
+  "params": {
+    "type": "terminal"
+  }
+}
+
+以后：
+
+Bitty 1.0
+Bitty 1.5
+Bitty 2.0
+
+内部 Rust 数据结构可以完全重构。
+
+但 IPC：
+
+panel.open
+workspace.list
+command.execute
+event.subscribe
+
+保持兼容即可。
+
+这实际上形成：
+
+    stable external API
+
+比如：
+
+Internal Rust API
+    ↓ 经常变化
+
+IPC Protocol
+    ↓ 稳定
+
+Plugins / Scripts / Agents
+
+对于你以后想做长期插件生态尤其重要。
+6. AI Agent 会特别适合 IPC
+
+这一点我觉得未来可能非常重要。
+
+Agent 不需要“模拟鼠标点击”。
+
+直接：
+
+Agent
+ │
+ ├─ workspace.list
+ ├─ panel.list
+ ├─ terminal.spawn
+ ├─ terminal.write
+ ├─ file.open
+ ├─ notification.send
+ └─ command.execute
+
+例如：
+
+AI Agent:
+
+1. 创建 workspace
+2. 打开 repository
+3. 创建 terminal
+4. 执行 cargo test
+5. 打开失败日志
+6. 打开 diff panel
+
+完全通过 IPC：
+
+LLM
+ ↓
+Agent Runtime
+ ↓
+Bitty IPC
+ ↓
+Workspace
+
+这比 GUI automation 稳定得多。
+
+甚至 Bitty 可以天然变成：
+
+    Agent-controllable workspace
+
+这和传统 terminal emulator 的定位就完全不同了。
+7. Panel 之间也可以跨进程通信
+
+例如：
+
+File Panel
+   │
+   │ file.open
+   ▼
+Event Bus
+   │
+   ├── Editor Panel
+   └── Preview Panel
+
+如果 Panel 是不同进程：
+
+process A
+   │
+ IPC
+   ▼
+Bitty Event Router
+   │
+ IPC
+   ▼
+process B
+
+比如：
+
+Git Panel
+  │
+  └─ git.diff.changed
+           │
+           ▼
+      AI Review Panel
+
+于是可以形成：
+
+Publisher
+   ↓
+Event Bus
+   ↓
+Subscribers
+
+8. CLI 工具可以主动“升级”为 GUI
+
+这是一个非常有意思的方向。
+
+比如：
+
+git diff
+
+正常是 stdout。
+
+但未来某些工具可以：
+
+发现 BITTY_SOCKET
+       ↓
+连接 Bitty IPC
+       ↓
+打开 Diff Panel
+
+例如环境变量：
+
+BITTY_SOCKET=/run/user/1000/bitty.sock
+BITTY_SESSION=abc123
+
+程序就知道：
+
+    我正在 Bitty 内运行。
+
+于是：
+
+git-tool --ui
+
+可以：
+
+CLI backend
+     ↓ IPC
+Bitty Panel
+
+这其实类似：
+
+$DISPLAY
+$WAYLAND_DISPLAY
+$DBUS_SESSION_BUS_ADDRESS
+
+Bitty 可以有：
+
+$BITTY_SOCKET
+
+这是很 Unix 的设计。
+9. 多窗口 / 多实例同步也非常自然
+
+例如：
+
+Bitty daemon
+     │
+     ├── Window A
+     ├── Window B
+     └── Window C
+
+状态：
+
+workspace
+sessions
+plugins
+commands
+notifications
+
+可以统一放在 daemon。
+
+于是：
+
+Window A ─┐
+Window B ─┼── IPC ── Bitty Daemon
+Window C ─┘
+
+甚至：
+
+bitty list
+
+可以列：
+
+Window 1
+  dev
+  ├ terminal
+  └ git
+
+Window 2
+  server
+  ├ ssh
+  └ logs
+
+这已经有点：
+
+tmux server
+
+的味道。
+10. session restore 会非常容易做
+
+因为 IPC architecture 往往意味着本身已经有统一状态模型：
+
+Bitty State
+├── windows
+├── workspaces
+├── panels
+├── layouts
+└── processes
+
+可以直接：
+
+serialize
+   ↓
+session.json / SQLite
+
+重新启动：
+
+restore
+
+例如：
+
+bitty session save work
+bitty session restore work
+
+甚至 crash recovery：
+
+Bitty crashes
+    ↓
+restart
+    ↓
+restore workspace
+
+11. Remote IPC 甚至可以自然扩展到远程机器
+
+本地：
+
+Unix Socket
+
+未来：
+
+SSH tunnel / TCP
+
+于是：
+
+Laptop Bitty
+     │
+     │ SSH
+     ▼
+Remote bitty-agent
+
+你甚至可以做到：
+
+Local UI
+Remote Process
+
+例如：
+
+┌──────── Local Bitty ────────┐
+│ File Panel                  │
+│ Git Panel                   │
+│ Remote Terminal             │
+└───────────┬─────────────────┘
+            │
+            SSH
+            │
+        Server
+
+这对 SSH / cloud / container / Kubernetes 使用场景特别强。
+12. Hyprland 本身其实就是很好的参照物
+
+你前面提到 Hyprland 很合适。
+
+Hyprland 有：
+
+hyprctl clients
+hyprctl dispatch workspace 2
+hyprctl keyword ...
+
+其思想其实就是：
+
+Hyprland compositor
+      ↑
+     IPC
+      ↑
+hyprctl / scripts
+
+所以用户可以：
+
+hyprctl dispatch exec kitty
+
+然后很多插件、状态栏、脚本都围绕 IPC 做。
+
+Bitty 完全可以有：
+
+bittyctl panel list
+bittyctl panel focus 3
+bittyctl workspace switch dev
+bittyctl command run git.status
+
+甚至实时 event：
+
+bittyctl events
+
+输出：
+
+panel.focused id=3
+terminal.cwd_changed cwd=/repo
+git.branch_changed branch=main
+workspace.changed name=dev
+
+这会非常强。
+13. 最值得借鉴的是「request + event」双模型
+
+我会非常建议 IPC 不只是 RPC：
+
+request
+  ↓
+response
+
+而应该同时有：
+
+RPC + Event Stream
+
+例如：
+RPC
+
+panel.create
+panel.close
+panel.focus
+
+workspace.create
+workspace.switch
+
+command.execute
+
+Event
+
+panel.created
+panel.closed
+panel.focused
+
+workspace.changed
+
+terminal.cwd_changed
+terminal.command_started
+terminal.command_finished
+
+于是整个模型：
+
+              Bitty IPC
+             /         \
+            /           \
+         Commands       Events
+            │             │
+            ▼             ▼
+        request()      subscribe()
+
+这是插件生态非常重要的基础。
+14. 再加 Capability System，会特别漂亮
+
+例如 Telegram plugin：
+
+permissions:
+  - network
+  - notifications
+
+Git：
+
+permissions:
+  - filesystem.read
+  - process.spawn
+
+AI：
+
+permissions:
+  - network
+  - terminal.read
+
+于是 IPC server 可以检查：
+
+Plugin
+  │
+  ├─ request: filesystem.read
+  │
+  ▼
+Capability Check
+  │
+  ├── allow
+  └── deny
+
+这比直接：
+
+dlopen third_party_plugin.so
+
+安全边界清晰得多。
+我认为 Bitty 最值得形成这样的架构
+
+                    ┌────────────────┐
+                    │   Bitty Core   │
+                    │                │
+                    │ Panel Manager  │
+                    │ Workspace      │
+                    │ Command        │
+                    │ Event Bus      │
+                    └───────┬────────┘
+                            │
+                       IPC Protocol
+                            │
+        ┌───────────┬───────┼────────┬──────────┐
+        ▼           ▼       ▼        ▼          ▼
+      CLI        Plugins   Agent    Scripts   External
+   bittyctl       Lua      LLM      Bash      Programs
+
+这样一来，IPC 就不仅是一个“进程通信功能”。
+
+它会同时成为：
+
+Automation API
+Plugin API
+Agent API
+CLI API
+Integration API
+Remote-control API
+
+一个协议，解决很多扩展问题。
+
+这可能是 Bitty 这种架构中 IPC 最大的天然优势。
+
+尤其如果你已经确定要做高度 programmable 的 Panel / Plugin 平台，我会认为 IPC protocol 的设计重要程度几乎可以和 Panel abstraction 并列。未来第三方生态真正依赖的，很可能不是 Bitty 内部 Rust API，而是这个长期稳定的外部协议。
+

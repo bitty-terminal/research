@@ -1,0 +1,1227 @@
+现在的 AI Coding TUI 都是可以把命令输出的东西给隐藏和展开，然后我就是想要在 bitty 做一个这种的插件来隐藏和展开呢？这样会节省更多空间？然后我想的是每一个展开和关闭不仅是鼠标点击操作，更多时候应该是用户两只手都是在键盘上面的，然后我想到在 neovim 中是有一个 https://github.com/folke/flash.nvim 这种的插件的，只要按住一个 Leader 键后，就会在各个位置显示对应的下标，那么我们只需要按照对应的顺序就可以跳转到那里，那么我觉得对于 Bitty 也是可以做成这样的，而且不止是跳转，就像这个输出隐藏和展开也是可以这么做的，因为一个页面可能有很多条命令，我只想要一个命令展开的这种。而且这种也可以跳到各个 panel 和 workspace，在以后如果扩展的更大的话，可以自定义 UI，那么这个应该也是很方便的插件。
+然后我还想着在终端我们直接回车那么就是输出了，那么如果用户只是误触导致的，然后有的用户如果想要输入比较长的命令，比如需要换行的命令，那么这种就比较麻烦了，我觉得都可以变成输入框，就像是跟 LLM 聊天那种，而且可以通过打开编辑器来进行更复杂的编辑，如打开 neovim 编辑后一个临时文件的这种，也就是用编辑器打开的方式来编辑复杂的命令？然后输入键用户可以把默认的 Enter 改成 Ctrl + Enter 之类的？
+
+你觉得怎么样了呢？
+
+我觉得这两个想法都很适合 Bitty，而且它们其实不是两个孤立功能，而是可以汇聚成一个更大的方向：
+
+> **把传统 Terminal 的“字符流”提升成可寻址、可操作、可折叠的 Semantic UI，同时保持底层 Terminal Truth 完全兼容。**
+
+这会很符合 Bitty 现在的发展方向。
+
+## 1. 命令输出折叠：Bitty 已经有最关键的基础
+
+这件事现在比想象中更容易成立，因为 Bitty 已经实现了 **OSC 133 Shell Integration**。
+
+当前代码已经能够把：
+
+```text
+PromptStart
+InputStart
+OutputStart
+OutputEnd
+```
+
+组织成 `CommandRegion`，甚至记录：
+
+```text
+exit_code
+cwd
+```
+
+也就是说，Bitty 已经能知道：
+
+```text
+┌ Command 1
+│ $ cargo test
+│ ...
+│ ...
+│ test result: ok
+└ exit 0
+
+┌ Command 2
+│ $ git status
+│ ...
+└ exit 0
+```
+
+而不是只能看到一堆不知道属于哪条命令的字符。
+
+所以你说的这种：
+
+```text
+$ cargo test
+▶ 386 lines hidden · exit 0
+
+$ git status
+▼
+On branch main
+nothing to commit
+```
+
+完全值得做。
+
+但这里有一个非常重要的架构原则：
+
+> **折叠绝对不要修改 Terminal State / Scrollback Truth。**
+
+应该是：
+
+```text
+PTY
+ ↓
+VT Parser
+ ↓
+Terminal State / Scrollback     ← 永远是真实完整内容
+ ↓
+Semantic Command Regions
+ ↓
+Presentation Projection
+ ↓
+Fold / Expand
+```
+
+也就是说只是：
+
+> **视觉投影隐藏**
+
+而不是：
+
+> 删除 terminal rows。
+
+这样：
+
+* 展开不会丢数据
+* copy all 可以取得完整输出
+* 搜索仍然可以搜索被折叠内容
+* Agent 读取 terminal history 不受影响
+* Debug/Replay 不受影响
+* terminal deterministic state 不受影响
+
+这和之前 VectoJS 那种“semantic projection”思维其实很接近。
+
+---
+
+# 2. 当前还缺一个关键东西：Stable Command Range
+
+目前 `CommandRegion` 主要记录的是 OSC 133 的 ordinal，例如：
+
+```rust
+CommandRegion {
+    prompt_start,
+    input_start,
+    output_start,
+    output_end,
+    exit_code,
+}
+```
+
+代码里也明确提到了当前还是按 ordinal group，未来才可能增加 row anchoring。
+
+所以要真正折叠，下一步最好不是直接写插件，而是先形成：
+
+```rust
+CommandId
+
+CommandBlock {
+    id: CommandId,
+    cwd,
+    command_range,
+    output_range,
+    exit_code,
+}
+```
+
+其中：
+
+```text
+output_range
+```
+
+最好不要简单保存：
+
+```text
+row 100 -> row 150
+```
+
+因为 resize/reflow 后 row number 会变化。
+
+应该保存类似：
+
+```text
+LogicalHistoryLineId
+```
+
+或者稳定 scrollback line identity：
+
+```text
+start_line_id
+end_line_id
+```
+
+这样：
+
+```text
+resize
+reflow
+scroll
+```
+
+之后 CommandBlock 仍然成立。
+
+---
+
+# 3. 这甚至可以成为 Bitty 的一个基础抽象：Command Block
+
+我觉得可以正式引入：
+
+```text
+CommandBlock
+```
+
+类似：
+
+```rust
+struct CommandBlock {
+    id: CommandId,
+
+    cwd: Option<String>,
+
+    input: SemanticRange,
+    output: SemanticRange,
+
+    exit_code: Option<i32>,
+
+    state: CommandState,
+}
+```
+
+状态：
+
+```text
+Running
+Completed
+Failed
+Interrupted
+```
+
+UI 可以显示：
+
+```text
+╭─ ~/bitty
+│ cargo test
+│
+│ ▶ 428 lines hidden
+│
+╰─ ✓ 0
+```
+
+甚至以后：
+
+```text
+CommandBlock
+├─ command
+├─ output
+├─ cwd
+├─ exit status
+├─ duration
+├─ annotations
+├─ AI summary
+└─ actions
+```
+
+这个时候 Bitty 就开始和传统 terminal 拉开区别了。
+
+---
+
+# 4. Flash.nvim 这个想法非常值得泛化，而不是只做 Jump
+
+`flash.nvim` 的核心实际上不只是“快速跳转”。
+
+它做的是：
+
+> **给当前 UI 中的可操作目标动态分配短 label。**
+
+官方设计本身就支持：
+
+* multi-window
+* jump labels
+* remote actions
+* different actions on selected target
+* overlay labels
+
+所以你的理解是对的：这个思想完全可以搬到 Bitty，而且应该比 Neovim 用得更广。
+
+我甚至不建议把它叫：
+
+```text
+Jump Mode
+```
+
+而更倾向于：
+
+```text
+Hint Mode
+```
+
+或者：
+
+```text
+Target Mode
+```
+
+因为：
+
+> Jump 只是 Action 之一。
+
+---
+
+# 5. Bitty Hint Mode 可以变成“键盘版鼠标”
+
+例如按：
+
+```text
+Leader + h
+```
+
+进入 Hint Mode：
+
+```text
+┌────────────────────────────┐
+│ [a] $ cargo test           │
+│     ▶ 428 lines hidden     │
+│                            │
+│ [s] $ git status           │
+│     On branch main         │
+│                            │
+│             [d] Git Panel  │
+│             [f] AI Panel   │
+└────────────────────────────┘
+```
+
+然后：
+
+```text
+a
+```
+
+选择对应对象。
+
+但这里最有意思的不是“选择”，而是：
+
+## Target 和 Action 分离
+
+可以定义：
+
+```text
+Target
++
+Action
+```
+
+例如 Target：
+
+```text
+CommandBlock
+Panel
+Workspace
+View
+Link
+SearchResult
+File
+RichBlock
+Button
+Tab
+```
+
+Action：
+
+```text
+Focus
+Jump
+Toggle
+Expand
+Collapse
+Open
+Close
+Copy
+Pin
+Inspect
+```
+
+于是形成：
+
+```text
+Action(Target)
+```
+
+---
+
+# 6. 可以做成类似 Vim 的 Operator + Motion
+
+这是我觉得最适合键盘用户的设计。
+
+例如：
+
+```text
+Leader + j
+```
+
+= Jump
+
+随后所有可 jump target 出现 label：
+
+```text
+a s d f
+```
+
+按：
+
+```text
+Leader j d
+```
+
+就是：
+
+> Jump → target d
+
+---
+
+类似：
+
+```text
+Leader + z
+```
+
+= Toggle Fold
+
+于是只给 CommandBlock 显示 label：
+
+```text
+[a] cargo test
+[s] npm build
+[d] pytest
+```
+
+然后：
+
+```text
+Leader z s
+```
+
+就是：
+
+> toggle command s
+
+---
+
+Panel：
+
+```text
+Leader p
+```
+
+可能得到：
+
+```text
+[a] terminal
+[s] git
+[d] files
+[f] AI
+```
+
+于是：
+
+```text
+Leader p f
+```
+
+直接切 AI Panel。
+
+---
+
+Workspace：
+
+```text
+Leader w
+```
+
+：
+
+```text
+[a] bitty
+[s] CapGlyph
+[d] VectoJS
+[f] misc
+```
+
+然后：
+
+```text
+Leader w d
+```
+
+直接跳到 VectoJS workspace。
+
+这个体验我觉得会非常漂亮。
+
+---
+
+# 7. 更进一步：Hint 本身应该是一个通用 Plugin API
+
+我建议不要把：
+
+```text
+Command Folding Hint
+Panel Hint
+Workspace Hint
+```
+
+分别实现三次。
+
+而是定义：
+
+```rust
+HintTarget {
+    id,
+    kind,
+    anchor,
+    scope,
+    actions,
+}
+```
+
+例如：
+
+```text
+CommandPlugin
+    ↓
+register_targets(CommandBlock)
+
+PanelRuntime
+    ↓
+register_targets(Panel)
+
+Workspace
+    ↓
+register_targets(Workspace)
+
+Rich
+    ↓
+register_targets(Link / Block)
+```
+
+然后统一：
+
+```text
+Hint Engine
+     │
+     ├── Target providers
+     ├── Label allocator
+     ├── Overlay renderer
+     └── Action dispatcher
+```
+
+以后任何插件都可以：
+
+```lua
+bitty.hints.register({
+    kind = "my-object",
+
+    targets = function()
+        ...
+    end,
+
+    actions = {
+        open = ...,
+        close = ...,
+    }
+})
+```
+
+这就很像 Emacs / Neovim 的可组合性了。
+
+---
+
+# 8. 而且 Bitty 当前 Focus API 已经非常适合这个
+
+现在 `bitty-ui` 已经有独立 Focus abstraction：
+
+```text
+Next
+Prev
+Up
+Down
+Left
+Right
+```
+
+并且 focus 是：
+
+```text
+ViewId
+```
+
+驱动的、deterministic 的。
+
+所以 Hint Mode 只需要最终得到：
+
+```text
+Target → ViewId / PanelId / CommandId
+```
+
+然后 dispatch action。
+
+不是从头实现 navigation system。
+
+---
+
+# 9. 不过当前 Overlay 有一个很实际的问题
+
+我看了现在的 `bitty-ui::panel`。
+
+目前 Overlay Manager 是：
+
+```text
+MAX_OVERLAYS_PER_WINDOW = 4
+```
+
+另外允许最多一个 modal，本质上是：
+
+> `4 + 1`
+
+的 bounded overlay system。
+
+这对：
+
+* Palette
+* Tooltip
+* Modal
+* Popup
+
+很好。
+
+但是 **Flash Hint 不能一个 label 一个 Overlay**。
+
+因为一屏可能：
+
+```text
+30
+50
+100
+```
+
+个 target。
+
+所以这里不要为了 Hint 把：
+
+```text
+MAX_OVERLAYS = 4
+```
+
+硬改成 256。
+
+我建议新增一个非常轻的：
+
+```text
+AnnotationLayer
+```
+
+或者：
+
+```text
+HintLayer
+```
+
+一次提交：
+
+```text
+HintBatch {
+    generation,
+    targets: Vec<HintLabel>,
+}
+```
+
+例如 bounded：
+
+```text
+max targets = 256
+max total text = 8 KiB
+```
+
+它在 compositor 中只算：
+
+> 一层 ephemeral presentation。
+
+而不是 256 个 Overlay。
+
+---
+
+# 10. Hint Mode 以后会非常适合 Bitty
+
+甚至不仅 terminal。
+
+设想以后：
+
+```text
+Terminal Panel
+File Panel
+Git Panel
+Mail Panel
+Browser Panel
+AI Panel
+```
+
+全部打开。
+
+鼠标当然可以点。
+
+但键盘用户可以：
+
+```text
+Leader + h
+```
+
+然后整个 UI：
+
+```text
+[a] terminal
+[s] git
+[d] browser
+[f] file
+[g] AI
+```
+
+这其实相当于：
+
+> **DOM accessibility keyboard navigation + Vim motion 的结合。**
+
+尤其 Bitty 本来就是 terminal-centric。
+
+这很可能成为一个非常有辨识度的功能。
+
+---
+
+# 11. 第二个想法：Command Input Box，我也非常赞成
+
+你说的痛点确实存在。
+
+传统 Terminal：
+
+```text
+键盘
+ ↓
+shell readline/zle
+ ↓
+Enter
+ ↓
+立即执行
+```
+
+于是：
+
+```bash
+find ... \
+  | grep ... \
+  | awk ... \
+  | sed ...
+```
+
+这种长命令编辑体验一直不算特别好。
+
+特别是：
+
+* multiline shell script
+* curl
+* ffmpeg
+* docker
+* kubectl
+* jq
+* SQL
+* 长 Agent command
+* heredoc
+
+---
+
+# 12. 可以做成 Command Composer
+
+我会把它叫：
+
+```text
+Command Composer
+```
+
+而不是单纯 Input Box。
+
+默认 Terminal 仍然是传统模式。
+
+但是：
+
+```text
+Leader + e
+```
+
+打开：
+
+```text
+┌ Command ───────────────────────────┐
+│ docker run --rm \                  │
+│   -v "$PWD:/work" \                │
+│   ubuntu:latest \                  │
+│   bash                             │
+│                                   │
+│ Ctrl+Enter Run   Alt+E Editor      │
+└────────────────────────────────────┘
+```
+
+这里就是一个真正的 multiline editor。
+
+---
+
+# 13. Enter / Ctrl+Enter 完全可以自定义
+
+在 Composer Mode 里面：
+
+```text
+Enter        → newline
+Ctrl+Enter   → execute
+Esc          → close composer
+Alt+E        → external editor
+```
+
+甚至用户可以：
+
+```lua
+composer = {
+    submit = "Ctrl+Enter",
+    newline = "Enter",
+    editor = "Alt+E",
+}
+```
+
+如果用户喜欢传统方式：
+
+```lua
+submit = "Enter"
+newline = "Shift+Enter"
+```
+
+也完全可以。
+
+---
+
+# 14. 但这里有一个极重要的边界：不能全局劫持 Enter
+
+这个是实现时最需要注意的。
+
+Terminal 中输入的不一定是 shell：
+
+```text
+bash
+zsh
+fish
+python
+node
+sqlite
+ssh
+vim
+nvim
+fzf
+htop
+less
+tmux
+```
+
+如果 Bitty 全局做：
+
+```text
+Enter → Composer newline
+```
+
+那么：
+
+```text
+vim
+ssh
+python REPL
+TUI
+```
+
+全部都会坏。
+
+所以必须是：
+
+```text
+Raw Terminal Input
+        │
+        ├── Normal Mode → PTY
+        │
+        └── Composer Mode → Composer
+```
+
+---
+
+# 15. 最漂亮的做法是结合 OSC 133
+
+Bitty 已经知道：
+
+```text
+InputStart
+OutputStart
+```
+
+因此可以判断：
+
+> 当前是不是 Shell Prompt 的 input phase。
+
+于是未来可以支持：
+
+```text
+if shell_semantic_state == Input:
+    Composer available
+else:
+    raw PTY input
+```
+
+甚至用户可以开启：
+
+```lua
+composer = {
+    auto = true
+}
+```
+
+意思是：
+
+> 只要检测到 shell prompt，就自动进入 Command Composer。
+
+一旦：
+
+```text
+OutputStart
+```
+
+就自动退出。
+
+如果 Shell 不支持 OSC 133：
+
+> fail open，恢复普通 Terminal 行为。
+
+这样兼容性很好。
+
+---
+
+# 16. External Editor 我非常赞成
+
+这个体验甚至应该是一等公民。
+
+例如：
+
+```text
+Alt+E
+```
+
+Bitty：
+
+```text
+1. 创建 secure temporary file
+2. 写入当前 Composer 内容
+3. 启动 $VISUAL / $EDITOR
+4. 等 editor 退出
+5. 读回内容
+6. 删除临时文件
+7. 回到 Composer
+```
+
+比如：
+
+```text
+$EDITOR=nvim
+```
+
+就变成：
+
+```text
+Command Composer
+       │
+       ▼
+temporary file
+       │
+       ▼
+      nvim
+       │
+       ▼
+save + :q
+       │
+       ▼
+Command Composer
+```
+
+这个对写：
+
+```bash
+for x in ...; do
+   ...
+done
+```
+
+尤其好。
+
+---
+
+# 17. 甚至 Bitty 可以做得比传统 `$EDITOR` 更自然
+
+因为 Bitty 已经有 Panel / View。
+
+不一定需要覆盖当前 terminal。
+
+以后可以：
+
+```text
+┌──────── Shell ─────────┬── Command Editor ──┐
+│                        │                    │
+│ $                      │ nvim / editor      │
+│                        │                    │
+│                        │                    │
+└────────────────────────┴────────────────────┘
+```
+
+甚至临时：
+
+```text
+floating editor panel
+```
+
+退出后自动消失。
+
+这个非常符合 Bitty 的 Panel 架构。
+
+当前 Panel 本身已经是 compositor-managed、可 focus 的 `ViewContent::Panel(PanelId)`，生命周期里也明确包含 Mounted / Focused / Suspended 等状态。
+
+---
+
+# 18. Submit 时不要直接“模拟逐键输入”
+
+最好不是：
+
+```text
+按字符 a
+按字符 b
+按字符 c
+...
+```
+
+而是 Composer 最后得到一个：
+
+```text
+CommandBuffer
+```
+
+然后：
+
+```text
+CommandBuffer
+      ↓
+Bracketed Paste
+      ↓
+Shell line editor
+      ↓
+final Enter
+```
+
+这样：
+
+* Unicode
+* multiline
+* 大段命令
+* paste safety
+
+都更可靠。
+
+以后甚至可以通过更深的 shell integration：
+
+```text
+bash readline integration
+zsh ZLE integration
+fish integration
+```
+
+直接把 buffer 插到 shell editor。
+
+---
+
+# 19. 最终这几个功能其实可以统一成“Semantic Terminal”
+
+如果把你的两个想法放在一起，就会变得非常有意思：
+
+```text
+                Bitty
+                  │
+       ┌──────────┴──────────┐
+       │                     │
+    Input Semantics      Output Semantics
+       │                     │
+ Command Composer        Command Blocks
+       │                     │
+ multiline               fold / expand
+ editor                   status
+ submit                   metadata
+       │                     │
+       └──────────┬──────────┘
+                  │
+             Hint Mode
+                  │
+        keyboard addressability
+```
+
+于是一次 session：
+
+```text
+[a] $ cargo test
+    ▶ 428 lines hidden · ✓
+
+[s] $ cargo clippy
+    ▼
+    Checking ...
+    Finished ...
+
+[d] $ git status
+    ▶ 6 lines hidden · ✓
+```
+
+你按：
+
+```text
+Leader z s
+```
+
+折叠第二条。
+
+按：
+
+```text
+Leader j a
+```
+
+跳到第一条。
+
+按：
+
+```text
+Leader y d
+```
+
+复制第三条输出。
+
+按：
+
+```text
+Leader e
+```
+
+打开 Command Composer。
+
+然后：
+
+```text
+Alt+E
+```
+
+进入 Neovim 编辑长命令。
+
+这整个 UX 是非常统一的。
+
+---
+
+# 20. 我建议拆成三个 first-party plugin / capability
+
+不要做成一个巨型插件。
+
+### `bitty-terminal.shell-blocks`
+
+负责：
+
+```text
+OSC133
+CommandBlock
+fold / expand
+exit status
+cwd
+command navigation
+```
+
+### `bitty-terminal.hints`
+
+负责：
+
+```text
+HintTarget
+label allocation
+keyboard selection
+remote actions
+Panel / Workspace / CommandBlock targeting
+```
+
+### `bitty-terminal.composer`
+
+负责：
+
+```text
+multiline command buffer
+custom submit key
+history
+external editor
+bracketed paste submission
+```
+
+它们组合：
+
+```text
+shell-blocks ─────┐
+panels ───────────┤
+workspace ────────┼── hints
+rich ─────────────┤
+browser ──────────┘
+
+shell integration
+       │
+       ▼
+    composer
+```
+
+---
+
+## 我认为这会成为 Bitty 很有特色的一条产品线
+
+现在很多 Terminal Emulator 比较的是：
+
+```text
+GPU 多快
+启动多快
+字体怎么样
+Kitty protocol 支不支持
+```
+
+这些 Bitty 必须做好，但很难单独形成长期差异。
+
+而你现在这组思路：
+
+> **Command 是对象，而不是一段字符。**
+>
+> **Panel 是对象。**
+>
+> **Workspace 是对象。**
+>
+> **任何可操作对象都可以通过键盘 Hint 精确寻址。**
+>
+> **Command 输入也不必受制于传统单行 shell input。**
+
+就开始形成真正属于 Bitty 的交互模型了。
+
+而且它和现有架构非常吻合，不是强行往 terminal 上堆 UI：Bitty 已经有 OSC 133 `CommandRegion`、独立 Focus、Panel Runtime、Command Registry 和 compositor-owned Overlay。现在应该做的是**补 `SemanticRange/CommandBlock`、批量 Hint Annotation Layer 和 prompt-aware Composer**，而不是重新发明这些底层系统。
+
+我会把这几个方向的优先级排成：
+
+**CommandBlock semantic anchoring → folding MVP → Hint Mode → Composer → external editor → 跨 Panel/Workspace 的通用 Hint API。**
+
+这条路线很值得正式写进 `bitty-docs` 的交互设计/RFC。

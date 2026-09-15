@@ -1,0 +1,39 @@
+# Bitty whole-repository code review (2026-09-15)
+
+11 subagents in parallel, read-only review (no source modified). Each report contains: defect list
+(severity P0/P1/P2, locations as repository-relative paths + symbol names, symptom / trigger / evidence),
+a resolution proposal per defect (plan / expected benefit / effort S/M/L), and test gaps.
+`SEC` marks security-related items. All paths in the reports are repository-relative.
+
+`bitty-website` is out of scope for this round as required. `bitty-ai` was fully covered independently by 1 reviewer.
+
+## File index
+
+| File                                | Coverage                                                                                                                       | Key findings                                                                                                                                                                                                                                                                           |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `01-vt-termstate-render.md`         | `bitty`: bitty-vt, bitty-term-state, bitty-render (terminal core pipeline)                                                     | P0×2: `damage_since` over-window missing full fallback causes under-paint; atlas wholesale intra-frame eviction causes silent glyph loss. P1×15 (incl. erase typo, Kitty 320MB decode spike, hot-path `eprintln`). P2×12                                                               |
+| `02-pty-platform-config.md`         | `bitty`: bitty-pty, bitty-platform, bitty-config (platform layer)                                                              | No P0. P1×13: pty destructor unbounded block, reader EOF/error folding, writer docs-vs-implementation mismatch, clipboard silent truncation, trust paths unnormalized. P2×14                                                                                                           |
+| `03-runtime.md`                     | `bitty`: bitty-runtime (116 files, sampled: core paths + recently modified + complexity-ranked)                                | No P0. P1×9: `Runtime` missing `Drop` leaks forwarder, `tick_at` ~1245-line god function, input/reply write failures silently swallowed. P2×5                                                                                                                                          |
+| `04-app-ui-core.md`                 | `bitty`: bitty-app, bitty-ui, bitty-core (application shell)                                                                   | No P0. P1×3: boot-chain assembly duplication, CLI error-policy split (fail-closed vs warning coexisting), single-slot `zoom_backup` vs `ctl` race drops pane; plus `bitty-core` is an empty shell with app wired straight to 8 internal crates                                         |
+| `05-ipc-agent-perf-test.md`         | `bitty`: bitty-ipc, bitty-agent, bitty-perf, bitty-test-support, bitty-compat-lab (support layer)                              | No directly remotely exploitable P0. P1×10 (incl. SEC: fd-passing impersonation, `BITTY_SOCKET` phishing, child-token log leak, `is_untrusted_content` always false). P2×12                                                                                                            |
+| `06-lua-pluginhost-package-rich.md` | `bitty`: bitty-lua, bitty-plugin-host, bitty-package, bitty-rich (extension layer)                                             | P0×1 (SEC): `bitty-package` V-C signature is a SHA-256 stub, forgeable with a public `key_id`. P1: Lua `execute` without chunk limit, bridge-timeout already-committed side effects, host allowing `/etc/**`, intercept-timeout fail-open, etc. 20 proposals                           |
+| `07-bitty-ai.md`                    | `bitty-ai` whole repository: bitty-ai-runtime, bitty-ai-slice (single reviewer full read + `cargo test` all-green cross-check) | P0×2 (one SEC: mid-round `rotate_generation` downgrade bypassed by snapshotted `AuthBase`; one: externalization failure swallows error into empty). P1×6, P2×9. Plus a dedicated section: 8 integration risks with the `bitty` main repository                                         |
+| `08-bitty-devtools.md`              | `bitty-devtools`: `src/*.ts`, devtools-client, tests                                                                           | P1×8 (incl. SEC×4: child-token plaintext echo, redaction dead code and under-coverage). P2×10. 10 improvements, 10 test-gap classes                                                                                                                                                    |
+| `09-sdk-template.md`                | `bitty-plugin-sdk`, `bitty-plugin-template`                                                                                    | P0×1: template `init.lua` uses `name`/`description`, fully mismatched with `BittyCommandDef` `id`/`title`; generated output cannot run. P1 (SEC×4: no path-traversal validation, settings without namespace isolation, etc.). P2×11                                                    |
+| `10-plugins.md`                     | `bitty-plugins` (registry/store)＋ standalone plugins activity, palette, statusline, file-manager, git-panel                   | P0×6 (incl. SEC×4): registry without signatures/hashes lets index poisoning reach install commands; `git-panel` allowlist lets write-out flags through. P1×19, P2×6. Negative-case directory empirically all intercepted but with no automated gate                                    |
+| `11-docs.md`                        | `bitty-docs`, `bitty-terminal-docs`, `bitty-ai-docs`, `bitty-plugins-docs` (documentation quality)                             | P0×3: aggregator submodules locally empty, Draft counts contradictory in three places, review checklist frozen at 16 crates/32 OQs (actual 19/40). P1×8 (cross-repository `blob/main` links vs pinned-revision contract, etc.). P2×5. See file tail for the missing-documentation list |
+
+## Cross-report top risks
+
+1. **Supply-chain signatures missing**: `bitty-package` signature stub (06, P0/SEC) ＋ registry without signatures/hashes (10, P0/SEC) — the plugin-distribution trust chain is missing end to end; recommend a merged cross-repository task with top priority.
+2. **Rendering correctness**: damage-tracking over-window under-paint, atlas eviction glyph loss (01, P0×2) — triggered by slightly large output, user-visible.
+3. **AI runtime auth-downgrade bypass** (07, P0/SEC) — mid-round rotation downgrade bypassed by snapshot.
+4. **SDK template generates unrunnable output** (09, P0) — new plugin authors fail on the very first step.
+5. **Documentation baseline distortion**: empty submodules, contradictory counts, stale checklist (11, P0×3) — undermines the credibility of all cross-repository decisions.
+6. **IPC local-trust assumptions**: fd impersonation, `BITTY_SOCKET` phishing (05, P1/SEC) — multi-user-machine risk.
+
+## Follow-ups
+
+- Convert P0/SEC items into formal Issues + CarryCtx tasks (by repository ownership: `bitty`, `bitty-ai`, `bitty-plugins`, `bitty-plugin-sdk`, `bitty-docs`); the two signature-chain items should merge into one cross-repository task.
+- Each report's "test gaps" section converts directly into test-backfill tasks.
+- This round was static read-only review, with no `just check` / `cargo test` runs (except 07); fix tasks should use those quality gates as acceptance criteria.

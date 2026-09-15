@@ -1,0 +1,1368 @@
+bitty-ai 是哪些工具是 Core 上游实现，哪些是 Lua 插件来实现呢？你可以看看现在的各个 AI Harness 的各个工具，现在有很多工具了，一般是通过输入 "/" 符号来调用，比如这些 /goal, /skills, /mcp, /plugins, /compact, /loop, /review, /plan, /task, /settings, /context, /statusline 等等。
+然后就是针对这个上下文压缩的，我想起了 OpenCode 的 @tarquinen/opencode-dcp 这个插件，好像是压缩一部分，而不是像 /compact 这种一次性把所有上下文给压缩了，而且 oh-my-pi 等等还有特殊的压缩，比如用 remote 的压缩等等情况。
+这些很多东西应该如何设计呢？
+## 我建议先把一个概念彻底拆开：`/command` ≠ Tool
+
+现在几个成熟 Harness 已经越来越明显地分成三层：
+
+**Command 是 Control Plane**，例如 `/compact`、`/model`、`/context`、`/review`；
+**Tool 是 Agent Data Plane**，例如 `read`、`edit`、`bash`、`lsp`、`task`；
+**Skill / Workflow 是可组合行为**，例如 review、plan、release、debug。
+
+Claude Code 现在甚至在文档里明确区分：`/clear`、`/model`、`/compact` 这类 built-in command 控制 session，而复杂的 multi-step command 推荐做成 Skill；Skill 本身又可以显示成 `/name`。([Claude][1]) OpenCode 也类似：`/compact` 等是内置行为，而自定义 `/review` 一类其实可以只是 prompt/workflow template，甚至指定 `subagent: true`。([OpenCode][2])
+
+所以 Bitty 最好不要设计成：
+
+```text
+/compact -> Rust
+/review  -> Rust
+/plan    -> Rust
+/loop    -> Rust
+...
+```
+
+而应该是：
+
+```text
+                    Slash Command Registry
+                            │
+             ┌──────────────┴──────────────┐
+             │                             │
+      Runtime Operations              Lua Workflows
+        /compact                        /review
+        /model                          /plan
+        /clear                          /loop
+        /fork                           /goal
+             │                             │
+             └──────────────┬──────────────┘
+                            ▼
+                     bitty-ai-core
+                            │
+        Session / Context / Tools / Agent / MCP
+                            │
+                            ▼
+                       Bitty Core
+                   Panel / PTY / FS / UI
+```
+
+这会是最适合 Bitty 的边界。
+
+---
+
+# 1. 我会把 Bitty AI 分成三个层级
+
+这里的 **Core 上游**我建议再区分成两个 Core。
+
+| 层               | 职责                                                               | 实现   |
+| --------------- | ---------------------------------------------------------------- | ---- |
+| `bitty-core`    | Panel、PTY、process、workspace、render、plugin host、日志                | Rust |
+| `bitty-ai-core` | Agent loop、Session、Context、Tool runtime、Provider、MCP、权限、Subagent | Rust |
+| `bitty-ai`      | `/review`、`/plan`、`/loop`、UI、默认 workflow                         | Lua  |
+
+这样 **Bitty 本体仍然不是一个 AI Terminal**。
+
+它只是提供 AI 所需的 primitives。
+
+而 `bitty-ai-core` 是一个 **Agent Kernel**。
+
+Lua 才决定：
+
+> “这些 primitives 应该怎么组合成用户体验。”
+
+这和 Neovim 非常像：
+
+```text
+Neovim Core
+  buffer
+  window
+  extmark
+  LSP client
+  Tree-sitter
+  RPC
+       ↓
+Lua plugins
+  telescope
+  lazy.nvim
+  flash.nvim
+  dap-ui
+  ...
+```
+
+Bitty 可以变成：
+
+```text
+bitty-ai-core
+  Agent
+  Context
+  Session
+  Tool
+  MCP
+  LSP
+  AST
+  Task
+       ↓
+Lua
+  review
+  plan
+  loop
+  DCP
+  memory
+  statusline
+  agent-dashboard
+```
+
+---
+
+# 2. 你列出来的 `/xxx`，我会这样划分
+
+这里最重要的不是“命令本身用什么语言写”，而是 **命令依赖的 primitive 在哪里**。
+
+| Command             | 推荐归属                             | Core primitive         |
+| ------------------- | -------------------------------- | ---------------------- |
+| `/compact`          | Hybrid：Lua command + Rust engine | `Context.compact()`    |
+| `/context`          | Lua UI                           | `Context.inspect()`    |
+| `/goal`             | Lua                              | pinned/session state   |
+| `/skills`           | Lua UI                           | `SkillRegistry`        |
+| `/mcp`              | Lua UI                           | `McpManager`           |
+| `/plugins`          | Lua UI                           | Bitty Plugin Registry  |
+| `/review`           | Lua Skill / Workflow             | agent + diff + tools   |
+| `/plan`             | Lua Skill / Workflow             | subagent / mode        |
+| `/task`             | Lua UI / Workflow                | Task graph + subagent  |
+| `/loop`             | Lua orchestrator                 | scheduler/events       |
+| `/settings`         | Lua UI                           | config API             |
+| `/statusline`       | Lua UI                           | observability API      |
+| `/model`            | Hybrid                           | Provider/Model runtime |
+| `/permissions`      | Hybrid                           | Permission Engine      |
+| `/clear`            | thin built-in                    | Session                |
+| `/new`              | thin built-in                    | Session                |
+| `/fork`             | thin built-in                    | Session DAG            |
+| `/resume`           | thin built-in                    | Session store          |
+| `/undo` / `/rewind` | thin built-in                    | checkpoint/session     |
+| `/help`             | Lua                              | CommandRegistry        |
+
+也就是说：
+
+> `/compact` 不是一个 Lua 算法。
+> 它是 Lua 调用一个 Rust Context primitive。
+
+但：
+
+> `/review` 完全不需要 Core 知道“Code Review”是什么。
+
+它可以只是：
+
+```lua
+ai.command.register("review", function(ctx, args)
+    return ai.agent.spawn({
+        skill = "code-review",
+        context = {
+            git.diff(),
+            ctx.workspace,
+        }
+    })
+end)
+```
+
+这样以后社区完全可以做：
+
+```text
+/review/security
+/review/performance
+/review/api
+/review/rust
+```
+
+而无需碰 Rust。
+
+这也是为什么我认为你之前设计的 `bitty-plugins` 会非常重要。
+
+---
+
+# 3. `/plan`、`/review`、`/goal` 不应该进入 Core
+
+这一点很容易设计过度。
+
+例如 Codex 现在已经有 `/review`、`/skills`、`/mcp`、`/compact`、`/statusline` 等大量 slash surface。([GitHub][3]) 但这些命令虽然都长得像 `/xxx`，语义完全不一样。
+
+例如：
+
+```text
+/compact
+```
+
+改变的是：
+
+```text
+Session → Context representation
+```
+
+而：
+
+```text
+/review
+```
+
+实际上是：
+
+```text
+collect diff
+    ↓
+load review instructions
+    ↓
+run agent
+    ↓
+possibly spawn subagents
+    ↓
+render result
+```
+
+因此 Core 应该只提供：
+
+```text
+session
+context
+task
+agent
+tool
+diff
+git?
+skill
+artifact
+```
+
+至于：
+
+```text
+review()
+```
+
+根本没必要存在。
+
+`/plan` 也是一样。
+
+Core 最多应该有：
+
+```rust
+AgentMode
+PermissionMode
+ToolPolicy
+SubagentPolicy
+```
+
+但不应该有：
+
+```rust
+PlanModeManager
+CodeReviewManager
+LoopModeManager
+```
+
+否则几年之后 `bitty-ai-core` 会变成一个巨大 Harness。
+
+---
+
+# 4. Model 真正调用的 Tool，我反而建议更多进入 Core
+
+这和 Slash Command 恰好相反。
+
+oh-my-pi 现在已经把非常多 coding primitives 做成真正的 built-in tools，包括 `read / write / edit / ast_grep / ast_edit / grep / glob / bash / lsp / debug / task / todo / browser / web_search` 等。([GitHub][4])
+
+Bitty 不必照搬这么多，但第一版我会形成这样的边界：
+
+| Tool                   | 建议                 |
+| ---------------------- | ------------------ |
+| `read`                 | Core               |
+| `write`                | Core               |
+| `edit`                 | Core               |
+| `grep`                 | Core               |
+| `glob`                 | Core               |
+| `symbols` / AST read   | **Core**           |
+| `ast_query`            | Core               |
+| `exec`                 | **Core**           |
+| `lsp`                  | **Core**           |
+| `task` / `spawn_agent` | Core               |
+| `ask_user`             | Core               |
+| `skill`                | Core               |
+| MCP tool bridge        | Core               |
+| Git high-level tool    | official plugin    |
+| GitHub                 | MCP/plugin         |
+| Browser                | optional plugin    |
+| Web Search             | optional plugin    |
+| Computer Use           | optional plugin    |
+| Jira/Slack/Notion      | MCP                |
+| Memory backend         | plugin/backend     |
+| Review                 | 不是 Tool，是 Workflow |
+| Plan                   | 不是 Tool，是 Workflow |
+
+尤其是你一直在讨论的：
+
+```text
+Tree-sitter
+AST
+LSP
+代码结构化阅读
+```
+
+我反而认为必须成为 **bitty-ai-core 的一等能力**。
+
+因为它不是“某个工作流”。
+
+它决定的是：
+
+> Agent 获取代码信息的基本方式。
+
+---
+
+# 5. `exec` 在 Bitty 里应该比别的 Harness 更特殊
+
+这个地方 Bitty 可以形成自己的优势。
+
+普通 Harness：
+
+```text
+bash tool
+   ↓
+spawn process
+   ↓
+stdout
+   ↓
+tool result
+```
+
+Bitty 完全可以是：
+
+```text
+agent.exec()
+    ↓
+Headless Panel
+    ↓
+PTY / process
+    ↓
+Panel Log Store
+    ↓
+structured result
+```
+
+所以 Agent 执行：
+
+```bash
+cargo test
+```
+
+实际上不是“调用 bash”。
+
+而是：
+
+```text
+Agent
+  │
+  ├── owns/borrows Headless Panel #17
+  │
+  └── execute cargo test
+            │
+            ▼
+       Panel Timeline
+            │
+       ┌────┴─────┐
+       │          │
+     Raw Log    AI View
+       │          │
+       │       3 tests failed
+       │       117 passed
+       │
+       └── user can inspect later
+```
+
+这样就和你刚才讨论的 **Panel 生命周期 ≠ Agent 生命周期** 完全接上了。
+
+Agent 可以：
+
+```text
+Panel A
+  cargo test
+
+Panel B
+  cargo build
+
+Panel C
+  dev server
+```
+
+而 Context 里根本不需要塞：
+
+```text
+12000 行 cargo build 输出
+```
+
+只放：
+
+```text
+panel://17/execution/42
+
+cargo test failed:
+- 3 failed
+- 117 passed
+- failure locations: ...
+```
+
+需要时：
+
+```text
+read panel://17/execution/42?tail=100
+```
+
+这比传统 Harness 的 `bash` Tool 强很多。
+
+---
+
+# 6. Context Compression 不应该只有 `/compact`
+
+这个我认为是 bitty-ai 最值得认真设计的部分。
+
+现在几个 Harness 已经证明：
+
+```text
+context management
+```
+
+本身其实是一整个 subsystem。
+
+Claude Code 的 `/compact` 是比较传统的：
+
+```text
+先清理旧 tool output
+→ 再 summary conversation
+```
+
+并且 `/context` 能看到当前 Context 消耗。([Claude][1])
+
+而 DCP 已经进一步变成：
+
+```text
+完整历史不动
+       │
+       ▼
+生成给本次 LLM 的 Context View
+       │
+       ├─ remove duplicate tools
+       ├─ remove old errors
+       ├─ compress range
+       ├─ compress message
+       └─ preserve protected content
+```
+
+它明确说明 **不会修改原 Session history**，只是在发送给 LLM 前替换内容；而且 compression 可以只压缩某一个 range，甚至单独某些 message。([GitHub][5])
+
+这个思想非常适合 Bitty。
+
+---
+
+# 7. 我建议 Bitty 直接引入 `Context View`
+
+核心数据模型不要是：
+
+```text
+Session == Prompt
+```
+
+而应该是：
+
+```text
+Session Journal
+     │
+     │ immutable / lossless
+     ▼
+Context Builder
+     │
+     ├── rules
+     ├── skills
+     ├── memory
+     ├── tool state
+     ├── panel state
+     ├── task state
+     └── history
+     │
+     ▼
+Context Transform Pipeline
+     │
+     ├── deduplicate
+     ├── supersede
+     ├── externalize
+     ├── summarize
+     ├── compress-range
+     ├── prune
+     └── compact
+     │
+     ▼
+Context View
+     │
+     ▼
+Provider
+```
+
+这会形成一个非常重要的 invariant：
+
+> **Session 是事实，Context 只是 Session 的一个投影。**
+
+所以：
+
+```text
+原始 command log
+原始 conversation
+原始 tool call
+原始 file read
+```
+
+全部可以保留。
+
+但不代表下一次 LLM Request 都要重新看到它们。
+
+---
+
+# 8. 然后 Context 压缩应该至少分 5 个层级
+
+我会设计成一个渐进式 pipeline：
+
+```text
+Level 0   Structured Output
+          ↓
+Level 1   Lossless Pruning
+          ↓
+Level 2   Selective Compression
+          ↓
+Level 3   Global Compaction
+          ↓
+Level 4   Provider-native / Remote Compaction
+```
+
+### Level 0：一开始就不要产生垃圾 Context
+
+这其实比 `/compact` 更重要。
+
+比如：
+
+```text
+cargo test
+```
+
+不要产生：
+
+```text
+20k tokens raw log
+```
+
+而是：
+
+```text
+ToolResult {
+    status = failed
+    passed = 117
+    failed = 3
+    failures = [...]
+    artifact = "panel://17/run/42"
+}
+```
+
+文件读取也是一样。
+
+Agent 问：
+
+```text
+了解 src/context.rs
+```
+
+默认返回：
+
+```text
+ContextManager
+├── new()
+├── build()
+├── compact()
+├── prune()
+└── estimate_tokens()
+```
+
+而不是 1800 行代码。
+
+这是你之前 `ctxctl` 那套 AST 阅读思想在 bitty-ai 里真正应该落地的位置。
+
+---
+
+### Level 1：Lossless / Mechanical Pruning
+
+这里完全不需要 LLM。
+
+例如：
+
+```text
+read foo.rs v1
+read foo.rs v2
+```
+
+只保留最近一次。
+
+再例如：
+
+```text
+cargo test error input
+```
+
+四五轮之后，只留：
+
+```text
+exit 101
+3 failures
+artifact://...
+```
+
+DCP 已经在做 duplicate tool call 与 old error pruning。([GitHub][5])
+
+oh-my-pi 的 `shake` 更进一步，会把大型 tool result / fenced block 外部化成可恢复的 `artifact://` reference。([GitHub][6])
+
+这一点跟 Bitty 简直天然匹配。
+
+Bitty 可以直接拥有：
+
+```text
+panel://
+file://
+artifact://
+task://
+agent://
+git://
+```
+
+Context 里只是引用。
+
+---
+
+### Level 2：Selective Compression
+
+这就是类似 DCP。
+
+比如：
+
+```text
+Turn 1-30
+  实现 parser
+  调试 parser
+  parser 完成
+```
+
+当前已经开始做 Renderer。
+
+那么可以把：
+
+```text
+Turn 1-30
+```
+
+压成：
+
+```text
+Completed: parser implementation
+
+Key decisions:
+- recursive descent parser
+- Span uses byte offsets
+- error recovery uses synchronization tokens
+
+Files:
+- src/parser.rs
+- src/span.rs
+
+Tests:
+- 47 parser tests passing
+```
+
+而：
+
+```text
+Turn 31-45 Renderer
+```
+
+保持原样。
+
+所以不是：
+
+```text
+/compact everything
+```
+
+而是：
+
+```text
+compress(range=1..30)
+```
+
+甚至：
+
+```text
+compress(task="parser")
+```
+
+我会直接让 Context Engine 支持：
+
+```rust
+compress_range(...)
+compress_task(...)
+compress_branch(...)
+compress_tool_results(...)
+```
+
+然后 Lua 插件可以实现 DCP-like 策略。
+
+---
+
+# 9. `/compact` 应该是最后一道“大手术”
+
+真正 `/compact` 时，可以形成一个：
+
+```text
+CompactionEntry
+```
+
+而不是删除 Session。
+
+oh-my-pi 现在就是把 `CompactionEntry` 和 `BranchSummaryEntry` 做成 first-class session entry，并保存 `firstKeptEntryId` 等边界信息。([GitHub][6])
+
+Bitty 可以类似：
+
+```rust
+CompactionEntry {
+    id,
+    range,
+    summary,
+    tokens_before,
+    tokens_after,
+    backend,
+    preserved_artifacts,
+}
+```
+
+于是：
+
+```text
+Session Journal
+
+0 User
+1 Assistant
+2 Tool
+3 Tool
+4 User
+5 Assistant
+6 Tool
+7 COMPACTION
+8 User
+9 Assistant
+```
+
+实际发送：
+
+```text
+System
+CompactionSummary
+Entry 4+
+```
+
+但 entry `0..3` 仍然在数据库里。
+
+所以 `/compact` 是：
+
+> 改变 active Context 的 boundary，
+
+不是：
+
+> 删除历史记录。
+
+---
+
+# 10. Remote Compaction 也应该成为 Core Backend，而不是特殊命令
+
+你提到 oh-my-pi 的 remote compaction，这个方向是对的。
+
+现在 OMP 的 compaction 已经不是只有一种算法，而是类似：
+
+```text
+remote
+snapcompact
+handoff
+shake
+soft
+```
+
+按 capability / failure fallback。([GitHub][6])
+
+而且现在 OpenAI 本身也提供 `/responses/compact` 这种 provider-native compaction API。([OpenAI Developers][7])
+
+因此 Bitty 不应该：
+
+```text
+if OpenAI ...
+if Anthropic ...
+```
+
+散落在 `/compact` 里面。
+
+应该做：
+
+```rust
+trait CompactionBackend {
+    fn supports(&self, provider: &Provider) -> bool;
+
+    async fn compact(
+        &self,
+        input: CompactInput
+    ) -> Result<CompactOutput>;
+}
+```
+
+然后：
+
+```text
+ContextPolicy
+
+method_order = [
+    "provider-native",
+    "fast-model",
+    "local-model",
+    "semantic",
+]
+```
+
+比如：
+
+```text
+Claude
+  ↓
+Anthropic native compaction
+
+OpenAI
+  ↓
+Responses compact
+
+OpenRouter model
+  ↓
+cheap remote summarizer
+
+Local model
+  ↓
+Ollama summarizer
+```
+
+而用户输入：
+
+```text
+/compact
+```
+
+根本不用知道背后是哪一种。
+
+---
+
+# 11. 甚至 `/compact` 和 DCP 应该可以共存
+
+我会做成：
+
+```text
+Context Engine
+│
+├── Continuous Maintenance
+│   ├── dedupe
+│   ├── stale output pruning
+│   ├── artifact externalization
+│   └── selective compression
+│
+└── Emergency / Boundary Compaction
+    ├── manual /compact
+    ├── threshold
+    ├── overflow
+    └── provider compaction
+```
+
+也就是平时不断：
+
+```text
+180k
+ ↓
+160k
+ ↓
+155k
+ ↓
+148k
+```
+
+慢慢清理。
+
+而不是：
+
+```text
+180k
+190k
+198k
+  ↓
+/compact
+  ↓
+30k
+```
+
+这种锯齿形 Context 管理。
+
+这样模型连续性会好很多。
+
+---
+
+# 12. 我甚至建议 Context Item 自带“保留策略”
+
+例如内部可以有：
+
+```text
+ContextItem
+├── id
+├── type
+├── tokens
+├── source
+├── artifact
+├── importance
+├── lifetime
+└── retention
+```
+
+其中：
+
+```text
+retention:
+  pinned
+  recent
+  normal
+  ephemeral
+```
+
+于是：
+
+```text
+User requirement         pinned
+Current goal             pinned
+Plan                     pinned
+Current task             pinned
+
+recent file reads        recent
+recent command output    recent
+
+old successful test      normal
+
+old duplicated grep      ephemeral
+old failed command input ephemeral
+```
+
+Lua 插件甚至可以：
+
+```lua
+context.pin("architecture-decision")
+context.protect(tool_result)
+context.compress(task)
+```
+
+这比硬编码 token threshold 灵活得多。
+
+---
+
+# 13. `/context` 应该做成一个真正的 Bitty Panel
+
+Claude Code 已经有 `/context` 用于查看 context window 都被什么占用。([Claude][1])
+
+Bitty 可以进一步做成：
+
+```text
+┌──────────────── Context ────────────────┐
+│ Model               GPT-5.6             │
+│ Context             93k / 256k          │
+│                                         │
+│ System              8.3k   ███          │
+│ Skills              5.1k   ██           │
+│ Conversation       31.4k   ███████      │
+│ File reads         14.8k   ████         │
+│ Tool results       18.1k   █████        │
+│ MCP schemas         6.2k   ██           │
+│ Memory              4.0k   █            │
+│ Plan                2.1k                │
+│                                         │
+│ Recoverable         34.1k               │
+│ Compressible        21.8k               │
+│ Pinned              13.4k               │
+└─────────────────────────────────────────┘
+```
+
+然后可以直接选择：
+
+```text
+File reads
+```
+
+看到：
+
+```text
+src/parser.rs      4200
+src/context.rs     2800
+src/main.rs        1700
+...
+```
+
+甚至按键：
+
+```text
+c → compress
+d → drop
+p → pin
+o → inspect
+```
+
+这就非常符合 Bitty 的 Panel 哲学。
+
+---
+
+# 14. MCP 也应该采用同样的 Lazy Context 思路
+
+还有一个现在越来越严重的问题：
+
+```text
+50 MCP servers
+× 20 tools
+× JSON schema
+```
+
+光 Tool Schema 就能吃掉一大堆 Context。
+
+Claude Code 现在已经有 MCP Tool Search：启动时只加载 server/tool 的简要信息，完整 schema 需要时才获取，以减少 context 占用。([Claude][1])
+
+Bitty 最好一开始就这么设计：
+
+```text
+MCP Registry
+
+github
+  ├── create_issue
+  ├── search_code
+  └── create_pr
+
+postgres
+  ├── query
+  └── schema
+```
+
+Prompt 初始只看到：
+
+```text
+github: repository and PR operations
+postgres: database queries
+```
+
+Agent 判断需要 GitHub：
+
+```text
+tool.search("github pull request")
+```
+
+之后才 expose：
+
+```text
+github.create_pr schema
+github.list_prs schema
+```
+
+而不是把 300 个 tool schema 每轮都发给模型。
+
+---
+
+# 15. `/skills` 也是 Registry，不是实现
+
+Skills 我建议 Core 只负责：
+
+```text
+discover
+parse
+resolve
+load
+unload
+invoke
+```
+
+目录兼容甚至可以直接考虑：
+
+```text
+.bitty/skills/
+~/.config/bitty/skills/
+
+.agents/skills/
+.claude/skills/
+```
+
+OpenCode 当前也会兼容 `.opencode/skills`、`.claude/skills`、`.agents/skills`。([OpenCode][8])
+
+Bitty 可以延续这种生态兼容性。
+
+真正：
+
+```text
+/review
+/release
+/debug
+/refactor
+```
+
+就是 Skills。
+
+---
+
+# 16. `/loop` 是一个非常典型的 Lua-only feature
+
+比如：
+
+```text
+/loop fix tests until pass
+```
+
+实际只是：
+
+```lua
+while not test_passed() do
+    agent.run(...)
+end
+```
+
+Core 只需要提供：
+
+```text
+agent.run()
+task.spawn()
+event.subscribe()
+exec()
+cancel()
+timeout()
+```
+
+甚至：
+
+```lua
+ai.loop({
+    until_ = function(state)
+        return state.tests_passed
+    end,
+
+    max = 5,
+
+    step = function()
+        agent.run("Fix the remaining failing tests")
+    end
+})
+```
+
+以后用户可以做：
+
+```text
+/loop
+/autofix
+/watch
+/verify
+/benchmark
+```
+
+完全不改 Rust。
+
+---
+
+# 17. `/task` 比 `/plan` 更底层一点
+
+这个我会稍微特殊处理。
+
+`Task` 的数据模型应该属于 Core：
+
+```text
+Task
+├── id
+├── parent
+├── state
+├── owner_agent
+├── workspace
+├── panel
+├── dependencies
+├── result
+└── artifacts
+```
+
+因为它涉及：
+
+```text
+Agent lifecycle
+Panel lifecycle
+Subagent
+Dashboard
+Persistence
+```
+
+但是：
+
+```text
+/task
+```
+
+这个 UI 和交互仍然 Lua。
+
+于是以后你那个 Agent Dashboard 可以直接看到：
+
+```text
+Agent                 Task             Panel
+
+Planner     ───────► architecture      #17
+Coder A     ───────► parser            #21
+Coder B     ───────► renderer          #24
+Reviewer    ───────► review            #31
+```
+
+这和我们刚才讨论的 Agent/Panel 解耦就全部连接起来了。
+
+---
+
+# 18. `/statusline` 几乎百分之百应该 Lua
+
+Core 只暴露：
+
+```text
+agent.state
+model
+tokens
+context_usage
+task
+branch
+workspace
+panel
+cost
+tool_calls
+```
+
+Lua：
+
+```lua
+statusline.register("ai", function(ctx)
+    return string.format(
+        "%s · %s · %.0f%% · %s",
+        ctx.model,
+        ctx.agent,
+        ctx.context.percent,
+        ctx.task.name
+    )
+end)
+```
+
+用户想改成：
+
+```text
+Claude Opus · HIGH · 84k/200k · parser
+```
+
+或者：
+
+```text
+󰚩 Sonnet | Plan | 41% | 2 agents
+```
+
+都是插件层问题。
+
+绝对不需要 Core。
+
+---
+
+# 19. 最后可以得到一条非常清晰的设计原则
+
+我认为可以直接写进 bitty-ai RFC：
+
+> **Core implements mechanism; Lua implements policy and workflow.**
+
+也就是：
+
+| Core mechanism      | Lua policy              |
+| ------------------- | ----------------------- |
+| Context compression | 什么时候压                   |
+| Session branching   | 怎么展示 `/fork`            |
+| Agent spawning      | `/review` 怎么创建 reviewer |
+| Task graph          | `/task` 如何组织            |
+| Skill registry      | `/skills` 如何展示          |
+| MCP runtime         | `/mcp` UI               |
+| Permission engine   | 权限配置 UI                 |
+| Tool registry       | 哪些 tool 当前开放            |
+| Panel execution     | `/loop` 如何运行            |
+| Token accounting    | statusline 怎么显示         |
+
+这条线一旦守住，`bitty-ai-core` 就不会变成第二个 Claude Code / Codex 那样塞满产品级 feature 的巨大 Core。
+
+---
+
+# 20. 我觉得 Bitty 最终真正有竞争力的，不是 Slash Command 数量
+
+现在大家都有：
+
+```text
+/compact
+/context
+/review
+/plan
+/mcp
+/skills
+/plugins
+/task
+```
+
+这些很快就会同质化。
+
+Bitty 真正可以不同的是：
+
+```text
+                Bitty Context Engine
+                        │
+       ┌────────────────┼────────────────┐
+       ▼                ▼                ▼
+    Panel           Source Code        Agent
+   Timeline       AST / LSP View      Task Graph
+       │                │                │
+ raw commands        raw files        raw history
+       │                │                │
+       └────────────────┼────────────────┘
+                        ▼
+                 Semantic Context
+                        │
+          only what the model needs
+```
+
+传统 Harness 是：
+
+> “不断产生文本 → Context 太大 → 压缩文本。”
+
+Bitty 完全有机会变成：
+
+> **“从一开始就不把原始世界等同于 Context。”**
+
+命令输出在 Panel Store。
+
+文件在 Filesystem。
+
+结构在 Tree-sitter/LSP。
+
+Agent 工作在 Task Graph。
+
+长内容在 Artifact Store。
+
+Context 只是这些真实状态的一个 **temporary semantic projection**。
+
+我认为这个抽象比单独实现一个 DCP 插件重要得多，而且会直接把你之前设计的 **Panel、headless agent workspace、Tree-sitter、LSP 共享、日志折叠、Agent Dashboard** 全部统一起来。([GitHub][5])
+
+如果按模块继续往下拆，我会把 `bitty-ai` 大致形成 **`runtime / session / context / tools / agent / task / skill / mcp / provider / artifact / lua-api`** 这几个 Rust 边界，而 `review / plan / loop / goal / context-ui / mcp-ui / statusline` 全部作为官方 Lua plugins。这个边界现在已经相当清晰了。
+
+[1]: https://code.claude.com/docs/en/glossary "Glossary - Claude Code Docs"
+[2]: https://opencode.ai/docs/zh-cn/commands/?utm_source=chatgpt.com "命令 | OpenCode"
+[3]: https://github.com/openai/codex/blob/main/codex-rs/tui/tooltips.txt?utm_source=chatgpt.com "codex/codex-rs/tui/tooltips.txt at main · openai/codex · GitHub"
+[4]: https://github.com/can1357/oh-my-pi/blob/main/README.md?utm_source=chatgpt.com "oh-my-pi/README.md at main · can1357/oh-my-pi · GitHub"
+[5]: https://github.com/Opencode-DCP/opencode-dynamic-context-pruning "GitHub - Opencode-DCP/opencode-dynamic-context-pruning: Dynamic context pruning plugin for OpenCode - intelligently manages conversation context to optimize token usage · GitHub"
+[6]: https://github.com/can1357/oh-my-pi/blob/main/docs/compaction.md "oh-my-pi/docs/compaction.md at main · can1357/oh-my-pi · GitHub"
+[7]: https://developers.openai.com/api/reference/java/resources/responses/methods/compact?utm_source=chatgpt.com "Compact conversation | OpenAI API Reference"
+[8]: https://opencode.ai/docs/skills?utm_source=chatgpt.com "Agent Skills | OpenCode"
+

@@ -1,0 +1,3571 @@
+核心判断：机制在 Core，策略与体验在 Plugin
+
+你现在 Bitty 文档里的方向基本就是我最推荐的方向：
+
+    Core 管理 resource / state / invariant / mechanism；Plugin 管理 behavior / policy / UX。
+
+目前 core-boundaries.md 已经明确把 View / LayoutNode / split / stack / overlay / focus / resize 放进 Core，而把 Tabs、Split policy、Search、Statusline、Sessions、Project、Palette 等放到 Plugin。
+
+但我建议再往前走一步：不要问“Tabs 是不是插件”，而应该问“Tabs 的哪一部分是插件”。
+
+这会让 Bitty 的架构非常干净。
+1. 我会这样切 Bitty
+功能	Core 必须提供	Plugin 可以提供	我的建议
+PTY / ConPTY	✅	❌	Core
+VT Parser / Grid	✅	❌	Core
+Unicode / shaping / emoji	✅	❌	Core
+GPU Renderer	✅	❌	Core
+Keyboard / Mouse / IME	✅	❌	Core
+Scrollback storage	✅	❌	Core
+Window / Surface lifecycle	✅	❌	Core
+Split tree	✅ primitive	✅ policy / UX	Core + Plugin
+Tabs	✅ container primitive	✅ tabline / policy	Core + Plugin
+Background color	✅	❌	Core
+Opacity	✅	❌	Core
+Background image	✅ rendering primitive	✅ UX/policy	Core + Plugin
+Blur / Mica / Acrylic	✅ platform backend	❌	Core
+Theme colors	✅ configuration	✅ theme manager	Core + Plugin
+Search	terminal snapshot	✅	Plugin
+Command Palette	registry	✅	Plugin
+Statusline	slots/primitives	✅	Plugin
+Shell integration	OSC parser	✅ UX	Core + Plugin
+Session persistence	primitives/state API	✅	Plugin
+Workspace	primitive APIs	✅	Plugin
+Git integration	❌	✅	Plugin
+Project detection	❌	✅	Plugin
+SSH manager	transport primitive/service	✅ UX	Plugin
+Quick/Quake terminal	window primitive	✅	Plugin
+Clipboard	✅ primitive/security	✅ history/UX	Core + Plugin
+Hyperlink	OSC 8 semantics	✅ hints/history/actions	Core + Plugin
+Notifications	OS primitive	✅ rules	Core + Plugin
+AI / Agent	IPC primitives	✅	Plugin
+
+这其实就是：
+
+Bitty Core
+    ↓
+mechanisms / primitives
+    ↓
+Plugin API
+    ↓
+official plugins
+    ↓
+community plugins
+
+而不是：
+
+Core = 少量功能
+Plugin = 剩下所有功能
+
+这两者区别非常大。
+2. Tabs：我认为你现在的方向对，但 Core 还应该有 Tab primitive
+
+你当前 RFC 已经把：
+
+bitty-terminal.tabs
+
+作为官方 bundled plugin，并规定负责：
+
+    tabline
+
+    tab commands
+
+    ordering
+
+    keybindings
+
+    closing policy
+
+这非常合理。当前 Default Distribution RFC 也已经把 bitty-terminal.tabs 列进首批 bundled plugins。
+
+但是：
+
+    Tab 的底层 container 不应该由 Lua 插件自己实现。
+
+应该类似：
+
+Window
+└── TabContainer
+    ├── Tab
+    │   └── LayoutTree
+    │       ├── TerminalSurface
+    │       └── TerminalSurface
+    │
+    └── Tab
+        └── TerminalSurface
+
+Core 负责：
+
+WindowId
+TabId
+SurfaceId
+LayoutNodeId
+
+以及：
+
+create_tab()
+destroy_tab()
+activate_tab()
+move_tab()
+create_surface()
+attach_surface()
+detach_surface()
+
+插件负责：
+
+新 Tab 默认 cwd 是什么？
+Tab 标题显示什么？
+什么时候显示 tabline？
+Tab 如何排序？
+close 时是否确认？
+Ctrl+Shift+T 做什么？
+数字 1~9 如何跳转？
+是否显示 icon？
+
+这样：
+
+Tab mechanism = Core
+Tab experience = Plugin
+
+非常漂亮。
+
+否则未来 sessions、workspace、project、AI agent 都需要操作 Tab，你会发现它们开始依赖 tabs 插件，架构会变成：
+
+workspace plugin
+      ↓
+tabs plugin
+      ↓
+core
+
+这不太好。
+
+更好的结构是：
+
+             tabs
+            ↗
+Core Tab API ← workspace
+            ↘
+             sessions
+            ↘
+             project
+
+3. Split 更是典型的「Core mechanism + Plugin policy」
+
+这个你现在已经定义得很好。
+
+当前文档就是：
+
+    Core：create / close / resize / focus LayoutNode
+    Plugin：keybindings / direction / balancing policy / tab-split UX。
+
+例如：
+
+LayoutNode
+├── Leaf(TerminalSurface)
+├── Horizontal
+│   ├── LayoutNode
+│   └── LayoutNode
+└── Vertical
+    ├── LayoutNode
+    └── LayoutNode
+
+这是 Core。
+
+但是：
+
+Ctrl+Shift+D → vertical split
+Ctrl+Shift+E → horizontal split
+
+这是 Plugin。
+
+以及：
+
+smart_split()
+balance_panes()
+rotate_panes()
+zoom_pane()
+swap_pane()
+move_pane_left()
+
+也完全可以属于官方：
+
+bitty-terminal.splits
+
+插件。
+为什么不能让 Split 本身完全成为插件？
+
+因为 Layout Tree 是 UI infrastructure。
+
+未来不仅 Terminal 会进去：
+
+LayoutNode
+├── Terminal
+├── PluginPanel
+├── RichView
+├── AI Agent
+├── FileBrowser
+└── Preview
+
+插件必须消费 layout primitive，不能自己成为 layout system。
+4. “无限上下窗口”需要分成两种理解
+
+如果你说的是：
+
+    可以一直上下左右 split，形成任意数量 pane
+
+那么它本质上就是 Core LayoutTree 的能力。
+
+例如：
+
+              Split V
+              /     \
+         Split H    T4
+         /    \
+       T1    Split V
+             /    \
+            T2    T3
+
+理论上：
+
+LayoutNode -> LayoutNode -> LayoutNode -> ...
+
+可以任意嵌套。
+
+Core 只需要资源限制，不应该人为限制「最多 4 个 pane」。
+
+Plugin 决定：
+
+怎么 split
+怎么导航
+怎么 balance
+怎么 resize
+怎么显示边框
+怎么高亮 active pane
+
+如果你说的“无限上下”其实是 无限 scrollback，那就是另一个问题。
+
+这个应该属于 Core。
+
+因为 scrollback 是 Terminal State 的一部分：
+
+PTY bytes
+   ↓
+VT Parser
+   ↓
+Terminal State
+   ├── visible grid
+   └── scrollback
+
+Plugin 不应该保存真正的 scrollback。
+
+不过：
+
+scrollback search
+scrollback pager
+scrollback export
+scrollback history browser
+scrollback bookmarks
+
+都很适合作为插件。
+
+而且我不建议真的做：
+
+scrollback = "unlimited"
+
+然后全部 RAM 存储。
+
+更合理的是未来支持：
+
+RAM ring buffer
+      ↓
+optional disk-backed history
+
+Core 管 mechanism，Plugin 管历史浏览体验。
+5. 背景自定义：这里很多东西其实不应该插件化
+
+这个尤其值得注意。
+Background color
+
+background = "#101010"
+
+Core。
+
+因为 renderer 本身必须知道默认 background。
+Opacity
+
+background_opacity = 0.85
+
+也应该：
+
+    Core。
+
+因为这会涉及：
+
+renderer
+→ swapchain/surface
+→ window compositor
+→ Wayland/X11/macOS/Windows
+
+WezTerm 也是直接把 window_background_opacity 作为窗口/render configuration，而且不同平台 compositor/backdrop 行为不同。
+
+不能让 Lua plugin 去碰这些 platform objects。
+6. Blur / Acrylic / Mica 更应该是 Core
+
+例如：
+
+background_blur = 20
+
+windows_backdrop = "mica"
+macos_blur = true
+
+底层涉及 native APIs。
+
+应该：
+
+Plugin
+   ❌ HWND
+   ❌ NSWindow
+   ❌ wl_surface
+
+Core Platform
+   ✅
+
+插件甚至不应该拿到 native window handle。
+
+这与你现在「plugin cannot access GPU objects/window handles」的安全边界是一致的。
+7. 但「Wallpaper 插件」完全可以有
+
+区别在这里。
+
+Core 支持：
+
+BackgroundLayer
+├── Solid
+├── Image
+└── Gradient
+
+然后插件可以做：
+
+bitty-terminal.wallpaper
+
+提供：
+
+随机壁纸
+按 workspace 切换背景
+根据时间切换
+根据 cwd/project 切换
+Slideshow
+Unsplash API
+GitHub repo backgrounds
+
+例如：
+
+bitty.on("terminal.cwd-changed", function(ev)
+    if ev.cwd:contains("vectojs") then
+        background.set("vectojs.png")
+    end
+end)
+
+这里：
+
+加载/解码/渲染 image → Core
+什么时候换 image       → Plugin
+
+就是很好的 mechanism-policy split。
+8. Theme 也不要完全当 Plugin
+
+我甚至建议 Bitty 区分：
+
+Plugin
+Theme
+Config
+Package
+
+不要什么东西都叫 Plugin。
+
+例如：
+
+tokyonight
+catppuccin
+dracula
+gruvbox
+
+它们只是：
+
+[colors]
+background = ...
+foreground = ...
+ansi = ...
+
+这种应该是 data package / theme package。
+
+不是 Lua Plugin。
+
+因为如果一个主题都需要：
+
+Lua VM
+Plugin lifecycle
+Capability
+Event queue
+
+成本太奇怪了。
+
+真正的 Plugin 应该是：
+
+bitty-terminal.theme-switcher
+
+负责：
+
+preview
+search
+switch
+light/dark automatic switching
+
+kitty 其实也采取了类似思路：其 kittens 用来做 theme preview/switcher、Unicode input、hints、diff、command palette 等高级体验，而底层终端功能仍然由 core 提供。
+9. Search 非常适合官方插件
+
+我很推荐：
+
+bitty-terminal.search
+
+Core：
+
+TerminalSnapshot
+SemanticSnapshot
+selection primitive
+overlay primitive
+
+Plugin：
+
+Ctrl+Shift+F
+regex
+case-sensitive
+whole word
+next/previous
+history
+highlight
+
+Plugin API v1 已经允许 read-only semantic snapshot、overlay/panel，所以这个与你现在的 API 非常契合。你现在 v1 已明确支持 command/event/keybind/settings/notification，以及 declarative status/overlay/panel。
+
+这会是很好的 dogfooding plugin。
+10. Statusline：几乎是教科书级插件
+
+bitty-terminal.statusline
+
+例如：
+
+~/Projects/bitty | main ↑2 | rust | 14:32
+
+可以组合 provider：
+
+cwd
+git
+shell
+hostname
+task
+exit status
+battery
+time
+ssh
+agent
+
+Core 只提供：
+
+StatusSlot
+Row
+Text
+Icon
+Separator
+
+插件完成全部 UX。
+
+你现在 RFC 已经这样设计了，我认为应该保留。
+11. Shell Integration 也很适合 Plugin，但 parser 必须 Core
+
+例如：
+
+OSC 7   cwd
+OSC 133 shell semantic zones
+
+必须 Core parse。
+
+因为 PTY output：
+
+untrusted bytes
+↓
+VT Parser
+↓
+OSC parser
+
+绝对不能进入 Lua hot path。
+
+但是：
+
+Jump to previous prompt
+Jump to next prompt
+Command history
+Command duration
+Exit-code indicator
+Prompt navigation
+
+可以全部：
+
+bitty-terminal.shell-integration
+
+这与你现在 RFC 完全一致。
+12. 第一批官方 Plugin，我会比现在再丰富一点
+
+你当前 accepted staged set 已经是：
+
+bitty-terminal.tabs
+bitty-terminal.statusline
+bitty-terminal.palette
+bitty-terminal.shell-integration
+bitty-terminal.project
+
+而且默认全部 disabled。
+
+我会最终扩成大概：
+
+bitty-terminal.tabs
+bitty-terminal.splits
+bitty-terminal.search
+bitty-terminal.palette
+bitty-terminal.statusline
+bitty-terminal.shell-integration
+bitty-terminal.sessions
+bitty-terminal.project
+bitty-terminal.hints
+bitty-terminal.notifications
+bitty-terminal.quick-terminal
+bitty-terminal.theme-switcher
+
+其中非常适合首批拿来验证 Plugin API 的是：
+
+tabs
+
+验证：
+
+UI slot
+commands
+events
+keybinds
+layout
+state
+
+search
+
+验证：
+
+terminal semantic read
+overlay
+keyboard input
+snapshot
+
+statusline
+
+验证：
+
+declarative UI
+event subscription
+state update
+composition
+
+palette
+
+验证：
+
+Command Registry
+overlay
+lazy loading
+cross-plugin discovery
+
+shell-integration
+
+验证：
+
+semantic events
+terminal observation
+security boundary
+
+这几个基本把 Plugin API v1 的核心能力全部压一遍。
+13. hints 我非常推荐
+
+这是 kitty 最有价值的扩展之一。
+
+例如用户按：
+
+Ctrl+Shift+E
+
+然后屏幕上的：
+
+https://...
+foo.rs:142
+/home/xuepoo/test.txt
+#1234
+SHA: abcd1234
+
+全部出现 label：
+
+[a] https://...
+[s] foo.rs:142
+[d] /home/...
+
+然后：
+
+Enter → open
+y     → copy
+e     → editor
+
+可以叫：
+
+bitty-terminal.hints
+
+它会非常适合 Bitty。
+
+因为 Core 已经提供 Terminal semantic snapshot，而 hints 完全是一种 presentation + interaction policy。
+
+kitty 官方 kittens 里的 Hints 就是类似思路。
+14. Session / Workspace 也非常适合 Plugin
+
+例如：
+
+bitty session save coding
+bitty session restore coding
+
+恢复：
+
+Window
+├── Tab: editor
+│   ├── nvim
+│   └── cargo watch
+│
+├── Tab: git
+│   └── lazygit
+│
+└── Tab: server
+    ├── pnpm dev
+    └── logs
+
+Core：
+
+Surface identity
+Tab identity
+Layout tree
+spawn mechanism
+cwd
+environment
+
+Plugin：
+
+serialize layout
+name session
+restore session
+auto-save
+workspace policy
+
+这一点 WezTerm 的 multiplexer 也是把 window/tab/pane 组织作为底层模型来管理。
+15. Clipboard History 可以插件化，但 Clipboard 本身绝不能
+
+Core：
+
+clipboard.read()
+clipboard.write()
+OSC 52 policy
+consent
+platform implementation
+
+Plugin：
+
+bitty-terminal.clipboard-history
+
+提供：
+
+history
+search
+pin
+paste
+format conversion
+
+但是这个插件需要：
+
+clipboard.read
+clipboard.write
+
+权限，所以绝对不应该默认开启。
+
+这也正好验证你的 capability system。
+16. Project Plugin 很值得保留
+
+你现在已有：
+
+bitty-terminal.project
+
+我认为这个以后可以非常强。
+
+例如识别：
+
+.git/
+Cargo.toml
+package.json
+pyproject.toml
+go.mod
+pom.xml
+
+然后：
+
+Project
+├── root
+├── language
+├── vcs
+└── commands
+
+进一步可以提供：
+
+bitty project open
+bitty project recent
+bitty project switch
+
+以及自动配合：
+
+tabs
+sessions
+statusline
+palette
+
+这就是 Bitty 从普通 Terminal 走向 programmable terminal platform 的地方。
+17. AI / Agent 我反而不建议首批做
+
+虽然 Bitty 很适合：
+
+bitty-terminal.agent
+
+但它会一次引入：
+
+network
+filesystem
+process
+terminal.input
+terminal.semantic-read
+panel
+tasks
+IPC
+MCP
+
+权限面太大。
+
+第一批官方插件最好用：
+
+tabs
+search
+palette
+statusline
+shell-integration
+
+先证明：
+
+    不用 private API，也能做出第一流体验。
+
+然后再做：
+
+project
+sessions
+SSH
+Agent
+MCP
+
+这样插件 API 会稳定很多。
+18. 有些东西我强烈建议“永远不要插件化”
+
+这是 Bitty 最重要的一条红线：
+
+PTY / ConPTY
+VT parsing
+Terminal state
+Grid
+Cursor
+Scrollback semantics
+
+Unicode / Grapheme
+Cell width
+Shaping
+Font fallback
+
+Keyboard encoding
+Mouse protocol
+IME
+Paste
+Focus
+
+OSC / CSI / DCS / APC parser
+Kitty Keyboard Protocol
+Kitty Graphics Protocol
+Sixel
+OSC 52 security
+OSC 8 hyperlink semantics
+
+Renderer
+Damage tracking
+GPU abstraction
+Software renderer fallback
+
+Window handles
+Clipboard primitives
+DPI
+Monitor APIs
+Compositor integration
+
+Layout tree primitives
+Focus tree
+Resize
+Overlay primitive
+
+Plugin host
+Capability system
+Resource limits
+Plugin lifecycle
+Config schema
+Command registry
+Event registry
+
+这些东西的共同特征是：
+
+    它们决定 Terminal Truth、security、correctness 或 runtime invariant。
+
+Lua 不应该碰。
+
+这也正好符合你目前 Plugin RFC 的安全原则：插件不得进入 parser/render/input hot path，presentation 不能改变 Terminal Truth。
+19. 一个非常好用的判断公式
+
+以后每增加一个功能，可以问三个问题。
+A. 禁掉它，Bitty 还是不是一个正确的 Terminal？
+
+如果：
+
+No
+
+→ Core
+
+例如：
+
+PTY
+scrollback
+IME
+renderer
+
+B. 它是否涉及 OS/GPU/Terminal Truth？
+
+如果：
+
+Yes
+
+→ Core primitive
+
+例如：
+
+opacity
+blur
+window
+clipboard
+split tree
+
+C. 它主要是在回答「用户希望怎么用」吗？
+
+如果：
+
+Yes
+
+→ Plugin
+
+例如：
+
+tabline 怎么画
+split 往哪个方向
+如何搜索
+如何恢复 workspace
+什么时候通知
+statusline 放什么
+
+这三个问题基本能解决 90% 的 Core/Plugin 边界。
+20. 我甚至建议把 Bitty 的整体模型明确成这五层
+
+┌──────────────────────────────────────┐
+│          Experience Plugins          │
+│ Tabs / Search / Git / Agent / SSH    │
+├──────────────────────────────────────┤
+│            Bitty Plugin API          │
+│ Command / Event / UI / Service       │
+├──────────────────────────────────────┤
+│          Application Primitives      │
+│ Tab / Layout / View / Overlay        │
+├──────────────────────────────────────┤
+│            Terminal Core             │
+│ PTY / VT / State / Input / Render    │
+├──────────────────────────────────────┤
+│             Platform                 │
+│ Wayland / X11 / Win32 / macOS        │
+└──────────────────────────────────────┘
+
+我觉得这会比简单的：
+
+Core
+Plugin
+
+二分法更适合 Bitty。
+最后回到你提到的几个具体功能
+
+我会这样定：
+
+Tabs
+├─ Tab container/lifecycle       Core
+├─ tabline                       Plugin
+├─ ordering                      Plugin
+├─ naming                        Plugin
+└─ keyboard UX                   Plugin
+
+Split
+├─ LayoutTree                    Core
+├─ split primitive               Core
+├─ focus/resize                  Core
+├─ layout strategy               Plugin
+└─ keybindings                   Plugin
+
+Background
+├─ background color              Core
+├─ opacity                       Core
+├─ blur/backdrop                 Core
+├─ image rendering              Core
+├─ wallpaper selection           Plugin
+└─ dynamic wallpaper             Plugin
+
+Scrollback
+├─ storage                       Core
+├─ limits                        Core
+├─ disk-backed mechanism         Core
+├─ search                        Plugin
+├─ history browser               Plugin
+└─ export/bookmarks              Plugin
+
+所以最重要的一点其实是：
+
+    Bitty 不应该追求“尽可能多东西都是插件”，而应该追求“尽可能多的 UX / policy 都由插件组成”。
+
+底层 primitive 反而应该相当强大。
+
+这样你最终可以做到一种很有意思的状态：
+
+bitty --safe
+
+是一个极小但功能完全正确的 Terminal；
+
+而：
+
+Core
++ tabs
++ splits
++ search
++ shell-integration
++ palette
++ statusline
++ sessions
++ project
+
+组合起来以后，就是一个功能非常完整的现代 Terminal。
+
+这比 Ghostty/kitty 那种“功能很多，但大量功能固化在主程序里”的模式更进一步。Ghostty 本身将 tabs/splits 作为应用内建能力，kitty 也直接内建 tab/window/layout，而把 hints、themes、command palette 等高阶体验放进 kittens。
+
+Bitty 可以把这条线再往下移一层：Core 提供强大的通用 UI/Terminal primitives，官方插件本身就是 Bitty 产品体验。 这会是 Bitty 最有辨识度的架构之一。
+
+对，我觉得这样总结 Bitty 的产品哲学非常准确：
+
+    Bitty 并不是单纯参考某一个现代 Terminal，而是在把 Linux 桌面环境里那些成熟的小工具哲学重新组合到一个 Terminal Workspace 里面。
+
+而且这些软件刚好代表几种非常不同、但能够很好组合的设计思想：
+
+Terminal emulator → Terminal/runtime 基础
+Neovim            → extensibility / command / plugin / composability
+Hyprland          → workspace / tiled layout / window interaction
+Waybar            → modular status information
+Rofi/Wofi         → palette / picker / launcher
+swaylock/hyprlock → lock experience
+Dunst/Mako        → notification
+tmux              → session / pane / workspace
+
+这反而可能成为 Bitty 很明显的 Linux / Unix 风格特色。
+Statusline 确实应该更像 Waybar
+
+甚至我觉得以后可以逐渐少用 "statusline" 这个概念，而在架构上称作：
+
+Status Bar
+
+插件名称仍然可以是：
+
+bitty-terminal.statusline
+
+但它的内部模型应该非常接近 Waybar：
+
+┌───────────────────────────────────────────────────────────┐
+│ ws:1 │ ~/bitty │ main ↑2    CPU 7%  MEM 5.8G    21ms  │
+└───────────────────────────────────────────────────────────┘
+
+每一块实际上是一个独立 module：
+
+StatusBar
+├── workspace
+├── cwd
+├── git
+├── command
+├── cpu
+├── memory
+├── gpu
+├── network
+├── battery
+├── clock
+└── custom plugin modules
+
+而不是一个插件里面硬编码所有模块。
+1. 最好做成 Provider / Module 模型
+
+例如：
+
+bitty-terminal.statusline
+        │
+        ▼
+Status Module Registry
+        │
+        ├── workspace
+        ├── cwd
+        ├── cpu
+        ├── memory
+        ├── network
+        ├── git.branch
+        └── activity.today
+
+然后用户：
+
+status = {
+    position = "bottom",
+
+    left = {
+        "workspace",
+        "cwd",
+        "git.branch",
+    },
+
+    center = {
+        "command.status",
+    },
+
+    right = {
+        "cpu",
+        "memory",
+        "network",
+        "battery",
+        "clock",
+    },
+}
+
+这基本就是 Waybar module philosophy。
+
+甚至可以支持：
+
+format
+tooltip
+click
+scroll
+update interval
+conditional visibility
+
+例如 CPU：
+
+{
+    module = "system.cpu",
+    format = "CPU {usage}%",
+    interval = 1000,
+}
+
+点击：
+
+CPU 24%
+  ↓
+打开 system monitor panel
+
+2. Waybar 能提供很多直接灵感
+
+第一批 system modules 可以考虑：
+
+CPU
+Memory / RAM
+Swap
+GPU
+VRAM
+Network
+Disk
+Battery
+Temperature
+Load average
+Uptime
+Clock
+Hostname
+Kernel
+Audio
+Bluetooth
+Power profile
+
+不过这里又需要区分：
+获取系统指标
+
+应该通过 Core/host service：
+
+SystemMetricsService
+
+例如：
+
+system.cpu()
+system.memory()
+system.network()
+system.battery()
+
+而不是 Lua 插件自己：
+
+读 /proc/*
+执行 sensors
+执行 nvidia-smi
+
+否则：
+
+    Linux-only
+
+    权限混乱
+
+    process spawn 太多
+
+    Windows/macOS 无法统一
+
+更好的设计是：
+
+Platform Core
+     ↓
+SystemMetrics API
+     ↓
+Status plugin
+
+然后 Linux backend 可以读取：
+
+/proc
+/sys
+netlink
+
+Windows/macOS 使用各自 API。
+3. 但 Status Bar 不应该局限于“系统状态”
+
+Bitty 比 Waybar 更有优势的一点是：
+
+它同时知道 Terminal semantic state。
+
+所以可以有：
+
+System state
++
+Terminal state
++
+Project state
++
+Plugin state
+
+例如：
+
+󰆍 zsh
+ ~/bitty
+ main ↑2
+󰅐 cargo test 12.7s
+✓ exit 0
+󰆍 4 panes
+󰓎 137 commands today
+󰍹 CPU 8%
+󰘚 23:41
+
+Waybar不知道：
+
+当前 shell command
+exit status
+cwd
+terminal semantic zone
+当前 workspace 中有几个 pane
+当前哪个 command 正在运行
+
+Bitty 知道。
+
+这就会变成一种：
+
+    Waybar + shell status + workspace status
+
+4. 甚至可以允许插件给 Status 注册内容
+
+这点特别重要。
+
+比如：
+
+git plugin
+    ↓
+git.branch
+
+activity plugin
+    ↓
+activity.today
+
+pet plugin
+    ↓
+pet.state
+
+session plugin
+    ↓
+session.name
+
+所以插件之间不要：
+
+activity → 直接调用 statusline internal API
+
+而应该：
+
+activity
+   │
+   ▼
+StatusModuleRegistry
+   ▲
+   │
+statusline
+
+这样即使以后用户不用官方 statusline，而换一个：
+
+xuepoo.fancy-statusbar
+
+它仍然能够消费：
+
+git.branch
+activity.today
+agent.state
+
+这个抽象会非常漂亮。
+5. lock 的想法也很好，但这里一定要区分两种 Lock
+
+这个地方涉及真正的 security boundary。
+第一种：Presentation Lock
+
+插件完全可以做：
+
+bitty-terminal.lock
+
+效果类似：
+
+┌────────────────────────────┐
+│                            │
+│          🔒 Bitty          │
+│                            │
+│       Workspace Locked     │
+│                            │
+│       [ Unlock ]           │
+│                            │
+└────────────────────────────┘
+
+锁住：
+
+keyboard input
+mouse interaction
+workspace switching
+terminal visibility
+
+甚至：
+
+inactive 10 minutes
+        ↓
+auto lock
+
+这作为插件完全合理。
+
+但它只能称：
+
+    UI / privacy lock
+
+不能宣称：
+
+    security lock
+
+6. 真正需要密码的 Lock 不能纯插件实现
+
+比如：
+
+    离开电脑以后，别人无法看到 Bitty 内容，也不能解锁。
+
+这个时候密码验证本身就不能交给 Lua plugin。
+
+否则恶意插件、插件崩溃、safe mode 都可能绕过它。
+
+真正的模型应该是：
+
+Lock Plugin
+    │
+    │ request lock
+    ▼
+Core Lock Primitive
+    │
+    ├── input interception
+    ├── hide terminal surfaces
+    ├── credential verification
+    └── unlock
+
+也就是说：
+
+什么时候锁       Plugin
+锁屏长什么样     Plugin
+空闲多久锁       Plugin
+
+真正冻结输入      Core
+保护 Terminal     Core
+认证              Core/platform
+
+7. 更重要的是：不要自己保存“Bitty 密码”
+
+如果真做安全 lock，我不建议：
+
+Bitty password = xxx
+
+然后自己 hash 保存。
+
+更 Unix/Linux 的方式应该是利用 OS authentication。
+
+Linux：
+
+PAM
+
+macOS：
+
+LocalAuthentication
+
+Windows：
+
+Windows credential/session APIs
+
+因此：
+
+unlock
+   ↓
+PlatformAuthService
+
+而不是插件自己处理密码。
+
+特别是如果用户输入的是系统密码：
+
+    Lua plugin 永远不应该看到密码内容。
+
+可以设计：
+
+auth.request("unlock")
+
+最终插件只收到：
+
+Success
+Denied
+Cancelled
+
+永远拿不到 credential。
+8. 但“真正桌面锁屏”还是应该交给系统
+
+还有一层边界：
+
+Bitty lock：
+
+只保护 Bitty
+
+而：
+
+hyprlock
+swaylock
+Windows lock screen
+macOS lock screen
+
+保护的是整个 desktop session。
+
+所以 Bitty 可以提供：
+
+Lock Workspace
+Lock Window
+
+但如果用户希望“离开电脑”，更合理的是：
+
+System Lock
+
+Bitty 可以调用受控 platform primitive：
+
+platform.lock_session()
+
+然后真正由 OS/hyprlock 处理。
+9. 这样 Bitty 还可以借鉴 Hyprlock 做视觉效果
+
+例如 Bitty Workspace Lock：
+
+blur background
+↓
+dim
+↓
+clock
+↓
+hostname
+↓
+workspace name
+↓
+avatar / logo
+
+甚至桌宠插件可以和 lock 联动：
+
+Bitty locked
+     ↓
+鼯鼠睡觉
+
+这种插件组合就很有意思。
+10. Linux 世界还能给 Bitty 很多插件灵感
+
+我觉得可以系统性地从 Linux 工具中提炼，而不是照搬 UI。
+
+比如：
+Linux 软件	Bitty 可以吸收的思想
+Neovim	Plugin API、commands、keymaps、events
+Hyprland	Workspace、tiles、drag、layout
+Waybar	composable status modules
+tmux	session、pane、detach/attach 思维
+Rofi/Wofi	command palette / picker
+fzf	fuzzy finder
+swaylock/hyprlock	workspace lock
+Dunst/Mako	notification center
+Yazi	terminal file browser
+btop	system monitor panel
+lazygit	Git workspace
+Zellij	panes/layout/session
+direnv	project environment integration
+Starship	prompt/context modules
+systemd	lifecycle/state/diagnostics 思维
+
+甚至可以继续做很多 Bitty 插件。
+11. 比如 system-monitor
+
+Waybar 只显示：
+
+CPU 19%
+RAM 42%
+
+但 Bitty 可以点进去变成：
+
+┌─ System ──────────────────────────────┐
+│ CPU                                   │
+│ ███████░░░░░░░░  42%                 │
+│                                       │
+│ RAM                                   │
+│ █████████░░░░░░  9.1 / 16 GB         │
+│                                       │
+│ Network                               │
+│ ↓ 3.1 MB/s ↑ 842 KB/s                │
+└───────────────────────────────────────┘
+
+插件：
+
+bitty-terminal.system-monitor
+
+Status module：
+
+CPU 42%  RAM 57%
+
+点击：
+
+Overlay / Panel
+
+这个体验就非常自然。
+12. Notification center 也可以借鉴 Mako/Dunst
+
+你已经有 platform notification primitive。
+
+那可以做：
+
+bitty-terminal.notifications
+
+例如：
+
+cargo test
+   ↓
+running 2min
+   ↓
+finished
+   ↓
+Bitty Notification
+
+✓ cargo test
+124 tests passed
+2m14s
+
+然后在 status bar：
+
+󰂚 3
+
+点击打开：
+
+Notification Center
+
+像：
+
+Waybar + Mako
+
+13. Command Palette 可以明显参考 Rofi/Wofi
+
+比如：
+
+Ctrl+Shift+P
+
+弹：
+
+> split
+
+Split Vertical
+Split Horizontal
+Balance Panes
+Move Pane Left
+Move Pane Workspace 2
+
+然后它实际上搜索统一：
+
+Command Registry
+
+插件也能注册 command。
+
+因此 Bitty 的 palette 类似：
+
+    Rofi，但是对象是 Bitty command graph。
+
+14. Scratchpad 可以直接吸收 Hyprland Special Workspace
+
+这个我还是很推荐。
+
+例如：
+
+Workspace 1
+Workspace 2
+Workspace 3
+Special: scratch
+
+快捷键：
+
+Alt+`
+
+弹出：
+
+┌──────────────────────┐
+│ scratch terminal     │
+│                      │
+│ $                    │
+└──────────────────────┘
+
+它甚至可以 floating：
+
+normal workspace
+      +
+special overlay workspace
+
+非常 Linux。
+15. 还可以有类似 btop 的 Dashboard
+
+比如：
+
+bitty-terminal.dashboard
+
+开启一个 workspace：
+
+Workspace: System
+
+┌ CPU ───────┬ Network ──────┐
+│ graph      │ graph         │
+├────────────┼───────────────┤
+│ Processes  │ Disk          │
+└────────────┴───────────────┘
+
+但这些不一定是 PTY。
+
+完全可以是：
+
+RichSurface
+
+这就是前面把 View != Terminal 做好的收益。
+16. 一个更有趣的方向：Bitty 自己形成一套“桌面组件生态”
+
+这样以后：
+
+Waybar module
+
+对应：
+
+Bitty Status Module
+
+Hyprland plugin/layout：
+
+Bitty Layout Plugin
+
+Rofi mode：
+
+Bitty Palette Provider
+
+Neovim plugin：
+
+Bitty Plugin
+
+Dunst action：
+
+Bitty Notification Provider
+
+于是插件不一定只是：
+
+Plugin
+
+还可以暴露标准 interface：
+
+StatusProvider
+PaletteProvider
+LayoutProvider
+NotificationProvider
+RichProvider
+ProjectProvider
+
+这会比“所有插件各玩各的”强很多。
+17. 可以把 Plugin API 分成 Extension Points
+
+长期可以形成：
+
+Plugin
+│
+├── Commands
+├── Events
+├── Services
+│
+├── UI Contributions
+│   ├── status
+│   ├── overlay
+│   ├── panel
+│   └── workspace
+│
+├── Providers
+│   ├── StatusProvider
+│   ├── PaletteProvider
+│   ├── LayoutProvider
+│   └── ProjectProvider
+│
+└── Capabilities
+
+这其实非常像：
+
+Neovim
++
+Waybar
++
+Hyprland
+
+抽象之后的组合。
+18. Bitty 的特色可能最终不是某一个 Feature
+
+而是一套非常一致的哲学：
+
+Linux desktop
+
+Hyprland
+├── workspace
+├── windows
+└── layout
+
+Waybar
+├── modules
+└── status
+
+Rofi
+└── command launcher
+
+Neovim
+├── commands
+├── plugins
+└── events
+
+
+                ↓ 抽象
+
+
+Bitty
+
+Workspace
+├── Views
+├── Layout
+└── Surfaces
+
+Status
+└── Modules
+
+Palette
+└── Commands
+
+Plugin Runtime
+├── Events
+├── Services
+└── Capabilities
+
+所以它不是：
+
+    “把 Hyprland/Waybar 搬进 Terminal。”
+
+而更接近：
+
+    把 Linux 桌面中已经证明很好用的 composability 思想重新缩放到 Terminal Workspace。
+
+我觉得这比单纯模仿 kitty、Ghostty、WezTerm 更有价值。
+
+尤其是以后你甚至可以明确形成一句架构描述：
+
+    Bitty treats a terminal window like a tiny composable desktop: workspaces organize views, layouts arrange them, status modules expose state, and plugins define the experience.
+
+而“锁终端”这个例子也很好地说明了 Bitty 的核心原则：**Hyprlock 风格的视觉和自动锁策略可以插件化，但真正的认证、输入冻结和安全边界必须由 Core/OS 掌握。**这样既保留 Linux 式自由组合，也不会为了“Everything is a plugin”牺牲安全边界。
+
+好的，那么对于 AI 部分的插件应该是会怎么设计呢？有什么灵感吗
+
+可以，而且我认为 Bitty 的 AI 部分反而很适合你前面已经形成的这套架构。
+
+关键不是做：
+
+Terminal
++ ChatGPT sidebar
+
+这种现在已经很常见的东西。
+
+Bitty 更适合做成：
+
+    AI / Agent 可以理解整个 Workspace，并把 Terminal、View、Project、Command、Status、Rich Surface 都当成可组合资源。
+
+这会比普通的“AI Terminal”有特色得多。
+1. 首先不要设计一个巨大的 bitty-ai
+
+我更推荐拆成几个标准角色：
+
+AI ecosystem
+│
+├── Model Provider
+│   ├── OpenAI
+│   ├── Anthropic
+│   ├── Gemini
+│   └── Local/Ollama
+│
+├── Context Provider
+│   ├── Terminal
+│   ├── Project
+│   ├── Git
+│   ├── Diagnostics
+│   └── Workspace
+│
+├── Tool Provider
+│   ├── Terminal tools
+│   ├── Files
+│   ├── Git
+│   └── MCP
+│
+├── Agent Runtime
+│
+└── Agent UI
+    ├── Panel
+    ├── Workspace
+    ├── Status module
+    └── Rich output
+
+这和 LSP 的思想有点类似：
+
+Neovim
+   ↓
+LSP Client
+   ↓
+Language Server
+
+Bitty 可以是：
+
+Bitty
+   ↓
+Agent Host API
+   ↓
+Model / Agent implementation
+
+Bitty 不应该知道 Claude/OpenAI 的具体逻辑。
+2. 最重要的抽象可能是 ModelProvider
+
+比如定义一个服务：
+
+ai.model
+
+接口概念上：
+
+list_models()
+complete()
+stream()
+cancel()
+
+于是插件：
+
+bitty-openai
+bitty-anthropic
+bitty-gemini
+bitty-ollama
+
+都提供：
+
+ai.model
+
+然后：
+
+bitty-agent
+
+只依赖接口，而不是依赖 OpenAI。
+
+所以用户可以：
+
+ai = {
+    default_provider = "anthropic",
+}
+
+甚至：
+
+coding     → Claude
+quick      → local model
+vision     → Gemini
+
+而 Agent UI 根本不需要变化。
+3. 但我甚至不一定建议 Bitty 官方维护所有 Provider
+
+Bitty 官方更应该维护：
+
+AI Provider API
+Agent API
+Context API
+Tool API
+
+然后生态去实现：
+
+openai
+anthropic
+ollama
+...
+
+官方最多做一个 reference provider。
+
+这样 Bitty 本身不会变成一个巨大的 API compatibility 项目。
+4. 第二个非常重要的抽象：ContextProvider
+
+这个可能比 ModelProvider 更有 Bitty 特色。
+
+AI真正需要的是：
+
+    当前我在哪里？周围正在发生什么？
+
+Bitty 可以统一提供：
+
+Context
+├── current terminal
+├── workspace
+├── other views
+├── project
+├── cwd
+├── git
+├── command history
+├── diagnostics
+└── selected text
+
+例如：
+
+context.workspace()
+
+得到：
+
+Workspace: bitty
+
+View v:1
+  type: terminal
+  cwd: ~/Projects/bitty
+  process: nvim
+
+View v:2
+  type: terminal
+  cwd: ~/Projects/bitty
+  command: cargo test
+  state: running
+
+View v:3
+  type: terminal
+  command: cargo watch
+  last_exit: 0
+
+View v:4
+  type: devtools
+
+这就很强。
+
+普通 AI Terminal 通常只知道：
+
+当前这一个 shell
+
+Bitty 可以知道：
+
+整个 Workspace
+
+5. Stable ID 在这里会发挥巨大价值
+
+你前面说：
+
+InstanceId
+WindowId
+WorkspaceId
+ViewId
+TerminalId
+
+到了 Agent 场景会非常漂亮。
+
+例如用户：
+
+    看一下测试窗口为什么失败了。
+
+Agent 可以识别：
+
+Workspace ws:3
+
+v:1 editor
+v:2 tests
+v:3 server
+
+然后：
+
+read terminal t:tests
+
+而不是靠：
+
+“右边第二个 pane”
+
+这对于自动化特别重要。
+6. Agent 可以直接拥有一个 Workspace
+
+这可能是 Bitty 最有特色的 AI UX。
+
+比如：
+
+Workspace 1: Coding
+
+┌──────────────┬─────────────┐
+│ nvim         │ cargo watch │
+│              │             │
+├──────────────┴─────────────┤
+│ server logs                │
+└────────────────────────────┘
+
+然后：
+
+Workspace 2: Agent
+
+┌────────────────────────────┐
+│ Agent                      │
+│                            │
+│ Investigating test failure │
+│                            │
+│ ✓ read t:test              │
+│ ✓ inspect git diff         │
+│ → analyzing                │
+└────────────────────────────┘
+
+Agent 不一定非得是右侧 Sidebar。
+
+它本身就是：
+
+AgentSurface
+
+或者：
+
+RichSurface
+
+这样就符合你整个 Workspace model。
+7. 甚至一个 Agent 可以管理多个 Pane
+
+例如：
+
+Agent
+ │
+ ├── t:build
+ ├── t:test
+ ├── t:server
+ └── t:logs
+
+状态：
+
+build    ✓
+tests    ✗ 2 failed
+server   ● running
+logs     ⚠ warning
+
+Agent 可以不断观察这些 pane。
+
+这对 AI Coding 非常实用。
+
+例如：
+
+修改代码
+   ↓
+观察 cargo watch
+   ↓
+观察 tests
+   ↓
+观察 server
+   ↓
+如果失败
+   ↓
+继续修改
+
+Bitty 的 Workspace 就自然变成了一个 Agent execution environment。
+8. 但默认只能 Observe
+
+你现在的安全方向非常适合继续保持：
+
+AI / Agent
+   ↓
+read-only
+
+默认可以：
+
+terminal.semantic-read
+project.read
+git.status
+diagnostics.read
+workspace.inspect
+
+不能：
+
+send input
+spawn process
+kill terminal
+modify files
+
+你目前 RFC 已经明确 MCP / Agent 应当默认 read-only，并且 Terminal output 属于 untrusted observation，而不是指令。这个原则对于 AI 部分尤其重要。
+9. Agent 权限最好做成分级
+
+例如：
+Level 0 — Inspect
+
+read terminal
+read workspace
+read diagnostics
+
+Level 1 — Own terminal
+
+Agent 可以拥有自己创建的 terminal：
+
+Agent
+   ↓
+Terminal t:agent-1
+
+只能往自己的 Terminal 输入：
+
+terminal.input.self
+
+这个非常合理。
+Level 2 — Workspace control
+
+经过授权：
+
+create pane
+move pane
+spawn command
+
+Level 3 — Other terminal control
+
+高风险：
+
+send input to arbitrary terminal
+interrupt command
+close terminal
+
+需要明显授权。
+
+这与你现有：
+
+terminal.input.self
+terminal.input.all
+terminal.manage
+
+其实正好吻合。
+10. 一个特别好的模式：Agent 自己创建 Pane
+
+比如用户说：
+
+    帮我检查这个 Rust 项目。
+
+Agent：
+
+Workspace
+├── editor
+├── user shell
+│
+└── Agent-created panes
+    ├── cargo check
+    ├── cargo test
+    └── cargo clippy
+
+这些 terminal 是 Agent 自己拥有的。
+
+因此它可以自由：
+
+input
+interrupt
+restart
+close
+
+但是不能碰：
+
+user shell
+
+这会让权限模型非常清晰：
+
+    Agent 对自己创建的资源拥有更强权限，对用户资源默认只读。
+
+这个原则我非常推荐。
+11. 可以做一个 AgentWorkspace
+
+甚至定义一个标准 provider：
+
+agent.workspace
+
+Agent 可以请求：
+
+workspace.create_ephemeral()
+
+产生：
+
+Workspace: Agent / Task #42
+
+里面：
+
+terminal build
+terminal tests
+terminal server
+rich panel
+
+任务完成后：
+
+Archive
+Close
+Keep
+
+这很像一个临时开发环境。
+12. AI 输出不要回到传统 Terminal Text
+
+这也是 Bitty 可以比别的终端做得漂亮很多的地方。
+
+普通 AI CLI：
+
+PTY
+↓
+ANSI
+↓
+Markdown 看起来勉强能读
+
+Bitty 可以：
+
+LLM token stream
+      ↓
+Streaming Markdown
+      ↓
+RichBlock
+      ↓
+Scene
+
+输出真正的：
+
+    Heading
+
+    CodeBlock
+
+    Table
+
+    List
+
+    Image
+
+    Diff
+
+    Citation
+
+    Tool call card
+
+你当前 Rich Presentation 设计本身就支持 RichBlock → SceneNode，而且明确要求 incremental update，不能每 token 全量重排，非常适合 LLM streaming。
+13. Tool Call 可以成为真正的 Rich UI
+
+比如 Agent：
+
+● Reading terminal t:test
+
+而不是普通文本。
+
+可以显示：
+
+┌─ Tool ─────────────────────────────┐
+│ terminal.read                     │
+│ Target: t:test                    │
+│                                   │
+│ ✓ completed · 23 ms               │
+└───────────────────────────────────┘
+
+或者：
+
+┌─ Command ──────────────────────────┐
+│ cargo test                         │
+│                                   │
+│ Running...                         │
+│ ███████████░░░░░                   │
+└───────────────────────────────────┘
+
+这就是 RichSurface 的价值。
+14. Diff 也应该是一等 RichBlock
+
+比如 Agent 改代码：
+
+src/runtime.rs
+
+展示：
+
+- old
++ new
+
+并提供：
+
+[Accept]
+[Reject]
+[Open]
+
+这就比传统 CLI 输出强很多。
+
+甚至 Plugin API 可以以后标准化：
+
+RichBlock.Diff
+
+15. AI Status Module 也会很好玩
+
+前面说 Statusbar 像 Waybar。
+
+那么 Agent 可以注册：
+
+agent.status
+
+例如：
+
+󰧑 Claude · analyzing
+
+或者：
+
+Agent
+├── ● build
+├── ✓ tests
+└── ↑ 3 tools
+
+Statusbar：
+
+~/bitty │ main │ Agent: analyzing │ CPU 14% │ 22:47
+
+点击以后展开 Agent Panel。
+
+这样 AI 不需要一直占一个 pane。
+16. 桌宠甚至可以和 Agent 状态联动
+
+这就开始非常有 Bitty 风格了。
+
+例如：
+
+Agent idle
+→ 鼯鼠睡觉
+
+Agent thinking
+→ 看书
+
+Agent executing command
+→ 敲键盘
+
+Tests passed
+→ 举手庆祝
+
+Tests failed
+→ 冒汗
+
+Pet plugin 不需要知道 Claude/OpenAI。
+
+它只订阅：
+
+agent.state.changed
+
+这就是插件之间通过标准事件组合的好处。
+17. ContextProvider 还可以让很多插件给 Agent 提供信息
+
+比如：
+
+git plugin
+↓
+context.git
+
+project plugin
+↓
+context.project
+
+activity plugin
+↓
+context.activity
+
+devtools
+↓
+context.runtime
+
+于是：
+
+Agent
+    ↓
+Context Registry
+    ↑
+ ┌──┼─────────────┐
+Git Project Terminal DevTools
+
+Agent 不直接依赖每个插件。
+
+这个模式和前面的 StatusProvider 非常类似。
+18. 甚至可以有 Context Budget
+
+AI 有一个非常现实的问题：
+
+    上下文不是越多越好。
+
+所以 Bitty 可以很自然地做：
+
+ContextRequest {
+    budget: 32 KiB,
+    priority: ...
+}
+
+各个 Context Provider 给：
+
+Project    8 KiB
+Git        4 KiB
+Terminal  12 KiB
+Diagnostics 4 KiB
+
+最后组合。
+
+甚至 provider 返回：
+
+summary
+full
+references
+
+比如 Terminal：
+
+terminal t:test
+summary:
+  cargo test failed
+  2 tests failed
+
+full:
+  bounded terminal snapshot
+
+这会非常适合 Agent。
+19. 可以做“语义上下文”而不是暴力抓屏
+
+这一点 Bitty 有天然优势。
+
+不要：
+
+Agent
+↓
+截图 OCR
+
+或者：
+
+整个 scrollback 全塞进去
+
+而是：
+
+SemanticZone
+├── command
+├── cwd
+├── output
+├── exit status
+└── duration
+
+比如：
+
+Command
+  cargo test
+
+Result
+  exit = 101
+  duration = 4.3s
+
+Output
+  failures:
+    foo::test_a
+    bar::test_b
+
+这比纯文本上下文质量高很多。
+20. 可以做一个 Command Intelligence 插件
+
+这是比聊天框更像 Terminal 的 AI 功能。
+
+例如用户输入：
+
+ffmpeg ...
+
+插件可以：
+
+Explain
+Suggest
+Fix
+Optimize
+
+但不要直接修改 Terminal input。
+
+比如：
+
+$ ffmpeg ...
+
+[Explain] [Optimize] [Save as snippet]
+
+或者 command failed：
+
+exit 1
+
+AI:
+This appears to be caused by ...
+
+显示为一个 pinned RichBlock。
+21. Failure Assistant 会非常实用
+
+插件：
+
+bitty-terminal.failure-assistant
+
+监听：
+
+command.finished
+exit != 0
+
+然后：
+
+cargo build
+↓
+failed
+↓
+[Explain failure]
+
+只有用户点击才把：
+
+command
+bounded output
+cwd
+project metadata
+
+送给模型。
+
+这样比每次失败都自动消耗 token 更合理。
+22. Command Planner
+
+用户输入自然语言：
+
+把当前目录所有 PNG 压缩到一半大小
+
+Agent 不直接执行。
+
+先生成：
+
+find . -name '*.png' -exec ...
+
+展示：
+
+Plan
+
+1. Find PNG files
+2. Resize images
+3. Preserve originals
+
+Command:
+...
+
+[Run in new pane]
+[Copy]
+[Cancel]
+
+我特别推荐：
+
+    默认 Run in new pane
+
+而不是直接在当前 shell 输入。
+
+这样 Agent-created terminal 的权限边界又发挥作用了。
+23. 还可以有很有特色的 Observe Mode
+
+例如：
+
+bitty agent watch t:test
+
+Agent不执行任何操作。
+
+只观察：
+
+tests
+build
+logs
+
+然后在异常时：
+
+⚠ server log detected repeated 500 errors
+
+这特别适合：
+
+long-running jobs
+server
+build
+training
+
+而且安全风险低很多。
+24. “知识图谱 + Agent”会非常有意思
+
+你之前说 activity knowledge graph。
+
+Agent 可以利用：
+
+Project
+├── commands
+├── sessions
+├── files
+├── failures
+└── tools
+
+形成长期 local context。
+
+例如：
+
+Bitty project
+
+cargo test
+   ↓ often fails after
+database migration
+
+npm dev
+   ↓ usually paired with
+localhost:5173
+
+然后 Agent 的上下文不是只有当前 Session。
+
+而是：
+
+    Bitty 本地积累的开发活动知识。
+
+当然这个必须 privacy-first，而且最好默认 local-only。
+25. 还可以有 Agent Timeline
+
+类似：
+
+10:31 User asked: fix tests
+10:31 Agent read t:test
+10:32 Agent opened project context
+10:33 Agent spawned t:agent-1
+10:33 cargo test
+10:34 modified ...
+10:35 tests passed
+
+这个其实和 DevTools trace 非常接近。
+
+可以：
+
+Agent activity
+↓
+Observability infrastructure
+
+而不是自己重新发明日志系统。
+26. Multi-Agent 甚至天然适配 Workspace
+
+以后如果真的做多 Agent：
+
+Workspace: Feature #42
+
+Agent: Architect
+Agent: Coder
+Agent: Reviewer
+
+可以是：
+
+┌─────────────┬─────────────┐
+│ Architect   │ Reviewer    │
+│             │             │
+├─────────────┴─────────────┤
+│ Coder terminal            │
+└───────────────────────────┘
+
+甚至 Statusbar：
+
+Agents: 3
+● coder
+✓ reviewer
+○ architect
+
+但是这些完全可以后做。
+
+Bitty Core 不需要知道什么叫 multi-agent。
+27. MCP 在这里就是 Tool Bus
+
+你的 MCP 设计以后可以承担：
+
+External Tool Provider
+
+比如：
+
+Agent
+  │
+  ├── Bitty native tools
+  │   ├── terminal
+  │   ├── workspace
+  │   └── project
+  │
+  └── MCP
+      ├── GitHub
+      ├── database
+      ├── docs
+      └── browser
+
+所以：
+
+    MCP 不应该等于 AI。
+
+它只是 Agent Tool Bus 的一种来源。
+28. Browser Surface 和 Agent 也可以组合
+
+以后 Web 开发：
+
+Workspace
+
+┌─────────────┬─────────────┐
+│ nvim        │ Browser     │
+│             │ localhost   │
+├─────────────┼─────────────┤
+│ server      │ Agent       │
+└─────────────┴─────────────┘
+
+Agent：
+
+code
+↓
+server
+↓
+browser
+
+形成完整 loop。
+
+不过 Browser Surface 本身复杂，适合 post-1.0。
+29. 我认为最值得做的 AI 插件不是 Chat
+
+如果按照“特色程度 + 实用价值”排序，我会更推荐：
+
+    Failure Assistant
+
+        对失败 command 做解释。
+
+    Agent Workspace
+
+        Agent 自己创建/管理 terminals。
+
+    Workspace Observer
+
+        跨多个 pane 观察 build/test/server。
+
+    Streaming Markdown / Rich Agent UI
+
+        真正利用 Bitty Rich Presentation。
+
+    Command Planner
+
+        自然语言 → plan → 用户批准 → Agent-owned terminal。
+
+    Context Hub
+
+        聚合 Terminal / Git / Project / DevTools context。
+
+    Agent Status Provider
+
+        Waybar-style AI state。
+
+    Agent Timeline
+
+        可审计的 action trace。
+
+而不是先做：
+
+Ctrl+L
+→ AI chat
+
+因为那个几乎任何 Terminal 都可以做。
+30. 最后我会形成这样一套 AI 架构
+
+                     Bitty Core
+                        │
+        ┌───────────────┼────────────────┐
+        │               │                │
+   Workspace API   Terminal API     Rich UI API
+        │               │                │
+        └───────────────┬┴────────────────┘
+                        │
+                   Agent Host
+                        │
+           ┌────────────┼────────────┐
+           │            │            │
+       Context       Tools       Model API
+       Registry      Registry     Provider
+           │            │            │
+      ┌────┼────┐       │       ┌────┼────┐
+      │    │    │       │       │    │    │
+   Git Project Term    MCP    OpenAI Claude Local
+                        │
+                        ▼
+                   Agent Runtime
+                        │
+              ┌─────────┼─────────┐
+              │         │         │
+            Panel     Status    Workspace
+
+而 Bitty Core 本身：
+
+完全不知道 LLM 是什么
+
+这反而是最健康的。
+
+它只知道：
+
+Terminal
+Workspace
+View
+Command
+Event
+Capability
+IPC
+RichBlock
+
+AI 只是这些 primitive 上面非常强大的一个 consumer。
+
+我认为这会让 Bitty 和所谓的 “AI Terminal” 区别非常明显：**不是把 AI 塞进终端，而是先把终端变成一个结构化、可观察、可控制的 Workspace Runtime，然后让 Agent 成为这个 Runtime 的一种插件。**这条路线会耐用得多。
+
+那么有些插件虽然是用 lua 写的，但是可能会调用别的实现好的库吗？比如搜索部分是否需要集成 television, rg 之类的呢？而不是自己手动去写一整套代码呢？也就是很多部分如果是有现成的，那么就不自己来实现了呢？这部分要如何设计呢？
+
+是的，而且我认为这个原则应该直接成为 Bitty 插件生态的一条设计原则：
+
+    Lua 负责 glue / orchestration / policy / UX；已经成熟的底层能力优先复用，而不是为了“插件是 Lua 写的”就全部重新实现。
+
+但同时不能变成：
+
+os.execute("随便什么命令")
+
+否则你现在已经设计好的 sandbox、capability、package integrity 基本都被绕过去了。Bitty 当前 Lua RFC 也已经明确禁止 os.execute、io.popen、native .so/.dll 动态加载；所有 privileged work 必须通过 bitty host bridge。
+
+所以我会把复用能力设计成 4 个等级。
+1. 第一层：Pure Lua Library
+
+最简单。
+
+例如一个插件：
+
+bitty-plugin/
+├── bitty-plugin.toml
+├── init.lua
+└── lua/
+    ├── parser.lua
+    ├── utils.lua
+    └── json.lua
+
+插件内部：
+
+local parser = require("parser")
+
+完全没问题。
+
+你当前 RFC 已经规定每个 Plugin VM 只能 require 自己 rooted module tree 中的模块，不允许跨插件乱找，也不允许 native package.cpath。这正适合这种模式。
+
+以后可以允许构建阶段把纯 Lua dependency vendor 进插件：
+
+plugin source
+   ↓
+package build
+   ↓
+resolved Lua dependencies
+   ↓
+plugin artifact
+
+但我不建议一开始再创造一个完整的 luarocks 替代品。
+
+先做：
+
+Plugin artifact contains all Lua source dependencies
+
+就够了。
+2. 第二层：调用系统已有 CLI
+
+这个会是 Bitty 非常重要的一种插件模式。
+
+比如：
+
+rg
+fd
+git
+bat
+jq
+delta
+tv
+fzf
+gh
+docker
+kubectl
+
+这些全部已经解决了大量复杂问题。
+
+例如 Project Search：
+
+Bitty Search Plugin
+        │
+        ├── Lua
+        │   query / state / UX
+        │
+        ▼
+     ProcessService
+        │
+        ▼
+   rg --json ...
+        │
+        ▼
+ structured results
+        │
+        ▼
+ Bitty Overlay / Panel
+
+这比用 Lua 自己实现 recursive filesystem walker + regex engine + .gitignore support 好得多。
+
+ripgrep 本身就是成熟的递归 regex 搜索工具，自动处理 .gitignore、hidden/binary filtering 等，而且有稳定的 --json 机器可读输出，非常适合集成到另一个程序里。
+3. 但不要让 Lua 直接 spawn
+
+你现在其实已经有很适合的 capability：
+
+process.spawn:CONSTRAINT
+
+而且 RFC 明确规定必须限制 program + argument shape，不能 arbitrary spawn。
+
+所以 Lua 最终应该类似：
+
+local result = bitty.process.spawn({
+    program = "rg",
+    args = {
+        "--json",
+        query,
+        root,
+    },
+})
+
+Host 检查：
+
+Plugin manifest
+     ↓
+process.spawn:rg(...)
+     ↓
+capability check
+     ↓
+allowed?
+     ↓
+spawn
+
+而不是：
+
+os.execute(...)
+io.popen(...)
+
+4. Manifest 最好明确声明 External Tool
+
+我会考虑以后扩展：
+
+[tools.rg]
+command = "rg"
+version = ">=14"
+required = true
+
+[tools.fd]
+command = "fd"
+version = ">=10"
+required = false
+
+[tools.tv]
+command = "tv"
+required = false
+
+然后：
+
+bitty plugin doctor search
+
+可以输出：
+
+bitty-terminal.search
+
+Dependencies
+
+✓ rg  14.1.1
+✓ fd  10.2.0
+○ tv  not installed (optional)
+
+Status: ready
+
+这样会比插件启动以后突然：
+
+command not found: rg
+
+专业很多。
+5. Required 和 Optional 很重要
+
+比如 Search Plugin：
+
+[tools.rg]
+required = true
+
+[tools.tv]
+required = false
+
+那么：
+
+rg missing
+→ Search plugin unavailable
+
+tv missing
+→ Bitty native picker fallback
+
+这非常符合 Linux 软件生态。
+
+用户安装：
+
+pacman -S ripgrep television
+
+Bitty 自动发现。
+6. 不过 television 和 rg 扮演的角色并不相同
+
+这里需要区分。
+
+rg 更像：
+
+    search engine/backend
+
+Television 更像：
+
+    interactive fuzzy finder application/framework
+
+Television 现在本身就支持 file、text、Git repositories、environment、Docker 等各种 channel，并且有自己的 source / preview / action 模型。
+
+所以对于：
+
+bitty-terminal.search
+
+我反而不建议：
+
+Bitty
+→ spawn television TUI
+→ Television 画 UI
+
+作为默认实现。
+
+否则你前面设计那么漂亮的：
+
+Overlay
+Rich UI
+Picker
+Panel
+
+就没意义了。
+7. 更好的 Project Search 架构
+
+我会这样：
+
+                     Search Plugin
+                          │
+              ┌───────────┴───────────┐
+              │                       │
+          SearchSource             Picker UI
+              │                       │
+              ▼                       ▼
+          ripgrep                 Bitty UI
+          fd                     Overlay
+          git                    RichList
+              │
+              ▼
+        SearchResult[]
+
+即：
+
+rg = backend
+
+Bitty = frontend
+
+例如：
+
+Ctrl+Shift+F
+
+出现：
+
+┌ Search project ──────────────────────┐
+│ > PluginCapabilities                 │
+├──────────────────────────────────────┤
+│ plugin-platform-rfc.md:123           │
+│ core-boundaries.md:87                │
+│ security-overview.md:205             │
+│ ...                                  │
+├──────────────────────────────────────┤
+│ Preview                              │
+│                                      │
+│ pub struct PluginCapabilities {      │
+│     ...                              │
+│ }                                    │
+└──────────────────────────────────────┘
+
+背后：
+
+rg --json PluginCapabilities .
+
+但用户根本不需要知道是 rg。
+8. Television 更适合作为另一个 Provider
+
+因为 Television 自己的一个很好思想就是：
+
+Channel
+
+例如：
+
+files
+text
+git-repos
+env
+docker
+
+Bitty 完全可以吸收这个思想：
+
+PickerProvider
+├── files
+├── project-text
+├── commands
+├── terminals
+├── workspaces
+├── git-branches
+├── processes
+└── plugins
+
+甚至：
+
+bitty.picker.register({
+    id = "docker.containers",
+    source = ...
+})
+
+这相当于：
+
+    Television channel philosophy + Rofi provider + Neovim Telescope source
+
+而 UI 仍然完全是 Bitty Native。
+
+这可能比“集成 Television 程序”更好。
+9. 当然，也可以提供 television Adapter
+
+比如：
+
+bitty-terminal.television
+
+这个插件负责：
+
+tv channel
+→ Bitty command
+
+例如：
+
+bitty palette
+
+Television: files
+Television: text
+Television: git repos
+
+执行时：
+
+open temporary View
+      ↓
+tv text
+
+这也很合理。
+
+所以：
+
+Native Search Plugin
+→ rg backend
+
+TV Integration Plugin
+→ television external application
+
+两者甚至可以同时存在。
+10. fuzzy matching 本身也不应该用 Lua 重写
+
+例如：
+
+100,000 files
+↓
+fuzzy query
+↓
+60 FPS picker
+
+让 Lua：
+
+for every candidate
+    calculate fuzzy score
+end
+
+并不是好方案。
+
+这里有三个选择。
+A. Host Service
+
+Bitty Core 提供：
+
+fuzzy.match
+
+由 Rust 实现。
+
+例如使用：
+
+nucleo
+skim matcher
+
+插件：
+
+bitty.fuzzy.filter(query, candidates)
+
+优点：
+
+    快
+
+    跨平台
+
+    不需要 process
+
+    适合很多插件
+
+如果多个插件都会用：
+
+palette
+search
+project
+workspace-switcher
+command picker
+file picker
+
+那么 fuzzy matching 已经变成了一种 common UI primitive。
+
+这个我认为值得进入 host service。
+11. 判断是否应该进入 Core Service 的方法
+
+还是你之前那条原则的扩展版：
+
+    不是看“有没有现成 Rust crate”，而是看它是不是多个插件共同需要的通用机制。
+
+例如：
+
+fuzzy matcher
+
+很多插件都用：
+
+→ 可以进入 Core/host service。
+
+但是：
+
+GitHub API client
+
+只有 GitHub plugin 用：
+
+→ 不应该进 Core。
+
+ripgrep
+
+Project Search 特别需要：
+
+→ 外部 tool / helper 即可。
+12. 第三层：Plugin Service
+
+这个其实是你当前 Plugin API 很有潜力的地方。
+
+你已经支持：
+
+[services.provided]
+"markdown.render" = "1.0"
+
+以及 plugin dependencies。
+
+所以以后可以出现：
+
+bitty-terminal.git
+        │
+        └── service: git.v1
+
+bitty-terminal.project
+        │
+        └── consume git.v1
+
+bitty-terminal.statusline
+        │
+        └── consume git.v1
+
+bitty-terminal.agent
+        │
+        └── consume git.v1
+
+而不是每个插件：
+
+spawn git
+parse git
+spawn git
+parse git
+spawn git
+parse git
+
+重复五遍。
+13. 比如可以有一个 git-core Plugin
+
+甚至没有 UI。
+
+bitty-terminal.git-core
+
+只提供：
+
+git.repository
+git.status
+git.branch
+git.diff
+git.log
+
+它自己底层：
+
+git CLI
+
+或者：
+
+libgit2 helper
+
+使用者不用关心。
+
+然后：
+
+statusline
+project
+palette
+activity
+agent
+
+都只依赖：
+
+git.v1
+
+这个模式会非常强。
+14. 第四层：Native Helper Process
+
+这是解决“Lua 不够快 / 需要 native library”的最终方案。
+
+比如某个插件真的需要：
+
+Tree-sitter
+SQLite
+FFmpeg
+ONNX Runtime
+Chromium
+complex indexing engine
+
+千万不要：
+
+Lua Plugin
+  ↓
+dlopen libfoo.so
+
+你的 RFC 已经明确禁止 native in-process plugin 和 package.loadlib，这是应该坚持的。
+
+而应该：
+
+Lua Plugin
+    │
+    │ bounded IPC
+    ▼
+Helper Process
+    │
+    ├── Rust
+    ├── C++
+    ├── Go
+    └── Python
+
+15. 比如 Markdown 高级解析器
+
+假设以后 Lua Markdown parser 性能不够。
+
+可以：
+
+bitty-terminal.markdown
+        │
+        │ service IPC
+        ▼
+bitty-markdown-helper
+        │
+        └── Rust parser
+
+返回：
+
+AST / RichBlock model
+
+Lua 负责：
+
+when
+where
+settings
+commands
+events
+
+Rust helper 负责：
+
+heavy parsing
+
+16. Package Manager 最终可以管理 Helper
+
+未来可以扩展 manifest，例如概念上：
+
+[[helpers]]
+id = "search-engine"
+
+[helpers.linux-x86_64]
+path = "bin/search-linux-x86_64"
+sha256 = "..."
+
+[helpers.windows-x86_64]
+path = "bin/search.exe"
+sha256 = "..."
+
+[helpers.macos-aarch64]
+path = "bin/search-macos-arm64"
+sha256 = "..."
+
+安装：
+
+Plugin Package
+   ↓
+verify checksum/signature
+   ↓
+stage
+   ↓
+NO EXECUTION
+
+运行：
+
+Plugin
+  ↓
+Host
+  ↓ capability
+spawn helper
+
+这样依然符合你现在：
+
+    installation runs no code
+
+的安全原则。
+
+不过我会把这种 bundled native helper 放到 Plugin API v2 / post-1.0，第一版先靠 system tools + Lua + Plugin Services。
+17. 不要直接 embed 第三方 Rust crate 到 Bitty Core
+
+这是一个非常容易膨胀的坑。
+
+例如看到：
+
+television 是 Rust
+ripgrep 是 Rust
+bat 是 Rust
+gitoxide 是 Rust
+
+然后开始：
+
+Bitty Cargo.toml
+
+television = ...
+grep = ...
+gitoxide = ...
+bat = ...
+...
+
+最后：
+
+Terminal Core
+↓
+变成巨大 application framework
+
+这与 Bitty small core 的理念冲突。
+
+例如 Television 当前确实有 Rust library target，但它本质仍然是一整个 fuzzy finder application，依赖 Tokio、Ratatui 等不少组件。
+
+所以不能因为：
+
+它提供 lib crate
+
+就认为：
+
+应该 link 到 Bitty
+
+18. 我会使用这样的判断矩阵
+能力	最佳复用方法
+小型 Lua utility	vendor Pure Lua
+fuzzy scoring	Host service / Rust primitive
+project text search	rg --json
+file enumeration	fd / Core service
+Git	Git plugin service + git CLI
+fuzzy TUI	Television integration plugin
+JSON	Pure Lua / Host serialization
+syntax parse	Tree-sitter helper/service
+SQLite	host storage API，避免插件自己载入 SQLite
+FFmpeg	external process/helper
+Browser	out-of-process helper
+AI provider	network service/plugin
+image decode	Core
+terminal scrollback search	Core snapshot/search primitive
+project filesystem search	rg
+
+这里最后两个尤其应该分开。
+19. Terminal Search 和 Project Search 其实不是一个东西
+
+例如：
+
+Ctrl+Shift+F
+
+搜索当前 Terminal scrollback：
+
+TerminalSnapshot
+↓
+Search API
+
+没必要启动 rg。
+
+因为数据：
+
+    已经在内存
+
+    不是文件
+
+    需要高频交互
+
+    需要绑定 line ID / selection
+
+    需要高亮结果
+
+这应该由 Core 提供基本 search primitive，然后 Search Plugin 做 UI。
+
+而：
+
+Search in Project
+
+才是：
+
+rg --json
+
+非常合适。
+
+所以可能最终：
+
+bitty-terminal.search
+├── terminal
+│   └── Core Search Service
+│
+└── project
+    └── Ripgrep Provider
+
+用户看起来还是统一 Search。
+20. 最终可以形成 Bitty 的 Provider 生态
+
+这个其实和我们前面讨论 Status/AI 非常一致。
+
+Picker
+    │
+    └── providers
+        ├── files
+        ├── rg
+        ├── commands
+        ├── history
+        ├── workspaces
+        ├── terminals
+        ├── git
+        └── television
+
+统一接口大概：
+
+Provider
+├── query()
+├── preview()
+├── actions()
+└── cancel()
+
+然后：
+
+Picker UI
+
+完全不知道底层数据来自：
+
+rg
+Lua
+Rust
+Git
+IPC
+MCP
+
+这才是最重要的抽象。
+21. 我认为 Bitty 应该明确提出一个原则
+
+可以叫：
+Reuse below, compose above
+
+也就是：
+
+成熟算法 / 系统工具
+        ↓
+       复用
+        ↓
+Host Service / External Tool / Helper
+        ↓
+      Lua Plugin
+        ↓
+ orchestration / policy
+        ↓
+   Bitty Native UI
+
+例如 Search：
+
+ripgrep
+   ↓
+Search Provider
+   ↓
+Lua Plugin
+   ↓
+Bitty Picker / Overlay
+
+Git：
+
+git
+ ↓
+Git Service
+ ↓
+Lua plugins
+ ├── Statusline
+ ├── Project
+ ├── Palette
+ └── Agent
+
+这样你就不会掉进“为了插件化而重新实现整个 Unix 用户空间”的坑。
+
+Bitty 应该自己实现的是自己的核心抽象和 integration layer，而不是重新实现 rg、git、ffmpeg、fuzzy finder、browser engine 这些已经非常成熟的东西。
+
+这也其实非常符合 Unix philosophy：Bitty 不是替代 Linux 工具，而是把这些工具变成可组合的 Workspace capabilities。
+

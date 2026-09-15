@@ -1,0 +1,646 @@
+看了现在 `bitty` 的 `release.yml`、`nfpm.yaml`、`PKGBUILD` 和 packaging 目录后，我觉得**现在不需要继续疯狂增加发行版数量**，而应该把现有发行体系从“能生成包”整理成“每个平台真的正确、可测试、语义清楚”。
+
+目前 Bitty 已经有 `deb / rpm / apk / archlinux`、AUR、Homebrew、Scoop、Nix 等基础设施，方向其实已经很完整。
+
+## 我建议现在把支持矩阵定成这样
+
+| Platform          | Arch    | Artifact / Package                        | 当前优先级               |
+| ----------------- | ------- | ----------------------------------------- | ------------------- |
+| Linux glibc       | x86_64  | binary / `.deb` / `.rpm` / `.pkg.tar.zst` | **Tier 1**          |
+| Linux glibc       | aarch64 | binary / `.deb` / `.rpm`                  | **Tier 1，马上补**      |
+| Alpine Linux musl | x86_64  | `.apk`                                    | **Tier 1/2，修正构建方式** |
+| Alpine Linux musl | aarch64 | `.apk`                                    | 后续                  |
+| macOS             | aarch64 | binary → `.app/.dmg`                      | **Tier 1**          |
+| macOS             | x86_64  | binary → `.app/.dmg`                      | Tier 1/2            |
+| Windows           | x86_64  | `.exe` → installer                        | **Tier 1**          |
+| Windows           | ARM64   | `.exe`                                    | Tier 2              |
+| FreeBSD           | x86_64  | binary/package                            | 后续                  |
+| 32-bit / RISC-V   | -       | -                                         | 暂不做                 |
+
+这里 **x86_64 + ARM64 就够了**。Rust 官方本身把 `aarch64-unknown-linux-gnu` 作为 Tier 1 with Host Tools target，因此 Linux ARM64 完全值得成为 Bitty 的正式 target。([Rust 文档][1])
+
+---
+
+## 1. 你现在其实已经写了 Linux ARM64，但 matrix 漏掉了
+
+这是我看 workflow 时发现一个挺明确的问题。
+
+你的 `release.yml` 已经写了：
+
+```yaml
+if: matrix.target == 'aarch64-unknown-linux-gnu'
+```
+
+以及：
+
+```text
+cross
+gcc-aarch64-linux-gnu
+g++-aarch64-linux-gnu
+libfontconfig1-dev:arm64
+libfreetype6-dev:arm64
+```
+
+甚至后面还有针对 ARM64 缺少 artifact 的 tolerant handling。
+
+**但是 build matrix 里实际没有：**
+
+```yaml
+- os: ubuntu-latest
+  target: aarch64-unknown-linux-gnu
+  arch: arm64
+```
+
+当前 matrix 只有 Linux x86_64、Windows x86_64/ARM64、macOS x86_64/ARM64。
+
+所以第一件事就是把这个 target 真正接进去：
+
+```yaml
+- os: ubuntu-22.04
+  target: aarch64-unknown-linux-gnu
+  arch: arm64
+  packagers: "deb,rpm"
+```
+
+这样你之前写的那一大段 ARM64 cross compilation 才真正被执行。
+
+---
+
+## 2. `.apk` 是 Alpine 包没错，但现在需要修的是“里面装了什么”
+
+你前面说得对：
+
+```text
+.apk = Alpine Linux package
+```
+
+问题不在扩展名。
+
+问题在于当前 workflow：
+
+```text
+x86_64-unknown-linux-gnu
+        ↓
+cargo build
+        ↓
+target/.../bitty
+        ↓
+nfpm
+        ├── deb
+        ├── rpm
+        ├── apk
+        └── archlinux
+```
+
+也就是说目前 `.apk` 和 `.deb` 实际塞进去的是**同一个 `x86_64-unknown-linux-gnu` binary**。
+
+而 Alpine 的正常 runtime 是 musl。
+
+所以我建议把它拆开：
+
+```text
+Linux glibc:
+x86_64-unknown-linux-gnu
+├── deb
+├── rpm
+└── pkg.tar.zst
+
+Alpine:
+x86_64-unknown-linux-musl
+└── apk
+```
+
+Rust 官方也直接提供 `aarch64-unknown-linux-musl` 等 musl target。([Rust 文档][2])
+
+不过对于 Bitty 这种 terminal emulator，我甚至更倾向：
+
+> **Alpine package 在 Alpine container / VM 里 native build。**
+
+而不是强行从 Ubuntu cross compile。
+
+因为 Bitty 不只是纯 Rust CLI，还涉及 fontconfig、FreeType、graphics/windowing 等 native dependency。用：
+
+```yaml
+container: alpine:latest
+```
+
+安装：
+
+```bash
+apk add \
+  build-base \
+  rust \
+  cargo \
+  fontconfig-dev \
+  freetype-dev \
+  pkgconf
+```
+
+然后 native build，会省掉很多 musl cross-compilation 的坑。
+
+---
+
+## 3. 把 `.archlinux` 改成真正的 `.pkg.tar.zst`
+
+这个现在也很好修。
+
+你 validation 阶段其实已经正确写了：
+
+```bash
+--target /tmp/bitty.pkg.tar.zst
+```
+
+但是正式 release 阶段却写成：
+
+```bash
+--target "dist/bitty-${target}.${pkg}"
+```
+
+因此 `pkg=archlinux` 最终就成了：
+
+```text
+bitty-x86_64-unknown-linux-gnu.archlinux
+```
+
+建议正式输出：
+
+```text
+bitty-0.0.21-1-x86_64.pkg.tar.zst
+```
+
+或者至少：
+
+```text
+bitty-x86_64-unknown-linux-gnu.pkg.tar.zst
+```
+
+这样用户直接：
+
+```bash
+sudo pacman -U bitty-*.pkg.tar.zst
+```
+
+就很自然。
+
+---
+
+## 4. 不建议一个 `nfpm.yaml` 粗暴覆盖所有 distro
+
+现在 `nfpm.yaml` 的结构基本是：
+
+```yaml
+name: bitty
+arch: amd64
+platform: linux
+
+contents:
+  /usr/bin/bitty
+  LICENSE
+  README
+  CHANGELOG
+  desktop
+  icons
+```
+
+只有少量 `deb/rpm/archlinux` metadata，没有真正按发行版区分依赖。
+
+短期可以继续用 nFPM，但应该逐渐改成：
+
+```text
+packaging/
+├── linux/
+│   ├── common/
+│   │   ├── bitty.desktop
+│   │   ├── metainfo.xml
+│   │   └── icons/
+│   │
+│   ├── deb/
+│   │   └── nfpm.yaml
+│   ├── rpm/
+│   │   └── nfpm.yaml
+│   ├── alpine/
+│   │   └── nfpm.yaml / APKBUILD
+│   └── arch/
+│       ├── PKGBUILD
+│       └── PKGBUILD.bin
+│
+├── macos/
+└── windows/
+```
+
+因为以后各发行版的 dependency name 很容易不同：
+
+```text
+Debian       libfontconfig1 / libfreetype6
+Arch         fontconfig / freetype2
+Fedora       fontconfig / freetype
+Alpine       fontconfig / freetype
+```
+
+不要到后面把一个 `nfpm.yaml` 写成一堆条件。
+
+---
+
+## 5. 当前真正应该补的是 package dependency verification
+
+你的 Arch PKGBUILD 已经明确：
+
+```bash
+depends=('fontconfig' 'freetype2')
+```
+
+但 nFPM package 目前没有相应的 runtime dependency declaration。
+
+建议 CI 在生成 binary 后检查：
+
+```bash
+ldd ./bitty
+readelf -d ./bitty
+```
+
+然后真正确定 Bitty runtime 依赖哪些 shared library。
+
+再分别声明。
+
+不要凭印象直接加 Wayland/X11/wgpu 一大堆依赖，应该以最终 binary 的动态链接结果为准。
+
+---
+
+# 6. 每一种 package 都应该真的安装后启动一次
+
+这是比“能生成 package”重要得多的事情。
+
+现在 validation 基本是：
+
+```text
+nfpm package 成功
+```
+
+但：
+
+> 能打包 ≠ 能安装 ≠ 能运行。
+
+建议 CI 加：
+
+```text
+Build
+ ↓
+Package
+ ↓
+Clean distro container
+ ↓
+Install
+ ↓
+bitty --version
+ ↓
+bitty doctor
+ ↓
+headless smoke test
+```
+
+你现在 Bitty 已经有 `bitty doctor`，正好特别适合干这个；最新 release 也已经加入 installation/compatibility diagnosis。([GitHub][3])
+
+例如：
+
+```text
+Ubuntu container
+    dpkg -i bitty.deb
+    bitty --version
+    bitty doctor
+
+Fedora container
+    dnf install ./bitty.rpm
+    ...
+
+Arch container
+    pacman -U ./bitty.pkg.tar.zst
+    ...
+
+Alpine container
+    apk add --allow-untrusted ./bitty.apk
+    ...
+```
+
+这会让你的 packaging 质量提高非常多。
+
+---
+
+## 7. `terminfo` 现在要尽快正式做掉
+
+这个我检查仓库时发现，目前：
+
+```text
+terminfo/bitty.terminfo
+```
+
+内容实际上还是：
+
+```text
+# dummy terminfo for nfpm validation
+```
+
+但 PKGBUILD 已经存在安装逻辑：
+
+```bash
+install ... terminfo/bitty.terminfo \
+    "$pkgdir/usr/share/terminfo/b/bitty"
+```
+
+这个在正式发行前应该修掉。
+
+如果 Bitty 最终：
+
+```bash
+TERM=bitty
+```
+
+那么需要真正定义：
+
+```text
+bitty,
+    ...
+```
+
+然后用：
+
+```bash
+tic bitty.terminfo
+```
+
+编译成 terminfo database entry。
+
+如果 Bitty 当前其实打算：
+
+```bash
+TERM=xterm-256color
+```
+
+那么反而暂时**不要安装假的 `bitty` terminfo**。
+
+这个比增加更多发行版重要。
+
+---
+
+# 8. Linux Desktop integration 再补一个 AppStream metadata
+
+你已经有：
+
+```text
+.desktop
+icons
+```
+
+而且 desktop entry 本身已经有：
+
+```ini
+Exec=bitty
+Icon=bitty
+Terminal=false
+Categories=System;TerminalEmulator;
+```
+
+下一步建议加：
+
+```text
+/usr/share/metainfo/<app-id>.metainfo.xml
+```
+
+也就是 AppStream metadata。
+
+这样 GNOME Software、KDE Discover 等 GUI software center 才能更完整地识别：
+
+* 应用名称
+* 描述
+* icon
+* screenshots
+* homepage
+* release info
+* license
+* categories
+
+而且我建议**现在就确定稳定的 Linux application ID**。
+
+比如如果确定长期使用 `bitty.run`：
+
+```text
+run.bitty.Bitty
+```
+
+那么以后可以统一：
+
+```text
+run.bitty.Bitty.desktop
+run.bitty.Bitty.metainfo.xml
+Wayland app_id
+DBus name（如果以后需要）
+Flatpak ID（如果以后做）
+```
+
+这种 ID 一旦生态建立以后再改，会比较麻烦。
+
+---
+
+# 9. Release binary 本身建议压缩，不要裸文件为主
+
+现在：
+
+```text
+bitty-x86_64-unknown-linux-gnu
+bitty-aarch64-apple-darwin
+```
+
+直接裸 binary 是能用，但随着以后 resources 增加，不够扩展。
+
+建议改成：
+
+```text
+bitty-0.0.21-x86_64-unknown-linux-gnu.tar.zst
+```
+
+里面：
+
+```text
+bitty/
+├── bin/bitty
+├── share/
+│   ├── applications/
+│   ├── icons/
+│   └── ...
+├── LICENSE
+├── README.md
+└── CHANGELOG.md
+```
+
+Windows：
+
+```text
+bitty-0.0.21-x86_64-pc-windows-msvc.zip
+```
+
+macOS 后面直接：
+
+```text
+Bitty-0.0.21-universal.dmg
+```
+
+裸 binary 可以继续保留一段时间，但不一定长期作为 primary artifact。
+
+---
+
+# 10. macOS 下一阶段应该优先于继续增加 Linux distro
+
+你现在已经同时 build：
+
+```text
+aarch64-apple-darwin
+x86_64-apple-darwin
+```
+
+GitHub Release 也确实有两个 binary。([GitHub][3])
+
+现在最值得做的不是再支持 Gentoo、Void、Solus，而是：
+
+```text
+Bitty.app
+   ↓
+Universal 2
+   ↓
+codesign
+   ↓
+notarize
+   ↓
+Bitty.dmg
+```
+
+最终普通 macOS 用户应该看到：
+
+```text
+Bitty-0.1.0-macos-universal.dmg
+```
+
+而不是去思考：
+
+> 我的 Mac 是 `aarch64-apple-darwin` 还是 `x86_64-apple-darwin`？
+
+---
+
+# 11. Windows 同理，先从 binary 演进到 application distribution
+
+目前 Windows：
+
+```text
+x86_64-pc-windows-msvc.exe
+aarch64-pc-windows-msvc.exe
+```
+
+已经够早期开发者使用。
+
+下一阶段：
+
+```text
+Portable ZIP
+├── bitty.exe
+├── LICENSE
+└── ...
+
+Installer
+└── BittySetup.exe
+```
+
+但是 installer 可以稍后。
+
+我会先做：
+
+```text
+bitty-0.0.21-windows-x86_64.zip
+```
+
+比现在裸 `.exe` 更规范。
+
+然后稳定后再考虑：
+
+```text
+MSIX / MSI / setup.exe
+winget
+```
+
+---
+
+# 12. 不建议现在继续增加这些发行版
+
+现阶段我不会做：
+
+```text
+Flatpak
+Snap
+Gentoo ebuild
+Void xbps
+Solus
+Nix official nixpkgs
+FreeBSD ports
+OpenBSD ports
+```
+
+你已经有 `flake.nix` validation，AUR、Homebrew、Scoop 也已经进入 release pipeline。
+
+已经足够。
+
+继续横向增加只会造成：
+
+```text
+10 个 package format
+×
+2 architectures
+×
+dependency changes
+×
+每次 release
+```
+
+维护成本指数上升。
+
+Bitty 目前真正需要的是**纵向把现有几个做正确**。
+
+---
+
+# 我会直接把近期发行工作排成这个顺序
+
+1. **补上 Linux ARM64 matrix**，启用已经写好的 cross-build 逻辑。
+2. **Alpine `.apk` 改为真正的 musl/Alpine build**，不要继续封 GNU binary。
+3. **`.archlinux` 改成 `.pkg.tar.zst`**。
+4. **为 deb/rpm/apk/Arch 分开 runtime dependencies**，CI 用 `ldd/readelf` 验证。
+5. **增加四个 distro install smoke tests**：Ubuntu、Fedora、Arch、Alpine。
+6. **处理真正的 terminfo**，当前 dummy 文件不应该进入正式 package。
+7. **增加 AppStream metainfo + 固定 application ID**。
+8. **Linux 增加 ARM64 `.deb/.rpm`**。
+9. **macOS 做 `.app` → Universal → DMG**。
+10. **Windows 从裸 exe 增加 Portable ZIP**。
+11. 再往后才是 Windows installer / macOS signing / FreeBSD / AppImage。
+
+这样调整后，我觉得 Bitty 的发行面已经足够覆盖 **90%+ 的实际桌面开发者场景**：
+
+```text
+                 Bitty Release
+                       │
+       ┌───────────────┼────────────────┐
+       │               │                │
+     Linux           macOS           Windows
+       │               │                │
+ ┌─────┴──────┐     Universal       x64 / ARM64
+ │            │        DMG               │
+glibc       musl                     Portable ZIP
+ │            │
+x64/ARM64    x64
+ │            │
+deb           apk
+rpm
+pkg.tar.zst
+ │
+AUR
+```
+
+尤其现在**最值得先修的是 Linux ARM64 matrix、Alpine musl、`.pkg.tar.zst` 和 dummy terminfo 这四项**。它们不是“未来优化”，而是当前 release pipeline 中已经能明确看到的不一致。
+
+[1]: https://doc.rust-lang.org/rustc/platform-support/aarch64-unknown-linux-gnu.html?utm_source=chatgpt.com "aarch64-unknown-linux-gnu - The rustc book"
+[2]: https://doc.rust-lang.org/rustc/platform-support/aarch64-unknown-linux-musl.html?utm_source=chatgpt.com "aarch64-unknown-linux-musl - The rustc book"
+[3]: https://github.com/bitty-terminal/bitty/releases "Releases · bitty-terminal/bitty · GitHub"

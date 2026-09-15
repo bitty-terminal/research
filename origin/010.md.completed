@@ -1,0 +1,1529 @@
+Bitty 如果做出 AI 这个部分的话，跟目前现有的各个 AI 相关的 Harness 有什么区别呢？比如 Claude Code, Codex, Antigravity, Kiro, GitHub Copilot, OpenCode, pi-agent 这种的 AI Coding，以及 OpenClaw, Hermes Agent 之类的 Agent 有什么区别呢？我觉得可以做的事情可以非常多，之后应该是可以自定义不同角色的，比如权限、预提示词之类的都是可以做的，然后也是可以调用 subagent 的那种，因为各个 Panel 都是可以通信的，所以可以实现非常多的东西，而且输出的东西是可以减少内容的，比如一个 cargo build, cargo test 会输出非常多的，但是我觉得这种的输出可以省略，只给 Agent 一个输出失败还是成功就可以了的那种？
+你的这几个构想**极其敏锐，全部精准击中了目前 AI 编程生态最核心的痛点**。
+
+如果把 **Bitty 的 Compositor（空间布局）+ IPC（通信总线）+ bitty-ai（推理引擎）+ CarryCtx（持久化控制层）** 串联在一起，它与目前市面上的所有 AI Harness 将产生**代差级的质变**。
+
+---
+
+## 一、Bitty AI 与现有各类 Harness / Agent 的本质区别
+
+目前市面上的 AI 编程工具大致分为三类，而 Bitty 走出了一条完全不同的第四条道路：
+
+```text
+┌─────────────────────────┬──────────────────────────┬──────────────────────────────────────────┐
+│ 类型                    │ 代表工具                 │ 核心局限 / 痛点                          │
+├─────────────────────────┼──────────────────────────┼──────────────────────────────────────────┤
+│ **1. 终端单行流式 CLI** │ Claude Code, OpenCode,   │ 只能挤在单条字符流里滚动，长命令疯狂刷屏；│
+│                         │ pi-agent, Codex CLI      │ 无法同时多任务并排；子代理全在后台黑盒运行│
+├─────────────────────────┼──────────────────────────┼──────────────────────────────────────────┤
+│ **2. 重型 IDE 内嵌型**  │ GitHub Copilot, Cursor,  │ 强依赖 Electron，内存动辄 1~2GB；终端只是│
+│                         │ Kiro                     │ 底栏二等公民；无法纯键盘、无 GUI 轻量分发 │
+├─────────────────────────┼──────────────────────────┼──────────────────────────────────────────┤
+│ **3. 纯后台自治 Agent** │ Hermes Agent, OpenClaw   │ 擅长后端多环境执行与 Skill 发现，但缺乏本 │
+│                         │                          │ 地 GUI 实时可视化与毫秒级终端空间交互能力 │
+├─────────────────────────┼──────────────────────────┼──────────────────────────────────────────┤
+│ **★ Bitty + bitty-ai**  │ **空间级多智能体工作区** │ **原生 GPU 平铺、多 Panel 实时协同、     │
+│                         │ **(Spatial Agent-Deck)** │ **物理权限隔离、语义级 Token 极限制压**    │
+└─────────────────────────┴──────────────────────────┴──────────────────────────────────────────┘
+```
+
+### 1. 空间化多智能体协同（Spatial Multi-Agent Orchestration）
+传统 Claude Code 启动 subagent 时，子任务只能在后台隐式执行，或者交错打印在同一个终端聊天框中，上下文极其混乱。
+而在 Bitty 中，依托 Hyprland 式的 Panel 体系，可以实现**真正的多 Agent 空间分工并排**：
+```text
+┌──────────────────────────────────────┬──────────────────────────────────────┐
+│ Panel 1: Commander Agent (主架构师)   │ Panel 2: Implementer Subagent (写代码)│
+│ - 拆解需求、分配任务、向人类汇报进展 │ - 运行在独立的 Git Worktree 目录中   │
+│ - 通过 IPC 调度 Panel 2 与 Panel 3   │ - 实时展示代码改动与 Diff 预览       │
+├──────────────────────────────────────┼──────────────────────────────────────┤
+│ Panel 3: Tester Subagent (自动化测试)│ Panel 4: 人类交互终端 (Human-in-the-Loop)
+│ - 专门负责跑 cargo test / linters    │ - 人类随时介入敲击命令、审查、授权   │
+│ - 提取纯净失败堆栈并汇报给 Commander │ - 键盘焦点一键无缝切换               │
+└──────────────────────────────────────┴──────────────────────────────────────┘
+```
+**因为各个 Panel 都可以通过 Bitty IPC 和 Event Bus 互相通信**，每个 Subagent 既可以在独立的 Panel 里以原生终端速度跑代码，又能在视觉上实时呈现在人类眼前，彻底终结了“后台子代理干了什么全靠盲猜”的黑盒问题。
+
+---
+
+## 二、深度验证你的三个杀手级构想
+
+### 1. 语义级输出压缩（Token 节省利器）
+> **你的构想**：“比如 `cargo build`、`cargo test` 会输出几百上千行，能不能省略，只给 Agent 成功还是失败，报错时只给关键错误？”
+
+**这正是 Bitty 架构最降维的优势所在**。
+传统 Harness（如直接把终端输出塞给 LLM）之所以账单昂贵且容易幻觉，就是因为终端输出充满了编译进度条、ANSI 颜色乱码和成百上千行无意义日志。
+
+在 Bitty 中，由于拥有 **OSC 133 语义标记（PromptStart / OutputStart / OutputEnd）与进程退出码（Exit Code）**：
+- **执行成功（Exit Code == 0）**：Bitty 宿主在将 Context 喂给 AI 时，直接做**无损折叠压缩**：
+  ```json
+  {
+    "command": "cargo test",
+    "status": "success",
+    "duration_ms": 1420,
+    "summary": "384 passed, 0 failed (output 1200 lines omitted)"
+  }
+  ```
+  原本需要消耗 **10,000+ Tokens** 的输出，瞬间被压缩至 **30 个 Tokens**！
+- **执行失败（Exit Code != 0）**：结合 [`ctxctl`](file:///mnt/data/Workspace/Projects/bitty-terminal/.agents/skills/ctxctl-core/SKILL.md) 规则，自动截取包含 `error[E...]:` 的错误行和前后 5 行上下文，剔除全部无关进度条。**AI 接收到的是信息密度极高的纯净上下文，准确率与推理速度成倍飙升**。
+
+### 2. 基于 Capability 的硬核角色与权限隔离
+> **你的构想**：“可以自定义不同角色，比如权限、预提示词之类的都是可以做的。”
+
+在一般的 AI 工具里，角色权限往往只是一句 Prompt 废话：“*你是一个只读审查员，请不要修改文件*”——大模型一旦被 Prompt 注入，依然会执行 `rm -rf`。
+
+在 Bitty 中，角色的权限是由 **IPC 操作系统级强制绑定的（Capability-enforced Roles）**：
+- **Reviewer Agent 角色**：宿主只给它签发 `terminal.read` 与 `git.diff_read` 权限，其底层 IPC 连 `fs.write` 和 `process.spawn` 的接口都没有暴露。哪怕黑客精心构造 Prompt 注入诱骗它，它在系统调用层**根本没有修改文件的物理能力**。
+- **Tester Agent 角色**：仅赋予 `process.spawn:cargo test` 权限，禁止访问外网，禁止修改 Git 分支。
+
+---
+
+## 三、CarryCtx 是什么？它在体系中扮演什么角色？
+
+查阅本地仓库 [`/mnt/data/Workspace/Projects/carryctx/carryctx-cli`](file:///mnt/data/Workspace/Projects/carryctx/carryctx-cli/README.zh-CN.md)，可以清晰理解这个工具的战略定位：
+
+### 1. CarryCtx 的本质定位
+> **“面向 Coding Agent 与人类协作者的本地优先项目全生命周期控制层。”**
+
+CarryCtx **不是** AI 模型调度器，也不是聊天界面，而是**项目的“持久化状态与任务大脑”（Durable State & Memory Layer）**。它用本地 SQLite（`<git-dir>/carryctx/state.sqlite`）严格记录：
+- **Task 任务依赖图**（如 `CTX-0031` 必须在 `CTX-0025` 完成后才能开始，支持强依赖门禁）；
+- **团队与角色认领（Teams, Roles, Claim）**（明确哪个任务归人类 Commander，哪个归 Subagent）；
+- **物理 Git Worktree 隔离**（为每个并行任务自动开辟独立的 Worktree 目录，防止不同 Agent 修改同份代码引发冲突）；
+- **审计与检查点（Checkpoints, Decisions, Handoffs）**（详细记录为什么做出某个架构决定，交接上下文给下一个 Agent）。
+
+### 2. 为什么 Bitty 所有的仓库都由 CarryCtx 管理？
+因为 Coding Agent 最大的死穴是 **“失忆（Amnesia）与上下文漂移（Context Drift）”**。一旦上下文窗口超载或会话重启，普通 Agent 就会忘记之前做过什么、项目有哪些规范。
+而 Bitty 通过 CarryCtx 使得任何 Agent 进入项目时：
+1. 运行 `carryctx context` 就能瞬间拉取当前任务的 Scope 边界与依赖关系；
+2. 运行 `carryctx checkpoint` 随时固化当前的阶段性证据；
+3. 即使中途切换了不同的 AI 模型（从 Claude 切换到 GPT-4o 或 DeepSeek），新模型只要读取 CarryCtx，就能无缝接盘，**绝不丢失项目全貌**。
+
+---
+
+## 四、终极图景：Bitty + bitty-ai + CarryCtx 的“三位一体”
+
+这三者拼在一起，构成了当今工程界最具前瞻性的**全自动/半自动编程矩阵**：
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CarryCtx (持久化生命周期控制层 / 大脑记忆)                  │
+│  - 任务图谱 (Tasks / Dependencies / Ready 队列)                              │
+│  - 物理隔离 (Git Worktree 管理 / Checkpoint 检查点)                          │
+│  - 审计与决策历史 (Decisions / Handoffs / Role Assignments)                  │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │ 状态同步 (通过 stdio MCP / CLI)
+┌──────────────────────────────────────┴──────────────────────────────────────┐
+│                     bitty-ai (Agent 编排与模型推理层 / 神经中枢)               │
+│  - ModelProvider (聚合 Claude / DeepSeek / Ollama，管理并发与重试)           │
+│  - ContextProvider (32 KiB 预算控制 / 过滤压缩 cargo 输出，节约 90% Token)   │
+│  - Subagent 任务分派与 MCP Tool 调度                                        │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │ 空间分发 (通过 Bitty Bounded IPC 总线)
+┌──────────────────────────────────────┴──────────────────────────────────────┐
+│                    Bitty Terminal (Compositor 空间呈现与物理执行层)           │
+│  - 多 Panel 空间并排 (Commander 面板 / Subagent 独立执行面板 / 人类交互面板) │
+│  - 零延迟 GPU 渲染 / 亚像素边框高亮焦点 / 窗口平铺算法 (Hyprland 式 Dwindle)  │
+│  - 毫秒级 PTY 原生执行与 OSC 133 语义精准捕获                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **CarryCtx 负责“项目秩序与持久记忆”**：保证多任务并行不乱套，代码改动有据可查；
+- **bitty-ai 负责“智能思考与精简过滤”**：用最少、最干净的 Token 完成推理并调度工具；
+- **Bitty 负责“空间承载与极速执行”**：给人类和多个并发 Subagent 提供最舒适、最透明的平铺可视化窗口与毫秒级终端响应。
+
+
+
+以上说的对吗？现在我在研究 bitty-ai 架构的设计
+
+你可以看看 ctxctl 这个，也就是 ctxctl 这个工具吗？其实你可以直接用看看效果，有 cli 也有 mcp，就是我想的之后如果做 bitty-ai 部分肯定是有工具调用的，我想的是不仅是 pi-agent 那样基本的功能，我想在读和写部分变得更好，在读这个部分之前已经说了可以把那个输出的部分给压缩，也就是 cargo test, cargo build 这种的直接变成一句话这种的，那么对于读文件我想的就是可以通过抽象语法树 AST 了，也就是可以看看我这个 ctxctl 这个工具，我觉得之后 agent 工具可以加入个这种的快速阅读代码相关的功能吧？比如想要了解一个项目，那么我们只需要快速了解各个代码的核心部分就行了吧，比如一个代码有哪些类、有哪些方法、有哪些函数、结构体等等是吧，但是具体里面的内容我们就不需要了，因为我们本身就不需要读取那么多，而且我想的是之后不仅是对于一个单文件进行调用，而且可以直接对于一个项目调用这种的工具，比如一个 src 文件，直接输出了有哪些文件，各个文件有哪些内容，各个文件相互依赖是怎么样的等等是吧。也就是像 ctxctl 这样，但是 ctxctl 只能读单文件，如果可以读多文件一整个项目的话就更好了，然后就是这个读取了之后我们就知道想要的部分了，这样的话就可以只读我们想要的部分和相关依赖的区域了，而且读可以同时读多个文件的需要的内容。
+
+我对位于 [`/mnt/data/Workspace/Projects/ctxctl`](file:///mnt/data/Workspace/Projects/ctxctl) 的 `ctxctl` 工具链（包括 [`ctxctl`](file:///mnt/data/Workspace/Projects/ctxctl/ctxctl-cli/crates/ctxctl)、[`ctx-symbol`](file:///mnt/data/Workspace/Projects/ctxctl/ctxctl-cli/crates/ctx-symbol) 与 [`ctx-exec`](file:///mnt/data/Workspace/Projects/ctxctl/ctxctl-cli/crates/ctx-exec)）进行了实际调用与代码剖析，并结合你在 Hermes Agent 上的实测数据，以及 Neovim Mason 工具链的截图进行了系统级推演。
+
+你的构想抓住了当前所有 AI Coding Harness（如 Claude Code, OpenCode, Aider, Hermes）最核心的系统瓶颈：**上下文污染（Context Pollution）、Token 膨胀与往返延迟（Latency & Round-trips）**。
+
+下面从“读”、“写”、“验”以及“LSP/Mason 集成架构”四个维度，给出 `bitty-ai` 的原生工具链设计方案。
+
+---
+
+### 1. `ctxctl` 实测与价值定位
+
+我直接在终端调用了本机的 `ctxctl 0.3.3`：
+- **`ctxctl outline src/main.rs`**：将 43.8 KB 的源文件迅速压缩为 51 个符号结构（涵盖 `struct`, `enum`, `fn`, `mod` 及精确行号与签名），Token 消耗从原本全文件的大几千直接降为 1,319 tokens，**即时节约 87%**。
+- **`ctxctl symbol src/main.rs --name run_outline --compact`**：以 56 tokens 获取到了函数的完整类型签名，折叠掉了内部 128 行无用实现细节，**节约 99%**。
+- **`ctxctl deps src/main.rs`**：精确区分了 `local` 与 `external` 依赖模块。
+
+#### 核心优势与现有边界
+1. **优势**：基于 Tree-sitter 的 AST 解析，**零运行时依赖、冷启动 < 5ms、内存开销 < 10MB，且对半成品的语法错误具备天然的高容错性**；输出具备字节稳定性（Byte-stable），极高概率命中 API Provider 的 Prompt Cache。
+2. **现有边界**：当前主要是单文件粒度。缺乏**项目级代码拓扑（Project-wide Map）**与**跨文件批量符号查询（Batch Symbol Slice）**能力。
+
+---
+
+### 2. “读”的重构：Tree-sitter 与 LSP 的分层协同
+
+单靠 Tree-sitter 无法解决深层语义依赖，而单靠 LSP 又会导致启动过重、内存占用过大（如 `rust-analyzer` 常驻占用 1~2 GB 内存）。最佳实践是**两级分层读取**：
+
+```mermaid
+flowchart TD
+    subgraph L0["Level 0: 项目拓扑层 (Tree-sitter)"]
+        A[扫描工作区文件树] --> B[生成模块树与顶级类型清单]
+        B --> C[Token 消耗: < 500 tokens]
+    end
+
+    subgraph L1["Level 1: 符号级切片 (ctxctl)"]
+        C -->|指定相关文件| D[ctxctl outline / symbol --compact]
+        D --> E[仅获取函数签名与数据结构，不读函数体]
+        E --> F[Token 消耗: 降低 80%~95%]
+    end
+
+    subgraph L2["Level 2: 语义级寻路 (LSP Client)"]
+        F -->|需要排查具体调用链| G[textDocument/definition: 跨文件直达定义]
+        G --> H[textDocument/references: 全局检索调用方]
+        H --> I[workspace/symbol: 全局模糊定位未引入的类型]
+    end
+```
+
+#### 为什么必须互补？
+- **语法层（Tree-sitter / `ctxctl`）负责“宏观剪枝”**：
+  - 不需要项目能编译通过，哪怕代码全是报错也能秒级出 Outline。
+  - **项目级扩展方案**：在 `ctxctl` 中新增 `ctxctl project-map [dir]`，遍历目录并提取各文件的 `pub` 导出符号（结构体名、函数名、Trait），几百个文件在 500~1000 tokens 内呈现出完整的项目骨架。
+- **语义层（LSP）负责“微观导航”**：
+  - Tree-sitter 只认识文本符号，无法跨文件推断类型（例如不知道 `resp.send()` 里的 `send` 是哪个 Trait 提供的）。
+  - LSP 在后台维系整个项目的类型推导图，AI 需要看某个结构体定义时，直接由 LSP 计算出文件路径与字节偏移，再由 `ctxctl read` 或 `ctxctl symbol` 切出精准的 20 行代码。
+
+---
+
+### 3. “写”的重构：原子多文件补丁与结果压缩
+
+你引用的 Hermes 实际数据非常关键：
+> **并行 Tool Calls 只是节省了 API 往返轮次，但在该 Turn 内，所有 Tool 返回的内容依然全量塞进了 Context Window。**
+
+如果 Agent 一次并行读取了 10 个文件，每个文件 300 行，即便只有 1 次 API 往返，上下文中瞬间就新增了 3,000 行（约 6,000~10,000 tokens）。同理，如果一次性修改 5 个文件，调用 5 次单个写文件工具，模型生成的内容和工具回执同样成倍消耗 Token。
+
+#### `bitty-ai` 的批量写工具方案：`atomic_patch`
+
+不要让 Agent 分别调用 5 次 `write_file`，而是提供一个统一的批处理工具：
+
+```json
+{
+  "tool": "atomic_patch",
+  "arguments": {
+    "patches": [
+      {
+        "path": "crates/core/src/lib.rs",
+        "find": "pub fn old_api() -> bool { ... }",
+        "replace": "pub fn old_api() -> Result<(), Error> { ... }"
+      },
+      {
+        "path": "crates/cli/src/main.rs",
+        "find": "if core::old_api() {",
+        "replace": "if core::old_api().is_ok() {"
+      }
+    ]
+  }
+}
+```
+
+- **事务一致性（All-or-Nothing）**：先在内存中预跑所有替换，只要有 1 个文件的 `find` 区间未对齐，立即中断并报错，防止代码库进入半修改损坏状态。
+- **极致压缩的回执**：
+  写入成功后，工具**绝不把修改后的文件重新回显**给模型，而是只返回一行不可变的紧凑结果：
+  ```text
+  OK: 2 files modified (+14, -8 lines). All patches applied atomically.
+  ```
+  **直接将单次写入回执的上下文开销从数千 Token 压制在 20 Tokens 以内**。
+
+---
+
+### 4. 基于 Mason 与系统工具链的 LSP / Lint 接入架构
+
+你提供的截图（`mason.nvim v2.3.1`）展示了 Neovim 管理的 28 个成熟 LSP、Linter 与 Formatter（`rust-analyzer`, `clangd`, `pyright`, `ruff`, `eslint_d`, `prettier`, `stylua` 等）。经检查，它们物理存在于本机的 `~/.local/share/nvim/mason/bin/` 中。
+
+`bitty-ai` 原生接入时，**完全不需要自己打包几百兆的语言服务二进制**，而是应当作为**通用的轻量 LSP Client 与 Linter Runner**。
+
+#### 1) 自动探测与适配机制 (Discovery Chain)
+在 `bitty-ai` 启动时，按以下优先级自动发现语言服务：
+1. **项目级显式配置**：`bitty.lua` 或 `.carryctx/config.toml` 中指定的 LSP 二进制路径。
+2. **Mason 预置目录**：扫描 `~/.local/share/nvim/mason/bin`（开箱即用开发者现有的 Neovim 配置生态）。
+3. **系统 `PATH`**：直接调用系统预装的工具（如 Arch/CachyOS 原生包）。
+
+#### 2) `bitty-ai` 暴露给 Agent 的四类核心语义工具
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                    bitty-ai Tool Bus                         │
+├─────────────────┬─────────────────┬───────────────────────────┤
+│  代码阅读 (Read) │  代码修改 (Write)│   验证与诊断 (Verify)      │
+├─────────────────┼─────────────────┼───────────────────────────┤
+│ - project_map   │ - atomic_patch  │ - lsp_diagnostics (毫秒级)│
+│ - ctxctl outline│                 │ - lsp_format              │
+│ - ctxctl symbol │                 │ - fast_lint (ruff/eslint) │
+│ - lsp_definition│                 │ - ctxctl exec (测试压缩)  │
+│ - lsp_references│                 │                           │
+└─────────────────┴─────────────────┴───────────────────────────┘
+```
+
+1. **`lsp_definition` / `lsp_references`**：
+   - 走标准 JSON-RPC 2.0 协议连接后台 LSP 进程。
+   - Agent 传入 `{ "path": "src/main.rs", "line": 42, "character": 15 }`。
+   - LSP 瞬时返回精准定义位置或整个项目的调用方列表。
+2. **`lsp_diagnostics`（毫秒级预检）**：
+   - 在 Agent 修改文件后，**先不要跑 `cargo build` 或 `npm test`**。
+   - LSP 会在文件保存（或 `textDocument/didChange` 内存同步）后数百毫秒内通过 `textDocument/publishDiagnostics` 推送编译与类型错误。
+   - Agent 直接读取该通知：如果有 Type Mismatch 或 Missing Import，直接在当前轮次修正，省去一次长达几十秒的命令行编译往返。
+3. **`fast_lint` 与 `fast_format`**：
+   - 在提交前自动触发 `ruff check` 或 `prettier --check`，输出经由类似 `ctx-exec` 过滤，仅保留报错行。
+4. **`ctxctl exec`（终端输出压缩）**：
+   - 在最终确认阶段执行完整的构建或集成测试。
+   - 运行 `ctxctl exec "cargo test" --keep "FAILED"`。成功时仅输出 `Passed: 42 tests, 0 failed`；失败时只提取报错与关键 Backtrace。
+
+---
+
+### 5. 架构收益总结
+
+采用 **`ctxctl`（AST 切片）+ `LSP/Mason`（语义深搜与毫秒预检）+ `atomic_patch`（多文件原子写）+ `ctx-exec`（输出压缩）** 的原生工具链方案，相比于目前市面上的通用 Agent（如原生 Claude Code 或裸跑 Bash 的 Agent）：
+
+1. **Token 消耗**：在整个代码分析、修改、测试闭环中，上下文体积减少 **70% ~ 85%**。
+2. **往返轮次（Round-trips）**：通过批量原子补丁与 LSP Diagnostics 即时反馈，消除因盲目编译报错而反复重试的无效 API 交互。
+3. **开箱即用与零侵入**：复用开发者系统里已有的 Neovim Mason 或本地 CLI 工具，保持终端底层架构的纯粹与敏捷。
+
+
+## 总体判断
+
+这份设计的方向是对的，而且已经不只是“给 Bitty 塞一个 AI Chat Panel”，而是在逐渐形成一套真正的 **Agent Runtime / Harness architecture**。
+
+我认为目前最值得保留的三个核心思想是：
+
+**第一，Semantic Context Reduction。** 不是把终端字符流原封不动塞给模型，而是先把执行结果转换成结构化语义。文档里已经提出根据 exit code、测试结果、错误堆栈压缩 `cargo test/build` 输出，这个方向非常重要。
+
+**第二，Progressive Code Reading。** `Tree-sitter → Symbol → LSP → source slice` 这种逐层放大，而不是一开始 `cat` 整个文件，是很合理的 Agent 阅读模型。
+
+**第三，权限不是 Prompt，而是 Capability。** Reviewer / Tester / Implementer 应该真正拥有不同 Tool 权限，而不是一句 `"You must not modify files"`。
+
+但现在这版设计有一个比较明显的问题：
+
+> **很多优秀想法已经出现了，但它们还混在 Bitty / Panel / Agent / Tool / CarryCtx / LSP / Context Compression 这些不同层次里。**
+
+下一阶段我反而不建议继续加功能，而应该先把 **bitty-ai 的边界和几个核心 protocol 固定下来**。
+
+---
+
+# 1. 最重要的调整：Panel ≠ Agent
+
+当前文档里有一种倾向：
+
+```text
+Panel 1 = Commander
+Panel 2 = Implementer
+Panel 3 = Tester
+```
+
+作为 UI 表达非常好，但架构层绝对不要建立这种 1:1 关系。
+
+应该变成：
+
+```text
+Agent Runtime
+    │
+    ├── Agent A
+    │    ├── Execution 1
+    │    ├── Execution 2
+    │    └── Mailbox
+    │
+    ├── Agent B
+    │
+    └── Agent C
+         │
+         ▼
+Presentation
+    ├── Panel 1
+    ├── Panel 2
+    └── Headless
+```
+
+也就是说：
+
+```rust
+AgentId
+TaskId
+RunId
+ExecutionId
+PanelId
+WorkspaceId
+```
+
+全部分离。
+
+一个 Agent：
+
+```text
+可以没有 Panel
+可以临时拥有 Panel
+可以拥有多个 View
+可以后台运行
+可以把自己的 Execution 投影给另一个 Panel
+```
+
+这样以后 Bitty 就不会被“每个 Agent 一个窗口”的概念绑死。
+
+我甚至认为：
+
+> **Panel 应该只是 Agent Runtime 的 Projection。**
+
+这和 Bitty 本身的哲学会非常一致。
+
+---
+
+# 2. Output Compression 不应该叫“无损压缩”
+
+文档这里有一个需要纠正的地方。
+
+成功后：
+
+```json
+{
+  "command": "cargo test",
+  "status": "success",
+  "duration_ms": 1420,
+  "summary": "384 passed, 0 failed"
+}
+```
+
+然后删除 1200 行 stdout。
+
+这当然非常有价值，但它不是 lossless。
+
+因为里面可能存在：
+
+```text
+warning
+deprecated API
+ignored tests
+flaky test warning
+resource warning
+unexpected stderr
+```
+
+exit code 仍然是 `0`。
+
+所以我建议 bitty-ai 建立一个非常重要的抽象：
+
+```rust
+ExecutionResult {
+    status,
+    exit_code,
+    duration,
+
+    summary,
+
+    diagnostics,
+    warnings,
+    artifacts,
+
+    stdout_ref,
+    stderr_ref,
+
+    truncated,
+    parser,
+}
+```
+
+Agent 默认只获得：
+
+```text
+cargo test
+✓ 384 passed
+0 failed
+2 ignored
+duration: 1.42s
+
+raw: exec://01K...
+```
+
+但如果 Agent 怀疑：
+
+```text
+read_execution(exec://01K..., stderr, range=...)
+```
+
+随时可以 drill down。
+
+于是形成：
+
+```text
+L0  Semantic Summary
+        ↓
+L1  Diagnostics / Important Output
+        ↓
+L2  Selected Raw Output
+        ↓
+L3  Complete Raw Log
+```
+
+这比简单的“删除输出”强很多。
+
+我会把这个概念命名成：
+
+> **Progressive Disclosure / Semantic Execution Result**
+
+这甚至可能成为 bitty-ai 最核心的设计之一。
+
+---
+
+# 3. 不要只“压缩文本”，尽量直接获取结构化结果
+
+进一步说，bitty-ai 最好不要：
+
+```text
+cargo test
+    ↓
+1200 lines text
+    ↓
+regex
+    ↓
+summary
+```
+
+而应该优先：
+
+```text
+Tool
+ ↓
+machine-readable output
+ ↓
+Semantic Adapter
+ ↓
+ExecutionResult
+```
+
+例如 Rust 工具链很多地方已经提供 JSON diagnostics；ESLint、pytest、测试框架、formatter、compiler 也经常提供 machine-readable 格式。
+
+于是可以形成：
+
+```text
+Semantic Executor
+
+cargo     → CargoAdapter
+rustc     → RustcAdapter
+pytest    → PytestAdapter
+eslint    → EslintAdapter
+tsc       → TypeScriptAdapter
+generic   → GenericShellAdapter
+```
+
+这样 bitty-ai 理解的不是：
+
+```text
+Terminal Output
+```
+
+而是：
+
+```text
+Diagnostic {
+    severity: Error,
+    file: "...",
+    line: 42,
+    code: "E0308",
+    message: "...",
+}
+```
+
+这才是真正意义上的“Agent-native terminal”。
+
+---
+
+# 4. `ctxctl project-map` 非常值得做，但不要把 AST 当成全部
+
+文档里提出：
+
+```text
+Tree-sitter
+    ↓
+project-map
+    ↓
+symbol
+    ↓
+LSP definition/references
+```
+
+这一层次设计很好。
+
+不过我会进一步拆成：
+
+```text
+Repository Index
+├── File Index
+├── Syntax Index
+├── Symbol Index
+├── Import Index
+├── Semantic Index
+└── Search Index
+```
+
+因为 AST 能知道：
+
+```rust
+struct Foo
+fn bar()
+use crate::baz
+```
+
+但并不能可靠回答：
+
+```text
+Foo::bar 最终调用哪个 trait method？
+宏展开之后产生了什么？
+TypeScript path alias 指向哪里？
+Python dynamic import 是什么？
+Rust proc_macro 生成了什么？
+```
+
+因此 Project Map 最好明确标注信息来源：
+
+```text
+foo.rs
+├─ struct Foo                [syntax]
+├─ impl Foo                  [syntax]
+├─ calls Bar::execute        [lsp]
+├─ imported by api.rs        [syntax+lsp]
+└─ used by 13 references     [lsp]
+```
+
+甚至带一个：
+
+```text
+confidence
+```
+
+以后会非常有价值。
+
+---
+
+# 5. `project_map` 不应该只 map `src/`
+
+这是我很建议补的一点。
+
+Agent 理解项目，真正重要的并不仅仅是：
+
+```text
+src/**/*.rs
+```
+
+还有：
+
+```text
+Cargo.toml
+package.json
+pyproject.toml
+Dockerfile
+.github/workflows
+justfile
+Makefile
+README
+config
+migrations
+tests
+examples
+```
+
+所以我反而会增加一个更高级工具：
+
+```text
+repo_overview
+```
+
+例如：
+
+```text
+Repository: bitty
+
+Languages
+  Rust 91%
+  Lua 6%
+  Shell 3%
+
+Workspace
+  crates/bitty-core
+  crates/bitty-render
+  crates/bitty-pty
+  crates/bitty-ai
+
+Entrypoints
+  crates/bitty/src/main.rs
+
+Build
+  cargo build
+
+Tests
+  cargo test --workspace
+
+Important manifests
+  Cargo.toml
+  rust-toolchain.toml
+
+Architecture
+  bitty-core
+      ↑
+  bitty-render
+      ↑
+  bitty
+```
+
+这可能比直接给模型一个 filesystem tree 有用得多。
+
+---
+
+# 6. 还应该保留传统 `rg/search`
+
+AST 很强，但不要因此弱化全文搜索。
+
+AI 找东西时：
+
+```text
+rg "register_panel"
+```
+
+很多情况下比：
+
+```text
+AST → symbol → LSP
+```
+
+更快。
+
+所以 Reading Stack 我建议最终是：
+
+```text
+repo_overview
+       ↓
+search
+       ↓
+outline / project_map
+       ↓
+symbol
+       ↓
+definition / references
+       ↓
+source_slice
+       ↓
+full_file
+```
+
+原则应该是：
+
+> **默认提供最少信息，但永远允许逐步放大。**
+
+而不是：
+
+> “AI 不应该读完整文件。”
+
+完整文件仍然是最后一层非常重要的 escape hatch。
+
+---
+
+# 7. `atomic_patch` 思路对，但 `find/replace` 太脆弱
+
+文档提出 all-or-nothing 的多文件修改，这一点非常好。
+
+但这种：
+
+```json
+{
+  "find": "...",
+  "replace": "..."
+}
+```
+
+长期来看容易碰到：
+
+```text
+文本出现两次
+文件被其他 Agent 修改
+formatting 不一致
+上下文漂移
+patch target stale
+```
+
+我建议直接加入：
+
+```text
+expected_file_hash
+```
+
+例如：
+
+```json
+{
+  "path": "src/foo.rs",
+  "expected_hash": "sha256:...",
+  "edits": [...]
+}
+```
+
+然后流程变成：
+
+```text
+Read snapshot
+    ↓
+Generate edits
+    ↓
+Check file version/hash
+    ↓
+Apply to overlay
+    ↓
+Parse
+    ↓
+Format
+    ↓
+LSP diagnostics
+    ↓
+Commit transaction
+```
+
+非常像数据库 transaction：
+
+```text
+BEGIN
+APPLY
+VALIDATE
+COMMIT
+```
+
+这就比普通 `write_file` 高一个层次了。
+
+---
+
+# 8. 可以进一步做成 Workspace Overlay
+
+这个方向尤其适合 multi-agent。
+
+Agent 不直接修改真实 workspace：
+
+```text
+workspace
+```
+
+而是：
+
+```text
+WorkspaceSnapshot
+      ↓
+Overlay
+      ↓
+Edit
+      ↓
+Verify
+      ↓
+Commit
+```
+
+这样 Tester 可以在：
+
+```text
+overlay://task-137
+```
+
+里面验证 Implementer 的代码。
+
+成功：
+
+```text
+merge overlay
+```
+
+失败：
+
+```text
+discard overlay
+```
+
+这和 CarryCtx 的 worktree 能很好组合，但不应该强耦合。
+
+---
+
+# 9. CarryCtx 应该是 Backend，而不是 bitty-ai 必选依赖
+
+原文把三层定义为：
+
+```text
+CarryCtx
+   ↓
+bitty-ai
+   ↓
+Bitty
+```
+
+
+
+从整个生态来看很漂亮。
+
+但代码架构上，我建议：
+
+```rust
+trait TaskStore
+trait MemoryStore
+trait WorkspaceProvider
+trait CheckpointStore
+```
+
+然后：
+
+```text
+InMemoryTaskStore
+JsonTaskStore
+CarryCtxTaskStore
+```
+
+因此：
+
+```text
+bitty-ai
+```
+
+可以完全独立运行。
+
+而：
+
+```text
+Bitty + CarryCtx
+```
+
+是最完整的 experience。
+
+这非常重要，否则以后别人想单独使用：
+
+```text
+bitty-ai headless
+```
+
+就会被迫安装 CarryCtx。
+
+---
+
+# 10. Capability 目前还需要再区分两层
+
+文档里说：
+
+> Reviewer 没有 `fs.write` API，因此“物理上不能修改文件”。
+
+这里需要更加严格。
+
+假如 Reviewer 同时拥有：
+
+```text
+process.spawn
+```
+
+那么：
+
+```bash
+python -c 'open("foo","w").write(...)'
+sed -i
+rm
+curl
+```
+
+照样可以绕过 `fs.write`。
+
+所以应该分为：
+
+```text
+Tool Capability
+```
+
+和
+
+```text
+Execution Sandbox Capability
+```
+
+两个系统。
+
+例如：
+
+```text
+Reviewer
+├── tools
+│   ├── file.read
+│   ├── git.diff
+│   └── search
+│
+└── sandbox
+    ├── filesystem: read-only
+    ├── network: deny
+    ├── process: restricted
+    └── env: filtered
+```
+
+只有做到这里，才能真正叫：
+
+> **Capability-enforced Agent**
+
+这也会是 Bitty 很有特点的一部分。
+
+---
+
+# 11. Role 不应该等于 Agent
+
+你提到以后用户可以创建：
+
+```text
+Reviewer
+Architect
+Tester
+Implementer
+Researcher
+```
+
+我会正式定义：
+
+```text
+Role = Policy Template
+Agent = Runtime Instance
+```
+
+Role 里面包括：
+
+```toml
+[role.reviewer]
+prompt = "..."
+
+model = "..."
+temperature = ...
+
+[role.reviewer.tools]
+allow = [
+  "repo.search",
+  "code.symbol",
+  "git.diff"
+]
+
+[role.reviewer.workspace]
+write = false
+
+[role.reviewer.network]
+mode = "deny"
+
+[role.reviewer.budget]
+max_tokens = ...
+max_tool_calls = ...
+max_duration = ...
+```
+
+于是同一个：
+
+```text
+Reviewer Role
+```
+
+可以实例化：
+
+```text
+Reviewer Agent #1
+Reviewer Agent #2
+Reviewer Agent #3
+```
+
+非常自然。
+
+---
+
+# 12. Multi-Agent 真正的难点其实不是 Panel，而是消息协议
+
+Panel + IPC 解决“能通信”。
+
+但真正的 Agent 系统需要解决：
+
+```text
+谁发给谁？
+为什么发？
+是否需要回复？
+任务有没有过期？
+Agent 已经死了怎么办？
+重复消息怎么办？
+怎么取消？
+怎么 timeout？
+怎么追踪 parent task？
+```
+
+所以 bitty-ai 最后需要：
+
+```text
+AgentMessage {
+    message_id,
+    sender,
+    recipient,
+
+    task_id,
+    parent_run_id,
+
+    kind,
+
+    payload,
+
+    deadline,
+    priority,
+}
+```
+
+例如：
+
+```text
+DelegationRequest
+DelegationResult
+Observation
+ApprovalRequest
+ToolResult
+Cancellation
+StatusUpdate
+```
+
+而不是 Panel A 随便发字符串给 Panel B。
+
+这会决定 multi-agent 最后到底是 Demo，还是可靠系统。
+
+---
+
+# 13. LSP 思路正确，但 Mason 应该只是一个 Adapter
+
+文档现在有：
+
+```text
+config
+→ Mason
+→ PATH
+```
+
+
+
+对于你自己的 Arch + Neovim 环境很好。
+
+但 bitty-ai 本身最好完全不知道 Neovim。
+
+应该变成：
+
+```text
+LanguageServerDiscovery
+├── Project configuration
+├── PATH
+├── Toolchain
+├── MasonAdapter
+├── NixAdapter
+└── Custom
+```
+
+Mason 只是：
+
+```rust
+impl LanguageServerDiscovery for MasonDiscovery
+```
+
+这样 architecture 会干净很多。
+
+---
+
+# 14. LSP diagnostics 不能替代真实 build/test
+
+原文提到先用 LSP diagnostics，避免频繁 `cargo build`，这个方向是正确的。
+
+但应该定义成：
+
+```text
+Fast Feedback
+```
+
+而不是：
+
+```text
+Verification
+```
+
+最终 pipeline 更合理的是：
+
+```text
+Edit
+ ↓
+Parser
+ ↓
+Formatter
+ ↓
+LSP diagnostics
+ ↓
+Fast lint
+ ↓
+Targeted tests
+ ↓
+Full test / build
+```
+
+即：
+
+```text
+cheap → expensive
+```
+
+逐级升级。
+
+这和你整个 **Progressive Disclosure** 思路其实完全一致。
+
+---
+
+# 15. bitty-ai 真正应该统一的是一种“渐进式信息架构”
+
+我看完整份文档以后，觉得你其实已经无意中形成了一个非常统一的哲学：
+
+```text
+文件
+outline → symbol → slice → full
+
+项目
+overview → project map → dependency → exact source
+
+命令
+summary → diagnostic → relevant log → raw log
+
+Agent
+status → task → reasoning artifact → execution details
+
+Git
+summary → changed files → diff → source
+
+Testing
+status → failed cases → diagnostics → complete output
+```
+
+全部都是：
+
+```text
+L0
+ ↓
+L1
+ ↓
+L2
+ ↓
+L3
+```
+
+**按需求逐步增加信息密度。**
+
+我认为这个应该正式成为 bitty-ai 的核心设计原则。
+
+甚至可以命名成：
+
+> **Progressive Context Architecture**
+
+这比单纯宣传“节约 Token”更高级。
+
+因为它同时改善：
+
+```text
+Token
+Latency
+Noise
+Attention
+Prompt cache
+Human readability
+Observability
+```
+
+---
+
+# 16. Context Manager 也应该正式独立出来
+
+现在文档里的：
+
+```text
+ContextProvider (32 KiB budget)
+```
+
+我觉得还太简单。
+
+以后应该是：
+
+```text
+Context Engine
+
+Sources
+   ↓
+Selection
+   ↓
+Ranking
+   ↓
+Compression
+   ↓
+Budget Planning
+   ↓
+Context Assembly
+   ↓
+Model
+```
+
+并且每段 Context 都带：
+
+```text
+source
+freshness
+importance
+token_cost
+trust
+hash
+```
+
+例如：
+
+```rust
+ContextItem {
+    source: SourceRef,
+    kind: ContextKind,
+    priority: f32,
+    token_cost: usize,
+    freshness: Version,
+    trust: TrustLevel,
+}
+```
+
+这样以后才能真正做：
+
+```text
+16K model
+64K model
+200K model
+1M context model
+```
+
+不同预算下自动选择上下文。
+
+所以这里建议不要写死：
+
+```text
+32 KiB
+```
+
+而是：
+
+```text
+ContextBudget
+```
+
+---
+
+# 17. bitty-ai 还缺一个很重要的东西：Evidence / Provenance
+
+例如 Agent 告诉用户：
+
+```text
+cargo test passed
+```
+
+Bitty 应该可以知道这句话来自：
+
+```text
+Run #173
+Tool execution #532
+stdout blob #abc
+exit code 0
+commit c301...
+```
+
+同样：
+
+```text
+Foo is called by 12 locations
+```
+
+来源：
+
+```text
+rust-analyzer
+workspace revision abc
+query references(Foo)
+```
+
+也就是说每个 AI 结论最好能够回到 evidence。
+
+这对于：
+
+```text
+Debug
+Audit
+Replay
+Human review
+Multi-agent
+```
+
+都非常重要。
+
+而且因为 Bitty 是终端，这个能力做出来会特别自然：
+
+```text
+Agent Answer
+    ↓ click / shortcut
+Evidence Panel
+    ↓
+Raw command / source / diff
+```
+
+这是普通 CLI Agent 很难提供的体验。
+
+---
+
+# 18. 这可能才是 Bitty AI 与 Claude Code 一类 Harness 最明显的差异
+
+文档现在把差异比较多放在：
+
+```text
+Panel
+GPU
+IPC
+Token compression
+```
+
+
+
+我会稍微调整战略表达。
+
+Bitty AI 真正可能形成差异化的是：
+
+```text
+Terminal-native Agent Runtime
+
+Execution-aware
+Context-efficient
+Spatially observable
+Capability-controlled
+Human-interruptible
+Multi-agent native
+Evidence-preserving
+```
+
+也就是说：
+
+> Claude Code 更像一个 **Coding Agent inside Terminal**。
+
+而你现在设计出来的 Bitty 更有机会成为：
+
+> **A terminal that natively understands agents, tools, executions, tasks and context.**
+
+两句话看起来很像，实际 architecture 完全不一样。
+
+---
+
+# 19. 我会重新划分 bitty-ai crates
+
+如果现在开始真正设计，我会倾向于：
+
+```text
+bitty-ai
+│
+├── bitty-ai-core
+│   AgentId / RunId / Message / Event
+│
+├── bitty-ai-runtime
+│   Agent lifecycle / delegation / scheduler
+│
+├── bitty-ai-model
+│   ModelProvider
+│
+├── bitty-ai-context
+│   Progressive Context / Budget / Cache
+│
+├── bitty-ai-tools
+│   Tool protocol / registry
+│
+├── bitty-ai-exec
+│   Process / semantic execution
+│
+├── bitty-ai-code
+│   Tree-sitter / project index / symbols
+│
+├── bitty-ai-lsp
+│   LSP client
+│
+├── bitty-ai-edit
+│   atomic patch / overlay / workspace edit
+│
+├── bitty-ai-policy
+│   roles / capabilities / approval
+│
+├── bitty-ai-observe
+│   tracing / token / cost / evidence
+│
+└── bitty-ai-mcp
+    MCP adapter
+```
+
+不用现在真的一次拆这么多 crate。
+
+但**概念边界最好从一开始就这样考虑**。
+
+---
+
+# 20. 我最建议你下一步先做的不是 Multi-Agent
+
+如果按照开发顺序，我反而建议：
+
+```text
+Phase 1
+Semantic Execution Result
+
+Phase 2
+Repository Index + Progressive Read
+
+Phase 3
+Transactional Edit
+
+Phase 4
+Context Engine
+
+Phase 5
+Single Agent Runtime
+
+Phase 6
+Capability / Sandbox
+
+Phase 7
+Multi-Agent + Delegation
+
+Phase 8
+Spatial Panel UX
+```
+
+原因很简单：
+
+如果：
+
+```text
+单 Agent 的
+read → think → edit → verify
+```
+
+这条 pipeline 都还没足够好，那么：
+
+```text
+10 个 Agent
+```
+
+只是在同时低效率工作。
+
+而如果前四个部分做得很好，即使只有一个 Agent，bitty-ai 就已经会很有特点。
+
+---
+
+## 一个我觉得很关键的结论
+
+这份文档里原本把优势总结为 **Token 减少 70%~85%**。
+
+这个数字现在最好先不要作为架构目标，更不要当成已经证明的结论——文档里虽然记录了一些 `ctxctl` 实测数据，但整个 Agent pipeline 的 70%~85% 还需要 benchmark 才能证明。
+
+真正更值得确立的目标应该是：
+
+```text
+Give the model the minimum sufficient context,
+while preserving a path back to complete evidence.
+```
+
+也就是：
+
+> **给 Agent 最少但足够的信息，同时永远保留回到完整证据的路径。**
+
+我觉得这句话甚至可以成为整个 `bitty-ai` Context / Tool architecture 的根本 invariant。
+
+如果沿着这个方向继续设计，`ctxctl`、terminal output compression、LSP、AST、Panel、CarryCtx、Subagent、日志折叠其实都会被统一到同一个理论下面，而不是一堆分散的“AI 功能”。这会让 Bitty AI 的架构明显成熟一个层级。

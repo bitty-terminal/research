@@ -1,0 +1,1255 @@
+# 我的判断
+
+Bitty 真正有辨识度的地方，不是某一个功能“别人没有”，而是它试图把 **Alacritty 的小核心、Ghostty 的 native runtime、WezTerm/kitty 的可编程性、WaveTerm 的 Block/Workspace、Warp 的 Agent automation** 放到一个更严格的分层架构里。
+
+当前文档已经把一句话定位写得很准确：
+
+> small, programmable, cross-platform terminal platform
+
+并且强调 `Small core. Stable API. Everything composable. Extensions own the experience.`。
+
+而且截至现在，Bitty 仍应该被看成 **Pre-alpha / M1 Hardening**：16 个 crate 的 architecture spine 已经存在，也已经有大量 headless tests，但还不是一个已经验证完成的终端产品。
+
+---
+
+# 一、Bitty 相比这些 Terminal，最核心的特点是什么？
+
+我认为可以压缩成这张表：
+
+| 特点                           | Bitty 的思路                               | 和现有 Terminal 的区别                      |
+| ---------------------------- | --------------------------------------- | ------------------------------------- |
+| **Small Core**               | Terminal correctness 留在 Rust core       | 类似 Alacritty/foot，但不是拒绝扩展             |
+| **Terminal ≠ View ≠ Layout** | PTY/state、viewport、UI layout 分离         | 比传统 `Pane = Terminal` 更彻底             |
+| **Mechanism ≠ Policy**       | core 提供机制，UX 由上层组合                      | 比 WezTerm/kitty 更强调边界                 |
+| **Terminal Truth**           | 插件/UI 不能修改 canonical terminal state     | 对扩展能力做了很强约束                           |
+| **Generic UI primitive**     | Panel/Overlay/RichSurface 等可成为应用容器      | 接近 WaveTerm Block，但计划更 native/general |
+| **Structured Control Plane** | Command/Event/Service/IPC/Debug 共用结构化模型 | 不只是 shell command automation          |
+| **Headless-ready**           | GUI 不是 Terminal runtime 的生存前提           | 为 daemon、attach、Agent 留空间             |
+| **Agent-friendly**           | Agent 是外部消费者，而非产品中心                     | 与 Warp 路线明显不同                         |
+| **Observability-first**      | debug/replay/structured state 从架构初期进入设计 | 很少有 Terminal 一开始这样设计                  |
+| **明确性能预算**                   | 无插件时保持轻量 floor                          | 避免逐渐变成 Electron workstation           |
+
+其中最重要的其实是下面几个。
+
+## 1. `Pane != Terminal`
+
+当前架构明确要求：
+
+```text
+Terminal
+├── PTY
+├── VT state
+├── grid
+├── scrollback
+└── modes
+
+View
+├── viewport
+├── selection
+└── presentation state
+
+Layout
+├── split
+├── stack
+├── overlay
+└── focus
+```
+
+而不是：
+
+```text
+Pane
+=
+PTY
+=
+Terminal
+=
+View
+=
+UI object
+```
+
+这是一个非常重要的区别。
+
+它意味着以后理论上可以：
+
+```text
+Terminal A
+   ├── View 1
+   ├── View 2
+   └── Agent observer
+
+Terminal B
+   └── View 3
+```
+
+甚至：
+
+```text
+headless Terminal
+        │
+   ┌────┼─────┐
+ GUI   CLI   MCP
+```
+
+很多 Terminal 是发展到后期想支持 detach/mux/remote 时才发现之前的对象模型绑死了。
+
+Bitty 是反过来，从第一天就避免这种绑定。
+
+---
+
+## 2. 我认为未来最有价值的是 `Panel`，但 Panel 不应该等于 Terminal
+
+这里需要继续保持现在这种分层。
+
+我会建议最终形成：
+
+```text
+Workspace
+    │
+   Layout
+    │
+   Panel
+    │
+    ├── TerminalView
+    ├── BrowserView
+    ├── FileView
+    ├── MarkdownView
+    ├── AgentView
+    └── PluginView
+```
+
+其中：
+
+```text
+Panel ≠ Terminal
+Panel ≠ PTY
+```
+
+Terminal 是业务对象；
+
+Panel 是 UI/lifecycle container。
+
+例如：
+
+```text
+Panel #42
+type = terminal
+view -> Terminal #7
+```
+
+但也可能：
+
+```text
+Panel #43
+type = browser
+url = localhost:3000
+```
+
+这就是 Bitty 相比 kitty/WezTerm 最容易形成明显差异的地方。
+
+kitty/WezTerm 的可编程对象主要仍然围绕：
+
+```text
+Window
+Tab
+Pane
+Terminal
+```
+
+Bitty 可以让：
+
+```text
+Panel
+```
+
+成为真正通用的 application primitive。
+
+这会更接近 WaveTerm，但 Bitty 不需要像 WaveTerm 那样天然绑定 Electron/React/Chromium。
+
+---
+
+## 3. `Terminal Truth` 是非常好的核心原则
+
+当前 Bitty 有一句我认为应该长期保留的架构原则：
+
+> Plugins may alter presentation, but must not alter terminal truth.
+
+也就是说：
+
+```text
+PTY
+ ↓
+VT Parser
+ ↓
+TerminalAction
+ ↓
+Terminal State   ← canonical truth
+ ↓
+Presentation
+ ↓
+Renderer
+```
+
+外部扩展最多在这里工作：
+
+```text
+Terminal State
+      ↓
+Presentation
+  ↙    ↓     ↘
+grid  rich  overlay
+```
+
+而不能：
+
+```text
+plugin
+ ↓
+terminal.grid[x][y] = ...
+```
+
+这会使 Bitty 的插件系统比 Neovim/Emacs 那类“几乎整个内部都暴露出去”的架构更加稳定。
+
+---
+
+# 二、不考虑插件系统，目前 Bitty 最大的挑战是什么？
+
+我认为真正难的部分反而还不是插件，而是下面这些。
+
+| 优先级    | 挑战                                    |    难度 |
+| ------ | ------------------------------------- | ----: |
+| **P0** | Terminal correctness / compatibility  | ★★★★★ |
+| **P0** | Terminal / View / Layout 生命周期         | ★★★★★ |
+| **P0** | Unicode / font / IME / shaping        | ★★★★★ |
+| **P0** | Renderer / damage / frame pacing      | ★★★★★ |
+| **P0** | PTY / ConPTY / platform abstraction   | ★★★★★ |
+| **P1** | Rich content 与 Terminal grid 共存       | ★★★★★ |
+| **P1** | Generic Panel / focus / input routing | ★★★★★ |
+| **P1** | Performance + resource budgets        | ★★★★☆ |
+| **P1** | headless / IPC / snapshot model       | ★★★★☆ |
+| **P2** | replay / DevTools / diagnostics       | ★★★★☆ |
+
+---
+
+## 1. Terminal compatibility 才是最大的硬骨头
+
+“能运行 Bash”其实一点都不难。
+
+真正难的是：
+
+```text
+bash
+zsh
+fish
+
+vim
+neovim
+emacs
+tmux
+zellij
+htop
+btop
+fzf
+lazygit
+
+Nerd Font
+CJK
+emoji
+BiDi
+
+mouse
+bracketed paste
+focus events
+OSC 7
+OSC 8
+OSC 52
+OSC 133
+Kitty Keyboard
+Kitty Graphics
+Sixel
+alternate screen
+...
+```
+
+而且这些组合之后会出现大量边界问题。
+
+例如：
+
+```text
+tmux
+ └── nvim
+      └── Kitty keyboard protocol
+```
+
+或者：
+
+```text
+SSH
+ └── remote tmux
+       └── emoji + CJK + OSC
+```
+
+真正成熟的 terminal emulator，核心竞争力首先还是：
+
+> **几十年历史包袱下的兼容性。**
+
+这也是为什么 Ghostty、kitty、WezTerm 即使已经很成熟，仍然会不断修 terminal compatibility bug。
+
+---
+
+# 2. Unicode / Font / IME 会比想象中困难很多
+
+比如：
+
+```text
+Unicode scalar
+≠ grapheme
+≠ glyph
+≠ terminal cell
+```
+
+简单的：
+
+```text
+A
+```
+
+是一回事。
+
+但：
+
+```text
+👨‍👩‍👧‍👦
+🇨🇳
+é
+中文
+Arabic
+Nerd Font ligature
+```
+
+完全不是同一个问题。
+
+最终涉及：
+
+```text
+Unicode segmentation
+      ↓
+cell width
+      ↓
+font fallback
+      ↓
+shaping
+      ↓
+glyph atlas
+      ↓
+GPU rendering
+```
+
+还要确保：
+
+```text
+selection
+cursor
+mouse hit testing
+copy
+search
+IME composition
+```
+
+看到的是同一个逻辑模型。
+
+这是 Terminal 中最典型的“80% 很简单，最后 20% 无限困难”。
+
+---
+
+# 3. Terminal / View / Layout 分离虽然正确，但会制造新的复杂度
+
+例如同一个 Terminal 同时存在两个 View：
+
+```text
+Terminal A
+ ├── View 1: 120×40
+ └── View 2: 80×24
+```
+
+那么：
+
+> PTY 应该 resize 成多少？
+
+这是非常实际的问题。
+
+因为 PTY 只有一个：
+
+```text
+TIOCSWINSZ
+rows
+cols
+```
+
+所以必须明确：
+
+```text
+Terminal logical size
+View viewport size
+PTY canonical size
+```
+
+三者之间的 ownership。
+
+可能需要类似：
+
+```text
+Terminal owns canonical geometry
+
+View smaller:
+    viewport/clipping
+
+View larger:
+    padding / fit strategy
+```
+
+或者定义：
+
+```text
+active controlling View
+```
+
+否则多 View 架构理论很漂亮，实际却会变成大量隐式状态。
+
+这类问题应该尽早 fuzz/test。
+
+---
+
+# 4. Generic Panel 会带来另一组非常大的问题
+
+一旦 Panel 不只是 Terminal：
+
+```text
+Terminal
+Browser
+File
+Markdown
+Agent
+Git
+System Monitor
+```
+
+那么就必须解决统一的：
+
+```text
+focus
+keyboard routing
+mouse routing
+resize
+lifecycle
+persistence
+suspend
+resume
+serialization
+accessibility
+selection
+clipboard
+drag/drop
+context menu
+command routing
+```
+
+例如用户按：
+
+```text
+Ctrl+C
+```
+
+到底是：
+
+```text
+Terminal -> SIGINT
+```
+
+还是：
+
+```text
+Browser -> Copy
+```
+
+还是：
+
+```text
+Markdown Panel -> Copy
+```
+
+又或者：
+
+```text
+Bitty global command
+```
+
+所以未来 Bitty 很可能需要一个明确的 input routing model：
+
+```text
+Platform Event
+      ↓
+Global Shortcut
+      ↓
+Focused Panel
+      ↓
+Focused Component
+      ↓
+Terminal Encoder / UI Action
+```
+
+而不是不断追加 `if panel_type == ...`。
+
+---
+
+# 5. Rich UI 和 Terminal 的共存也非常难
+
+Bitty 当前已经明确区分：
+
+```text
+TerminalSurface
+RichSurface
+OverlaySurface
+```
+
+这个方向是对的。
+
+但后面会遇到：
+
+```text
+selection
+search
+copy
+scroll
+anchor
+resize
+accessibility
+export
+screen reader
+mouse coordinates
+```
+
+例如：
+
+```text
+$ cat report.md
+
+[Markdown RichBlock]
+# Result
+...
+```
+
+这个 RichBlock 到底：
+
+* 占多少 terminal rows？
+* shell 的 cursor 在哪里？
+* scrollback 怎么表示？
+* resize 后 anchor 怎么变化？
+* Ctrl+A / mouse selection 跨 RichBlock 怎么工作？
+* tmux 怎么理解？
+* alternate screen 下允许吗？
+
+所以 Rich UI 最大的问题从来不是“画 Markdown”。
+
+而是：
+
+> **怎么让 Rich UI 不破坏几十年来 Terminal 对 row/column/cursor 的假设。**
+
+你现在选择“不修改 Terminal Truth”是非常正确的。
+
+---
+
+# 6. Cross-platform 是一个巨大长期成本
+
+Bitty 当前明确不是 Windows 后补：
+
+```text
+Unix:
+PTY
+
+Windows:
+ConPTY
+```
+
+而 platform layer 还要抽象：
+
+```text
+Wayland
+X11
+macOS
+Windows
+
+clipboard
+IME
+DPI
+windowing
+notifications
+process
+filesystem
+font discovery
+```
+
+最大的风险是为了统一而造出：
+
+```rust
+trait Platform {
+    fn do_everything(...)
+}
+```
+
+这种 God abstraction。
+
+更合理的是按 capability 分：
+
+```text
+WindowBackend
+ClipboardBackend
+ImeBackend
+FontBackend
+PtyBackend
+NotificationBackend
+```
+
+让平台差异显式存在，而不是假装 Linux/Windows/macOS 一样。
+
+---
+
+# 7. Bitty 还有一个非常困难的目标：既强大又轻
+
+当前 Performance RFC 的目标相当激进：
+
+```text
+cold startup
+≤100 ms p50
+
+idle RSS
+≤80 MB
+
+input latency
+≤8 ms p50
+
+binary
+≤25 MB
+
+distribution
+≤40 MB
+
+idle periodic wakeups
+0
+```
+
+其实这里最大的架构挑战就是：
+
+> 不能因为未来可能有 Browser、Agent、Git、Markdown，就让一个空 terminal 启动时把所有东西都初始化。
+
+正确状态应该一直是：
+
+```text
+bitty
+│
+├── PTY
+├── VT
+├── fonts
+├── renderer
+└── basic UI
+
+≈ lightweight terminal
+```
+
+只有用户要求：
+
+```text
+Browser Panel
+```
+
+才出现 Browser runtime。
+
+要求：
+
+```text
+AI
+```
+
+才出现 Agent runtime/network/model client。
+
+这也是 Bitty 能否区别于 WaveTerm/Electron workstation 的关键。
+
+---
+
+# 三、然后单独来看插件系统：它真正需要解决什么？
+
+这里我觉得必须先明确一件事：
+
+## 插件系统绝不只是 `Lua API`
+
+完整的 Bitty Plugin Platform 实际应该包含：
+
+```text
+               Plugin Platform
+                     │
+ ┌───────────────────┼───────────────────┐
+ │                   │                   │
+Package            Runtime              API
+ │                   │                   │
+resolver            VM             command/event
+lockfile            isolation       UI/service
+update              lifecycle
+rollback            budgets
+ │                   │
+ └──────────┬────────┘
+            │
+      Capability Model
+            │
+       Observability
+            │
+          SDK
+```
+
+少任何一层，最终都会出问题。
+
+当前 Plugin Platform RFC 已经定义了相当多正确的基础：静态 `bitty-plugin.toml`、deny-by-default capability、Command/Event/UI/Service、generation lifecycle、bounded queues 等。
+
+---
+
+# 四、插件系统最重要的十个问题
+
+| 问题            | Bitty 应该坚持的方向                                     |
+| ------------- | ------------------------------------------------- |
+| API stability | stable semantic API，不泄露 Rust/wgpu/winit internals |
+| Isolation     | 每插件 VM，必要时 WASM/process                           |
+| Capability    | deny-by-default + scoped permission               |
+| Lifecycle     | generation ownership + deterministic cleanup      |
+| UI            | declarative primitives，不直接给 GPU/DOM               |
+| Event         | cold path + bounded queue                         |
+| Dependency    | deterministic resolver，不依赖 load order             |
+| Package       | lockfile + transactional update + rollback        |
+| Security      | provenance/signature/supply-chain                 |
+| DX            | SDK/mock/test/doctor/DevTools                     |
+
+其中最关键的是下面几个。
+
+---
+
+## 1. 最大风险其实是 Plugin API 设计得太早、太大
+
+例如如果 v1 直接暴露：
+
+```lua
+ctx.window.raw
+ctx.wgpu.device
+ctx.terminal.grid
+ctx.runtime.internal_manager
+```
+
+那以后基本没办法改内部架构。
+
+正确的是 semantic API：
+
+```lua
+ctx.ui:create_panel(...)
+ctx.commands:register(...)
+ctx.terminal:snapshot(...)
+ctx.process:spawn(...)
+ctx.fs:read(...)
+```
+
+插件应该知道：
+
+```text
+“创建一个 Panel”
+```
+
+而不知道：
+
+```text
+“这个 Panel 后面是 egui/winit/wgpu/GTK”
+```
+
+这也是为什么当前 RFC 把 Level 3/4 的 Presentation/Protocol extension 留出 v1，而不是一次性开放全部，我认为是对的。
+
+---
+
+# 2. Declarative UI 会是整个 Plugin API 最难设计的部分
+
+如果以后真的要让插件做：
+
+```text
+Tabs
+Statusline
+File Explorer
+Git
+Markdown
+Agent Chat
+System Monitor
+Browser launcher
+```
+
+那么基础 UI primitives 必须足够强。
+
+比如：
+
+```text
+Row
+Column
+Text
+Button
+Input
+List
+Tree
+Image
+Scroll
+Canvas?
+TerminalView
+RichText
+```
+
+然后：
+
+```text
+state
+event
+focus
+theme
+accessibility
+virtualization
+```
+
+都必须设计。
+
+太少：
+
+> 插件什么都做不了。
+
+太多：
+
+> Bitty 实际上自己实现了一套 React/Flutter。
+
+这是插件平台中我认为**难度最高的 API 问题**。
+
+---
+
+# 3. Capability system 必须非常严格
+
+当前 Bitty 已经采用：
+
+```text
+deny by default
+
+fs.read:/project/**
+network.connect:github.com
+process.spawn:git
+clipboard.read
+terminal.semantic-read
+terminal.input.self
+```
+
+这种思路，而且 first-party plugin 也不能绕过。
+
+这一点非常重要。
+
+特别是未来 AI plugin 会想获得：
+
+```text
+terminal output
+filesystem
+process
+network
+clipboard
+credentials
+runtime control
+```
+
+如果只有：
+
+```toml
+permissions = ["system"]
+```
+
+这种权限，等于没有 sandbox。
+
+---
+
+# 4. Lua VM 不能被误认为真正的 security sandbox
+
+当前 RFC 其实已经正确指出：
+
+> isolated Lua VM 是 namespace/failure boundary，不是 OS sandbox。
+
+所以未来可以形成三个 isolation tier：
+
+```text
+Tier 1
+Lua VM
+普通 UI/workflow plugin
+
+Tier 2
+WASM
+更强计算/第三方扩展
+
+Tier 3
+Helper Process
+高风险/复杂 runtime
+```
+
+尤其像：
+
+```text
+browser
+language server
+AI runtime
+database client
+native decoder
+```
+
+未必适合强行塞进 Lua VM。
+
+---
+
+# 5. Plugin 生命周期必须做到“真正卸载”
+
+这个很容易被忽略。
+
+比如：
+
+```text
+Plugin generation 7
+
+commands
+events
+panels
+timers
+tasks
+services
+queues
+watchers
+```
+
+reload：
+
+```text
+Generation 7
+      ↓ dispose ALL
+Generation 8
+```
+
+必须保证：
+
+```text
+no leaked callbacks
+no leaked timer
+no leaked task
+no stale service
+no stale UI
+no stale permission
+```
+
+否则运行几天后就会变成：
+
+```text
+reload 50 次
+→ 50 个 background task
+```
+
+Bitty 当前用 `(PluginId, generation)` 来标记 ownership，这个方向非常好。
+
+---
+
+# 6. Event system 绝对不能变成 Neovim autocmd 的无限版
+
+如果任何插件都能：
+
+```text
+on_byte
+on_cell
+on_glyph
+on_keydown
+on_mouse_move
+```
+
+那么：
+
+```text
+PTY
+ ↓
+plugin
+ ↓
+plugin
+ ↓
+plugin
+ ↓
+renderer
+```
+
+性能很快就没了。
+
+Bitty 当前已经明确：
+
+```text
+hot path
+    不允许插件进入
+
+cold-path events
+    bounded queue
+```
+
+而且当前 accepted default 是：
+
+```text
+PerSubscription: 64 events
+PerPlugin: 1024 events / 256 KiB
+Global: 8192 events / 2 MiB
+
+DropOldest
+```
+
+这是非常健康的设计。
+
+---
+
+# 7. 插件依赖不应该等于 Lua `require`
+
+应该区分：
+
+```text
+implementation dependency
+```
+
+与：
+
+```text
+service dependency
+```
+
+比如 Git 插件公开：
+
+```text
+git.repository @ v2
+```
+
+其他插件：
+
+```lua
+ctx.services:get("git.repository", ">=2")
+```
+
+而不是：
+
+```lua
+require("other_plugin.internal.git")
+```
+
+这样才能独立升级。
+
+最终更像：
+
+```text
+Plugin A
+    ↓
+Service Interface
+    ↓
+Plugin B
+```
+
+而不是直接 code coupling。
+
+---
+
+# 8. Package Manager 是插件系统的一部分，而不是额外小功能
+
+长期必须考虑：
+
+```text
+install
+remove
+enable
+disable
+update
+update-all
+lock
+rollback
+verify
+doctor
+```
+
+以及：
+
+```text
+version resolver
+dependency graph
+checksum
+signature
+provenance
+yank
+prerelease
+registry
+local path
+Git source
+```
+
+特别是更新应该：
+
+```text
+download
+ ↓
+verify
+ ↓
+resolve
+ ↓
+stage
+ ↓
+activate transaction
+ ↓
+success ── commit
+failure ── rollback
+```
+
+而不是：
+
+```text
+下载完直接覆盖 ~/.config/bitty/plugins/foo
+```
+
+---
+
+# 9. First-party plugin 必须严格 dogfood public API
+
+这个决定现在 Bitty 已经做得非常正确。
+
+当前 Default Distribution RFC 甚至规定：
+
+> v1 默认启用插件数量是 **0**。
+
+但会 bundle：
+
+```text
+shell-integration
+tabs
+statusline
+palette
+project
+```
+
+全部默认 disabled。
+
+而且 first-party plugin：
+
+```text
+same API
+same manifest
+same capability
+same lifecycle
+```
+
+不能：
+
+```lua
+ctx.__internal_magic()
+```
+
+这是判断 Plugin API 是否真的够用的最好办法。
+
+如果 Bitty 官方 tabs plugin 自己都需要私有 API：
+
+> Plugin API 就设计失败了。
+
+---
+
+# 十、所以我认为 Bitty 现在最需要警惕的不是“功能不够”
+
+反而是：
+
+> **抽象过度。**
+
+现在已经有：
+
+```text
+16 crates
+Terminal
+View
+Layout
+Rich
+IPC
+Agent
+Lua
+Plugin
+Package
+Runtime
+Config
+...
+```
+
+架构确实漂亮，但 Terminal 项目非常容易陷入：
+
+```text
+设计 Platform
+→ 为未来设计 Protocol
+→ 为 Protocol 设计 abstraction
+→ 为 abstraction 设计 extension point
+→ 终端本身还没真正跑起来
+```
+
+当前仓库 README 自己也很诚实地说，它现在主要还是 foundation evidence，而不是 released terminal。
+
+所以我认为接下来最重要的阶段其实应该从：
+
+```text
+Architecture-first
+```
+
+逐渐切换成：
+
+```text
+Dogfooding-first
+```
+
+---
+
+# 我会给 Bitty 当前工作排成这个顺序
+
+```text
+                 ┌──────────────────┐
+                 │ Terminal Truth   │
+                 │ PTY / VT / State │
+                 └────────┬─────────┘
+                          │
+                          ▼
+                 ┌──────────────────┐
+                 │ Real Renderer    │
+                 │ Font/Input/IME   │
+                 └────────┬─────────┘
+                          │
+                          ▼
+                 ┌──────────────────┐
+                 │ Usable Terminal  │
+                 │ shell/nvim/tmux  │
+                 └────────┬─────────┘
+                          │
+                    dogfooding
+                          │
+                          ▼
+              ┌───────────────────────┐
+              │ View/Layout/Panel     │
+              └───────────┬───────────┘
+                          │
+                          ▼
+                ┌──────────────────┐
+                │ Plugin API v1    │
+                └────────┬─────────┘
+                         │
+              official plugins dogfood
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │ Rich / IPC / Agent   │
+              │ Browser / ecosystem  │
+              └──────────────────────┘
+```
+
+也就是说，**Bitty 最大的短期挑战不是做出更多能力，而是证明这套架构在一个真实、高兼容性、高性能的 Terminal 上不会成为负担。**
+
+一旦这个底座成立，Bitty 的差异化会非常明显：
+
+> **Alacritty 可以很小，WaveTerm 可以很丰富，Warp 可以很 Agentic，WezTerm 可以很 programmable；而 Bitty 想证明的是，同一个 architecture 能够从“小型 Terminal”平滑生长成“programmable workstation”，并且用户没有启用的东西真正不存在于运行时成本里。**
+
+如果最终做到这一点，我认为这才是 Bitty 最强、也是目前这些 Terminal 中相当少见的特点。

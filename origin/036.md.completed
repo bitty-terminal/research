@@ -1,0 +1,910 @@
+在 Bitty 中一个 Panel 中，设置的环境变量得怎么管理呢？比如 export ENV=xxx, set -x ENV xxx 这种的怎么保留呢？然后之后 bitty-ai 做了之后，agent 如何知道哪些 Panel 有哪些环境变量呢？
+现在的 Bitty 的 Panel 生成机制是跟 Ghostty、Kitty 哪些相似的，都是从 Focus 的生成新的，并且位置 pwd 也是上个那样，只不过这个生成的位置机制是跟 Hyprland 一样的。
+那么这个临时环境变量这个部分要如何规划呢
+
+## 核心问题：环境变量属于 Shell，不属于 Panel
+
+在 Bitty 里，首先要把几个对象分开：
+
+```text
+Bitty
+  └─ Panel
+      └─ PTY
+          └─ Shell
+              ├─ export FOO=bar
+              ├─ source .venv/bin/activate
+              ├─ set -x FOO bar
+              └─ command...
+```
+
+例如：
+
+```bash
+export ENV=xxx
+```
+
+或者 fish：
+
+```fish
+set -x ENV xxx
+```
+
+真正被修改的是 **shell 进程自身的 environment**。
+
+Bitty 启动 shell 时可以决定它的初始环境，但之后 shell 自己执行了 `export`，Bitty Core 并不会天然收到通知。
+
+这也是 Kitty 为什么要专门实现 `clone-in-kitty`：普通 `--copy-env` 只能复制窗口创建时保存的 environment，不能得到 shell 后来修改过的 environment；而 `clone-in-kitty` 则通过 shell integration，让 shell 把自己的 state 序列化给 Kitty。([Kovid Goyal][1])
+
+Ghostty 目前公开的 shell integration 也主要用来解决“新 terminal 从上一个 focused terminal 的 cwd 开始”等状态同步；配置里的 `env = KEY=VALUE` 则属于启动环境。([Ghostty][2])
+
+所以我建议 Bitty **借 Kitty 的思想，但做成更系统的 Panel Environment State**。
+
+---
+
+# Bitty 应该有四层 Environment
+
+我会把模型设计成：
+
+| 层            | 示例                            | 生命周期              |
+| ------------ | ----------------------------- | ----------------- |
+| `ProcessEnv` | `HOME`, `PATH`, `LANG`        | Bitty 进程          |
+| `ConfigEnv`  | Bitty config / `.bitty` 配置    | Session / Project |
+| `LaunchEnv`  | Panel 创建时继承的环境                | Panel             |
+| `RuntimeEnv` | `export`, `set -x`, `venv` 修改 | Shell runtime     |
+
+也就是：
+
+```text
+ProcessEnv
+    ↓
+ConfigEnv
+    ↓
+Source Panel RuntimeEnv
+    ↓
+Explicit overrides
+    ↓
+New Panel LaunchEnv
+```
+
+比如：
+
+```text
+Panel A
+cwd = ~/Projects/bitty
+
+export RUST_LOG=debug
+export FOO=bar
+source .venv/bin/activate
+```
+
+此时：
+
+```text
+Panel A RuntimeEnv
+
+FOO=bar
+RUST_LOG=debug
+VIRTUAL_ENV=/home/xuepoo/Projects/bitty/.venv
+PATH=/home/.../.venv/bin:...
+...
+```
+
+然后：
+
+```text
+Mod+Enter
+```
+
+从 focused Panel A 创建 Panel B。
+
+Bitty 就可以：
+
+```text
+Panel A RuntimeEnv Snapshot
+              ↓
+         Panel B
+      Launch Environment
+```
+
+于是 Panel B 自动得到：
+
+```bash
+$ echo $FOO
+bar
+
+$ echo $VIRTUAL_ENV
+/home/.../bitty/.venv
+```
+
+这个行为非常符合你现在 Bitty 的设计：
+
+```text
+focused Panel
+     │
+     ├── cwd
+     ├── environment
+     └── context
+           ↓
+        new Panel
+```
+
+布局位置仍然完全交给 Hyprland 风格的 layout tree 决定。
+
+---
+
+# 但 RuntimeEnv 怎么得到？
+
+这里我不建议 Bitty：
+
+```text
+❌ 解析用户输入
+
+export FOO=bar
+set -x FOO bar
+unset FOO
+source env.sh
+source .venv/bin/activate
+```
+
+因为根本解析不完。
+
+下面这些都可能修改 environment：
+
+```bash
+export A=1
+
+source setup.sh
+
+eval "$(...)" 
+
+direnv allow
+
+conda activate foo
+
+source .venv/bin/activate
+
+foo() {
+    export BAR=123
+}
+foo
+```
+
+甚至：
+
+```bash
+source some_arbitrary_script.sh
+```
+
+Bitty 不可能通过 command parser 正确知道最终结果。
+
+也不要依赖：
+
+```text
+/proc/<pid>/environ
+```
+
+它不是一个合适的跨平台、可靠的 shell runtime state API。
+
+## 最漂亮的方案是 Shell Integration + helper
+
+例如 Bitty 为 bash/zsh/fish/nushell 注入自己的 shell integration。
+
+每次 shell 回到 prompt：
+
+```text
+command finished
+      ↓
+shell precmd / PROMPT_COMMAND
+      ↓
+bitty __shell-sync
+      ↓
+Bitty Core
+```
+
+关键在于：
+
+> `bitty __shell-sync` 是 **shell 的 child process**。
+
+所以 shell 不需要自己序列化 environment。
+
+假如 shell 当前：
+
+```bash
+export FOO=bar
+export ABC=123
+source .venv/bin/activate
+```
+
+它执行：
+
+```bash
+bitty __shell-sync
+```
+
+这个 helper 天然继承：
+
+```text
+FOO=bar
+ABC=123
+VIRTUAL_ENV=...
+PATH=...
+```
+
+然后 Rust 里直接：
+
+```rust
+std::env::vars_os()
+```
+
+就获得真正的 exported environment。
+
+这意味着 bash：
+
+```bash
+export FOO=bar
+```
+
+zsh：
+
+```zsh
+export FOO=bar
+```
+
+fish：
+
+```fish
+set -x FOO bar
+```
+
+甚至：
+
+```bash
+source whatever.sh
+```
+
+全部自动支持。
+
+不需要 Bitty 理解这些 shell syntax。
+
+这是我非常推荐 Bitty 使用的方案。
+
+---
+
+# 可以建立 `PanelEnvSnapshot`
+
+Core 内部可以类似：
+
+```rust
+struct PanelEnvSnapshot {
+    panel_id: PanelId,
+    revision: u64,
+
+    cwd: PathBuf,
+
+    env: HashMap<OsString, OsString>,
+
+    shell: ShellKind,
+
+    sync_state: EnvSyncState,
+}
+```
+
+例如：
+
+```text
+Panel #3
+
+cwd:
+  ~/Projects/bitty
+
+env revision:
+  42
+
+last sync:
+  prompt #127
+
+environment:
+  PATH=...
+  HOME=...
+  RUST_LOG=debug
+  VIRTUAL_ENV=...
+  FOO=bar
+```
+
+执行：
+
+```bash
+export FOO=hello
+```
+
+回到 prompt：
+
+```text
+revision 42
+    ↓
+revision 43
+```
+
+甚至可以内部只存 diff：
+
+```text
+EnvDiff #43
+
+changed:
+  FOO: bar → hello
+
+added:
+  TEST=value
+
+removed:
+  OLD_ENV
+```
+
+不过环境通常就几 KB～几十 KB，第一版完全没必要优化这么早，直接 snapshot 即可。
+
+---
+
+# Shell Integration 只需要在 Prompt 时同步
+
+没必要监听每一次 shell 操作。
+
+生命周期：
+
+```text
+                ┌─────────────┐
+                │ Shell Prompt │
+                └──────┬──────┘
+                       │
+                sync environment
+                       │
+                       ▼
+               PanelEnvSnapshot
+                       │
+             user executes command
+                       │
+                       ▼
+                command running
+                       │
+                       ▼
+                 command ends
+                       │
+                       ▼
+                Shell Prompt
+                       │
+                sync environment
+```
+
+这样：
+
+```bash
+source .venv/bin/activate
+```
+
+执行结束以后：
+
+```text
+VIRTUAL_ENV added
+PATH changed
+```
+
+就自然被 Bitty 得到了。
+
+这和 cwd、command boundary、exit code 等 shell integration 信息可以属于同一个体系。
+
+---
+
+# `cwd` 和 `env` 实际上可以统一
+
+现在你的 Bitty 已经有：
+
+```text
+focused Panel
+    ↓
+cwd
+    ↓
+new Panel
+```
+
+Ghostty Shell Integration 就明确支持新 terminal 从此前 focused terminal 的 working directory 开始。([Ghostty][3])
+
+以后可以扩展成：
+
+```text
+ShellState
+├── cwd
+├── env
+├── shell
+├── foreground command
+├── prompt state
+├── last command
+├── exit status
+├── virtual environment
+└── remote/local
+```
+
+也就是说，不要专门创造一个：
+
+```text
+EnvManager
+```
+
+然后 cwd 又在另一个地方管理。
+
+更适合设计成：
+
+```rust
+struct ShellState {
+    cwd: PathBuf,
+    env: EnvSnapshot,
+    command: Option<CommandState>,
+    prompt: PromptState,
+    shell: ShellKind,
+    remote: RemoteState,
+}
+```
+
+Panel：
+
+```rust
+struct Panel {
+    id: PanelId,
+    pty: Pty,
+    shell_state: ShellState,
+    ...
+}
+```
+
+这样对未来的 bitty-ai 会非常有价值。
+
+---
+
+# bitty-ai 不应该直接拿全部 Environment
+
+这个地方尤其重要。
+
+因为 environment 经常有：
+
+```text
+OPENAI_API_KEY
+ANTHROPIC_API_KEY
+AWS_SECRET_ACCESS_KEY
+GITHUB_TOKEN
+DATABASE_URL
+PASSWORD
+SSH_AUTH_SOCK
+```
+
+所以千万不要：
+
+```text
+PanelEnvSnapshot
+      ↓
+serialize
+      ↓
+LLM context
+```
+
+否则一个 Panel：
+
+```bash
+export OPENAI_API_KEY=sk-xxxxx
+```
+
+Agent 一 inspect Panel，就把 key 发送给模型了。
+
+应该设计成：
+
+```text
+             Panel Environment
+                    │
+          ┌─────────┴─────────┐
+          │                   │
+     Execution View       Agent View
+          │                   │
+      full values        sanitized
+```
+
+比如 Agent 调：
+
+```text
+panel.inspect(3)
+```
+
+看到：
+
+```text
+Panel #3
+
+cwd:
+  ~/Projects/bitty
+
+shell:
+  fish
+
+environment:
+  VIRTUAL_ENV = ~/.venv
+  RUST_LOG = debug
+  NODE_ENV = development
+  OPENAI_API_KEY = <redacted>
+  AWS_SECRET_ACCESS_KEY = <redacted>
+
+env_revision:
+  43
+```
+
+甚至 API 可以返回：
+
+```json
+{
+  "panel_id": 3,
+  "cwd": "~/Projects/bitty",
+  "environment": {
+    "VIRTUAL_ENV": "~/.venv",
+    "RUST_LOG": "debug",
+    "OPENAI_API_KEY": {
+      "present": true,
+      "secret": true
+    }
+  }
+}
+```
+
+Agent 知道：
+
+> “这个 Panel 有 OpenAI credential。”
+
+但不知道：
+
+> `sk-proj-xxxxxxxx`
+
+---
+
+# 更进一步：Agent 根本不需要“知道” Secret
+
+假如 Agent 想：
+
+```bash
+cargo test
+```
+
+或者：
+
+```bash
+python script.py
+```
+
+最好的架构不是：
+
+```text
+Agent
+  ↓
+获得 Environment
+  ↓
+执行 command
+```
+
+而是：
+
+```text
+Agent
+   │
+   │ execute(panel=3, "python script.py")
+   ▼
+Bitty Core
+   │
+   ├── Panel #3 environment
+   ├── credentials
+   └── cwd
+   ↓
+Process
+```
+
+也就是：
+
+> **Use Environment ≠ Read Environment**
+
+这是以后 bitty-ai 非常重要的权限边界。
+
+Agent 可以使用：
+
+```text
+OPENAI_API_KEY
+AWS credentials
+GitHub token
+```
+
+运行程序。
+
+但是 LLM 根本没有必要看到值。
+
+---
+
+# 我甚至建议 Env Snapshot 使用 Handle
+
+以后可以做成：
+
+```text
+Panel #3
+    │
+    └── EnvSnapshot #81
+```
+
+Agent 创建 headless Panel：
+
+```text
+spawn_panel(
+    source = Panel#3
+)
+```
+
+实际上：
+
+```text
+Panel #3
+cwd ------------------┐
+                      │
+EnvSnapshot #81 ------┼──→ Headless Panel #7
+                      │
+project context ------┘
+```
+
+Bitty Core 内部负责传递 environment。
+
+Agent 只知道：
+
+```text
+env_snapshot_id = 81
+```
+
+不需要得到真正的数据。
+
+这个设计对你之前规划的：
+
+```text
+Agent ↔ Panel
+```
+
+生命周期模型也非常适合。
+
+---
+
+# 新 Panel 的默认行为，我建议这样定
+
+Bitty 可以定义三种语义：
+
+| 行为            | cwd            | environment       |
+| ------------- | -------------- | ----------------- |
+| `new`         | focused Panel  | focused Panel     |
+| `clean`       | focused / home | Bitty base env    |
+| `spawn --env` | source         | source + override |
+
+例如默认：
+
+```text
+Mod+Enter
+```
+
+就是：
+
+```text
+new_panel {
+    source = focused,
+    cwd = inherit,
+    env = inherit,
+}
+```
+
+所以：
+
+```text
+Panel A
+
+~/bitty
+FOO=bar
+VIRTUAL_ENV=~/bitty/.venv
+```
+
+创建：
+
+```text
+Panel B
+
+~/bitty
+FOO=bar
+VIRTUAL_ENV=~/bitty/.venv
+```
+
+这比“只继承 cwd”更加符合 Bitty 的 Panel 模型。
+
+如果用户想干净环境：
+
+```bash
+bitty panel new --clean-env
+```
+
+或者 API：
+
+```lua
+bitty.panel.spawn({
+    cwd = "inherit",
+    env = "clean",
+})
+```
+
+插件也可以：
+
+```lua
+bitty.panel.spawn({
+    env = {
+        inherit = true,
+        RUST_LOG = "trace",
+        DEBUG = "1",
+    }
+})
+```
+
+---
+
+# 但不要默认持久化到磁盘
+
+这里需要把“继承”和“持久化”区分开：
+
+```text
+export FOO=bar
+```
+
+我建议：
+
+```text
+当前 Panel          ✓
+从它新建 Panel      ✓
+Agent headless clone ✓
+
+Bitty 重启后恢复     ✗ 默认不保存
+写 session 文件      ✗
+写日志               ✗
+```
+
+因为里面很可能有 Secrets。
+
+Bitty 重启后的环境应该重新来自：
+
+```text
+OS environment
++
+bitty config
++
+.bitty config
++
+shell rc
+```
+
+而不是：
+
+```text
+昨天 Panel 的整个 environment dump
+```
+
+如果以后真的需要 session environment persistence，可以做显式 allowlist：
+
+```lua
+session = {
+    persist_env = {
+        "RUST_LOG",
+        "NODE_ENV",
+        "VIRTUAL_ENV",
+    }
+}
+```
+
+而不是默认全存。
+
+---
+
+# Shell-local variable 也不要管
+
+还有一个很重要的边界。
+
+例如 Bash：
+
+```bash
+FOO=bar
+```
+
+没有：
+
+```bash
+export FOO
+```
+
+那么 `FOO` 是 shell variable，不是 environment variable。
+
+Bitty 不应该同步它。
+
+同样包括：
+
+```text
+aliases
+shell functions
+local variables
+shell options
+history
+completion state
+prompt internals
+```
+
+第一阶段只定义：
+
+> **Bitty Panel Environment = exported process environment**
+
+这样语义非常清晰。
+
+Kitty 的 `clone-in-kitty` 也特别为 virtualenv / Conda 等额外 shell state 做了一些专门恢复策略，说明“完整 clone shell”本身比单纯 environment 更复杂。([Kovid Goyal][1])
+
+Bitty 前期没必要试图完整复制整个 shell。
+
+---
+
+# 最终我建议形成这样一套 Core
+
+```text
+                    Bitty Core
+                        │
+              ┌─────────┴─────────┐
+              │                   │
+          Panel #1            Panel #2
+              │
+             PTY
+              │
+            Shell
+              │
+      Bitty Shell Integration
+              │
+        prompt reached
+              │
+      bitty __shell-sync
+              │
+              ▼
+        ShellStateManager
+              │
+       ┌──────┼─────────┐
+       │      │         │
+      cwd    env      command
+       │      │         │
+       └──────┼─────────┘
+              ▼
+       PanelStateSnapshot
+              │
+        ┌─────┴──────┐
+        │            │
+ new Panel        bitty-ai
+        │            │
+ inherit         sanitized view
+ environment       +
+                  env handle
+```
+
+其中最关键的抽象不是：
+
+```rust
+Panel.env: HashMap<...>
+```
+
+而是：
+
+```rust
+Panel
+ ├── launch_context
+ └── shell_state
+       ├── cwd
+       ├── environment
+       ├── command
+       └── prompt
+```
+
+我认为这个设计会非常适合 Bitty，因为之后 **Panel、Agent、headless Panel、project `.bitty` context、virtualenv、command execution** 都能通过同一个 `ShellState / ExecutionContext` 接起来，而不是等 bitty-ai 做到后面再反过来给终端补环境状态系统。
+
+[1]: https://sw.kovidgoyal.net/kitty/shell-integration/?utm_source=chatgpt.com "Shell integration - kitty"
+[2]: https://ghostty.org/docs/config/reference?utm_source=chatgpt.com "Option Reference - Configuration"
+[3]: https://ghostty.org/docs/features/shell-integration?utm_source=chatgpt.com "Shell Integration - Features"
+

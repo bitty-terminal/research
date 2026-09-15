@@ -1,0 +1,726 @@
+你可以看看 bitty-ai 和 bitty-ai-docs 的情况吗？这些是否有需要改和优化的地方吗？给出一些建议也可以，因为现在一直在准备文档工作，没有开始代码工作
+## 结论
+
+我把现在的 `bitty-ai` 和 `bitty-ai-docs` 重新看了一遍。我的判断是：
+
+> **文档准备阶段已经足够成熟，现在应该正式进入代码阶段。**
+>
+> 接下来继续大规模扩写架构文档的边际收益已经开始下降，最需要的是用实现反过来收敛这些 Draft。
+
+而且严格来说，现在已经不是“完全没有开始代码”。`bitty-ai-slice` 已经是一个很好的 **walking skeleton / architecture pressure test**：它已经跑通了
+
+`prompt → ModelProvider → ContextProvider → Tool Bus → stream`
+
+并覆盖了 deterministic、missing consent、missing scope、unknown tool、write deny、budget exceeded、oversized chunk 等 fail-closed 情况。
+
+所以我会把现在的阶段定义成：
+
+**Architecture exploration → Experimental implementation 已完成第一步，现在该进入 Runtime implementation。**
+
+---
+
+# 1. 目前整体架构其实已经相当完整
+
+`bitty-ai-docs` 现在已经不是几个零散 RFC，而是一整个 Architecture Family：
+
+| 文档                                   | 当前作用                                  |
+| ------------------------------------ | ------------------------------------- |
+| `ai-architecture.md`                 | 总架构                                   |
+| `ipc-agent-rfc.md`                   | IPC / Agent 边界                        |
+| `context-management.md`              | Context / compaction                  |
+| `command-tool-architecture.md`       | `/command` / Tool / Lua               |
+| `agent-coordination.md`              | multi-agent / lifecycle / supervision |
+| `code-intelligence.md`               | AST / LSP / verification reuse        |
+| `persistence-evidence.md`            | session / evidence / persistence      |
+| `browser-agent-pre-study.md`         | Browser Agent                         |
+| `ai-vertical-slice-pressure-test.md` | 用真实代码验证架构                             |
+| `ai-unresolved-questions.md`         | 仍未决定的问题                               |
+
+这套 dependency graph 本身已经写得比较清楚。
+
+尤其是最近我们讨论的 `/compact`、`/review`、`/plan`、`/loop`、Tools、AST、Panel、Agent 生命周期等，现在基本都已经进入 canonical docs 了。
+
+例如 command/tool 文档已经明确区分：
+
+```text
+Command = control plane
+Tool    = agent data plane
+Skill   = workflow / composition
+```
+
+以及：
+
+```text
+/compact -> Lua command + Rust context primitive
+/review  -> Lua workflow
+/plan    -> Lua workflow
+/read    -> AI runtime primitive
+/edit    -> AI runtime primitive
+/lsp     -> AI runtime primitive
+```
+
+这个方向我认为是对的。
+
+Context 这边也已经形成了很好的核心原则：
+
+> Session is fact; Context is projection.
+
+然后是：
+
+```text
+Level 0 Structured Output
+Level 1 Lossless Pruning
+Level 2 Selective Compression
+Level 3 Global Compaction
+Level 4 Provider-native / Remote Compaction
+```
+
+尤其 Level 0 的思想非常重要：**不要先制造 20k tokens 垃圾，然后再想办法 compact。**
+
+所以架构上的“大方向”已经够用了。
+
+---
+
+# 2. 现在最需要防止的是「继续设计而不实现」
+
+目前最大的风险反而不是架构考虑不全，而是：
+
+> **设计空间太大，于是永远还有一个 RFC 可以继续写。**
+
+`ai-unresolved-questions.md` 目前保存了 51 个 identifier，涉及 Context、Tool、Agent Coordination、Code Intelligence、Persistence 等多个方向。
+
+这些问题当然有价值，但不能要求：
+
+```text
+51 个问题全部解决
+        ↓
+才允许实现
+```
+
+否则 Bitty AI 会变成一个“形式上极其成熟、但没有 runtime”的项目。
+
+现在应该改成：
+
+```text
+Architecture
+     │
+     ▼
+Release Profile
+     │
+     ▼
+Implementation
+     │
+     ▼
+Evidence
+     │
+     ▼
+Architecture revision
+```
+
+而不是：
+
+```text
+Architecture
+     ↓
+More architecture
+     ↓
+More research
+     ↓
+More OQs
+     ↓
+More architecture
+```
+
+---
+
+# 3. 我建议马上增加一个 `v0.1 implementation profile`
+
+这是现在 `bitty-ai-docs` **最值得新增的一篇文档**。
+
+不是再写一个大 RFC，而是一个非常短的：
+
+```text
+specifications/
+  implementation-profile-v0.1.md
+```
+
+或者：
+
+```text
+roadmap/
+  v0.1-runtime.md
+```
+
+它只回答：
+
+```text
+v0.1 做什么？
+v0.1 不做什么？
+哪些 Draft contract 可以实验性采用？
+哪些 OQ 真正 blocking？
+成功标准是什么？
+```
+
+例如我会把 v0.1 压缩成：
+
+```text
+ModelProvider
+ContextProvider
+Session
+ToolBus
+Streaming
+Generic Bitty IPC Bridge
+```
+
+而明确排除：
+
+```text
+Multi-agent organization
+Agent teams
+Long-term memory
+Browser agent
+Remote compaction
+Provider-native compaction
+Persistent evidence DB
+Cross-session memory
+LSP service sharing
+Task organization graph
+Agent dashboard
+```
+
+这样你就可以开始写东西了。
+
+---
+
+# 4. `bitty-ai-slice` 不应该丢掉，它就是代码起点
+
+现在这个实验 crate 已经有：
+
+```rust
+bridge
+context
+error
+provider
+session
+stream
+toolbus
+```
+
+而且已经导出了：
+
+```rust
+ModelProvider
+ContextProvider
+ToolBus
+VerticalSlice
+StreamSink
+IpcBridge
+```
+
+这实际上已经非常接近一个最小 runtime 的结构。
+
+我不建议：
+
+```text
+实验结束
+→ 删除 slice
+→ 重新从空白开始写正式代码
+```
+
+更好的方式是：
+
+```text
+bitty-ai-slice
+      │
+      │ experimental contracts
+      ▼
+production implementation
+      │
+      ├─ 保留 slice 作为 integration test/reference
+      │
+      └─ 把稳定 primitive 逐步迁移出去
+```
+
+也就是说它最后可以成为类似：
+
+```text
+tests/
+  vertical_slice.rs
+```
+
+或者：
+
+```text
+crates/
+  bitty-ai-testkit/
+```
+
+它持续验证：
+
+> **完整 AI turn 仍然可以只建立在 generic Bitty primitives 上。**
+
+这个 pressure test 很有价值。
+
+---
+
+# 5. 我暂时不建议立刻拆五个 production crates
+
+现在 README 规划的是：
+
+```text
+bitty-ai-model-provider
+bitty-ai-context-provider
+bitty-ai-agent
+bitty-ai-tool-bus
+bitty-ai-workspace
+```
+
+Cargo workspace 里也已经把这些作为 Future crates 记下来了。
+
+方向可以保留，但我**不建议现在直接把五个空 crate 全创建出来**。
+
+否则非常容易进入 crate-boundary-driven development：
+
+```text
+这个 trait 放哪？
+这个 type 谁拥有？
+是不是要再加 common？
+是不是需要 protocol？
+workspace 依赖 agent 还是 agent 依赖 workspace？
+```
+
+代码还没多少，dependency graph 先复杂起来。
+
+我反而建议第一版是：
+
+```text
+crates/
+├── bitty-ai-runtime/
+│   └── src/
+│       ├── provider/
+│       ├── context/
+│       ├── session/
+│       ├── tool/
+│       ├── agent/
+│       └── stream/
+│
+└── bitty-ai-slice/
+```
+
+或者继续叫：
+
+```text
+bitty-ai-core
+```
+
+但我其实更偏向 **`bitty-ai-runtime`**。
+
+因为你整个 Bitty 架构一直强调：
+
+```text
+Terminal Core
+AI Runtime
+Lua Plugin
+```
+
+`bitty-ai-core` 很容易和真正的 Bitty Core 混淆。
+
+而且 command/tool 文档自己也已经专门澄清：
+
+> `bitty-ai-core` 是 conceptual layer，并不是已经确定的 repository/crate assignment。
+
+所以现在正好是改名字成本最低的时候。
+
+---
+
+# 6. 第一阶段代码不要先碰 OpenAI / Claude
+
+我会先做一个完全 deterministic 的 runtime。
+
+也就是：
+
+```text
+                ┌──────────────┐
+                │ FakeProvider │
+                └──────┬───────┘
+                       │
+User
+ │
+ ▼
+Session
+ │
+ ▼
+ContextBuilder
+ │
+ ▼
+AgentLoop
+ │
+ ├──── ToolCall ────► ToolBus
+ │                       │
+ │                       ▼
+ │                  Bitty Bridge
+ │
+ ▼
+Stream
+```
+
+现在 slice 里的 `DeterministicLocalProvider` 就非常适合。
+
+先验证：
+
+```text
+Session
+Context
+Tool invocation
+Cancellation
+Streaming
+Budget
+Errors
+Authorization
+Artifacts
+```
+
+等这些接口稳定以后，再接：
+
+```text
+OpenAI
+Anthropic
+Gemini
+OpenRouter
+Ollama
+```
+
+否则 provider API 的各种特殊行为会太早污染 runtime abstraction。
+
+---
+
+# 7. Context 第一版只实现 Level 0 + Level 1
+
+这是我非常推荐收缩的地方。
+
+你现在的 Context Architecture 已经考虑到了：
+
+```text
+L0 Structured Output
+L1 Lossless Pruning
+L2 Selective Compression
+L3 Global Compaction
+L4 Remote/Provider Compaction
+```
+
+v0.1 只需要：
+
+```text
+L0
++
+L1
+```
+
+也就是先做到：
+
+```text
+cargo test
+→ structured result
+
+read file
+→ outline/symbols first
+
+LSP
+→ diagnostics
+
+bash
+→ exit + summary + bounded failure
+
+large output
+→ artifact://xxx
+
+duplicate read
+→ supersede
+
+old failed build
+→ prune raw log
+```
+
+这已经会让 Bitty AI 和很多传统 harness 的工作方式产生明显差异。
+
+然后再实现：
+
+```text
+compress_range()
+compress_task()
+compress_branch()
+```
+
+最后才是 `/compact` 和 Remote Compaction。
+
+实际上从工程价值来说：
+
+> **L0 + L1 的重要性很可能比 `/compact` 本身还大。**
+
+你现有文档也基本得出了这个结论。
+
+---
+
+# 8. 目前真正需要跨仓库解决的是 G-2 / G-3
+
+Vertical Slice 已经非常有价值地告诉你哪里真的缺东西。
+
+它找出的六个 gap 里，我最关注：
+
+```text
+G-2 terminal.snapshot host service
+G-3 generic Tool Bus dispatch
+```
+
+文档本身也把它们称为 **load-bearing findings**。
+
+也就是说现在应该出现两个并行轨道：
+
+```text
+bitty
+│
+├─ terminal.snapshot
+├─ generic tool dispatch
+├─ bridge consumability
+└─ rich fragment transport
+
+bitty-ai
+│
+├─ runtime
+├─ session
+├─ provider
+├─ context
+├─ tool registry
+└─ agent loop
+```
+
+这才是真正的 architecture → implementation。
+
+而不是继续只修改 `bitty-ai-docs`。
+
+---
+
+# 9. Agent Coordination 现在可以先“冻结设计”
+
+最近你思考很多的：
+
+```text
+Agent != Process
+Agent != Panel
+Panel != Execution
+Agent -> ExecutionContext <- Panel
+headed/headless
+lease
+takeover
+service sharing
+multi-agent teams
+```
+
+现在文档已经表达得相当成熟了。尤其是：
+
+```text
+Agent/run
+Execution
+Workspace view
+Tooling instance
+Evidence
+Panel/view
+```
+
+生命周期和 owner 都已经拆开。
+
+我建议这部分**暂时停止继续细化**。
+
+先不要实现：
+
+```text
+Manager Agent
+Reviewer Agent
+Team
+Organization graph
+service sharing
+cross-agent mailbox
+multi-agent budgets
+hierarchical delegation
+```
+
+只实现：
+
+```text
+AgentId
+RunId
+SessionId
+ExecutionId
+
+AgentLoop
+cancel()
+tool dispatch
+context
+stream
+```
+
+等单 Agent 足够稳定，Multi-Agent 才真正有可靠 primitive 可以组合。
+
+---
+
+# 10. 有几处文档现在需要马上清理
+
+这个比较具体。
+
+目前 `bitty-ai/README.md` 还写着：
+
+```text
+Status: Pre-implementation
+```
+
+但 main 已经有真正的 experimental vertical slice。
+
+我建议改成类似：
+
+```text
+Status: Experimental / pre-alpha
+
+Architecture is documentation-first, while an experimental vertical
+slice is implemented to validate runtime and host boundaries.
+Production runtime implementation has not started.
+```
+
+这样更准确。
+
+另外 `bitty-ai-docs/TODO.md` 还写着：
+
+> Later phase: wire this repository into bitty-ai as the docs/ submodule once the implementation repository exists.
+
+但这个已经完成了。
+
+而且最新 `bitty-ai` main commit 本身就是同步 docs gitlink。这个 TODO 应该立即清掉。
+
+---
+
+# 11. `ai-architecture.md` 已经有点太大了
+
+现在 `ai-architecture.md` 大约 **132 KB**，同时下面又已经有：
+
+```text
+context-management
+command-tool
+agent-coordination
+code-intelligence
+persistence
+```
+
+我建议以后不要继续往主文件塞详细机制了。
+
+把它逐渐收缩成：
+
+```text
+AI Architecture
+├─ Principles
+├─ Trust boundaries
+├─ Component graph
+├─ Ownership
+├─ Stable public contracts
+├─ Invariants
+├─ Dependency map
+└─ Links to subsystem specs
+```
+
+比如：
+
+```text
+MP-*
+CP-*
+TB-*
+AG-*
+RS-*
+```
+
+可以继续作为 contract IDs，但具体算法、状态机、策略放到各 subsystem 文档。
+
+否则未来很容易出现：
+
+```text
+ai-architecture.md
+context-management.md
+command-tool-architecture.md
+```
+
+三份文件同时描述 `ToolResult / Artifact / Context`，然后慢慢漂移。
+
+---
+
+# 12. Research provenance 也可以调整一下
+
+现在很多新文档开头都有：
+
+```text
+$BITTY_WORKSPACE/recording/research/021.md.completed
+$BITTY_WORKSPACE/recording/research/022.md.completed
+sha256: ...
+```
+
+例如 command/tool 和 context 文档都是如此。
+
+对于你自己和 Agent 协作，这非常有价值。
+
+但对公共 GitHub contributor 来说：
+
+```text
+$BITTY_WORKSPACE/recording/...
+```
+
+是不可访问的。
+
+以后可以把 provenance 分成：
+
+```text
+Research provenance
+├─ Public upstream references
+│   ├─ OpenCode
+│   ├─ Claude Code
+│   ├─ Codex
+│   └─ oh-my-pi
+│
+└─ Internal research record
+    └─ hash only / optional
+```
+
+canonical contract 不依赖 inaccessible recording 才是最好维护的。
+
+---
+
+# 13. 我会把接下来的开发顺序定成这样
+
+这是我认为现在最合理的一条主线：
+
+1. **清理文档状态**：README `Pre-implementation`、过期 TODO，并加一个很短的 `v0.1 implementation profile`。
+2. **把 `bitty-ai-slice` 定义成永久 pressure-test / integration-test**，不要重写掉。
+3. **建立真正的 `bitty-ai-runtime`**，先把 provider/context/tool/session/stream 放一个 crate 内，不急着五 crate 拆分。
+4. **实现 production Agent Loop + deterministic FakeProvider**，先不接网络模型。
+5. **实现 Context L0 + L1**：Structured Result、Artifact、dedup、supersede、pruning、progressive code read。
+6. **在 Bitty 一侧解决 G-2 / G-3**：`terminal.snapshot` 和 generic tool dispatch，然后把真实 host 接进 `bitty-ai`。
+7. **加入真实 local provider**，我会优先 Ollama/OpenAI-compatible local endpoint；再接 remote provider。
+8. **之后才做 Level 2/3/4 compression、LSP sharing、multi-agent、persistence、browser。**
+
+---
+
+## 最重要的一个判断
+
+现在 `bitty-ai` **不缺宏观设计了**。
+
+甚至从软件项目生命周期看，你已经到了一个很明显的转折点：
+
+```text
+以前：
+“这个系统应该怎么设计？”
+
+现在：
+“这些设计在真实代码里到底成立不成立？”
+```
+
+Vertical Slice 已经证明这种方法是有效的：一写代码，马上就发现了 G-1～G-6，而且其中 G-2/G-3 是之前纯文档推演不容易确定优先级的真正 load-bearing gap。
+
+所以我会建议你**从现在开始把工作比例反过来**：以代码为主，文档作为 implementation-driven architecture 继续演化，而不是继续等文档“全部准备好”。
+
+如果按这个方向，我觉得下一件最值得做的事情就是 **`bitty-ai-runtime` 的第一个 production skeleton + 把现有 `bitty-ai-slice` 变成它的端到端验收测试**。这会是 bitty-ai 从“架构项目”真正变成“软件项目”的节点。
+

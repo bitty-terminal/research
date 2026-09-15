@@ -1,0 +1,1051 @@
+现在想想 bitty 的本身的 config 配置应该是比较好复制和迁移的，可以通过变成 dotfiles 来做的。
+但是对于 bitty-ai 部分，其实配置还好，就是现在讨论下这个存储日志、存储记忆、导出的部分可以如何设计，就是我看我自己本地的 OpenCode，里面这个 opencode.db 文件已经达到 25GB 了，在本地已经算是非常大的了，如果我想要之后迁移到别的电脑的话就比较麻烦了。
+而且现在各个 AI Harness 的这些存储位置都不是统一的，比如 OpenCode 对于这些存储是放到 ~/.local/share/opencode 中，但是好像有很多是放到 ~/.config/ 对应的目录的，比如 Codex, Claude Code, 而且很多是如果不设置环境变量的话，这些目录是默认存在 ~/ 这个用户目录根目录的，Bitty 的话肯定是遵循 XDG 的标准比较好，这样也更方便管理。而且 config 目录就该都放配置文件，而不是放各种缓存、日志之类的文件吧
+还有就是之后应该有 /export 这种的命令导出该 Session 的所有内容的那种？一个 Panel 的所有的 History 是否也可以这样导出呢？一个 Agent 的所有的上下文 Context 应该也是可以独立导出的吧？不过这几个应该是作为 Lua 插件来实现的
+bitty-ai 应该主要是选择使用 SQLite 的形式来管理这些了，但是对于很多部分的设计就比较麻烦，哪些对于这部分可以怎么设计呢？
+而且我想要规避 OpenCode 那种全部放到一个 sqlite 文件中，其实 OpenCode 最开始设计的应该是没有问题的，只是随着时间变长，对话次数处理的任务越来越多，那么这个文件就慢慢积累的越来越大了
+对，这一块我会把 Bitty 明确设计成 **“配置可迁移，数据可归档，状态可丢弃，缓存可重建”**。你现在 OpenCode 的 `opencode.db = 25GB` 正好说明：**SQLite 本身没问题，问题是把不同生命周期的数据长期塞进一个全局数据库。**
+
+SQLite 处理几十 GB 数据并不奇怪；真正麻烦的是迁移、备份、`VACUUM`、故障影响范围、归档，以及“我只想带走一个 Session，却必须处理整个 25GB 数据库”。你截图里的 `opencode.db-wal` / `-shm` 也是 WAL 模式的正常组成部分；SQLite 官方本身就提供 checkpoint 和 Online Backup API 来处理活动数据库。([SQLite官网][1])
+
+我比较推荐 Bitty 最终采用：
+
+> **Global Catalog + Per-Session SQLite + Content-Addressed Object Store + Independent Memory Store**
+
+而不是一个 `bitty.db` 包办所有东西。
+
+---
+
+# 1. 首先严格按照 XDG 分层
+
+你这里的判断是对的：`~/.config` 就应该是 **configuration**，不应该慢慢长出几十 GB 的日志、历史记录、数据库和缓存。
+
+XDG 0.8 本身就已经把 `CONFIG / DATA / STATE / CACHE / RUNTIME` 分得很清楚；尤其 `$XDG_STATE_HOME` 官方定义就是“需要跨重启保存，但不够重要/不够 portable、不应该进入 DATA 的状态”，并明确举了 logs、history、recently used files 等例子。([自由桌面规范][2])
+
+我会给 Bitty 定成：
+
+| 类型      | 路径                        | 内容                                          |
+| ------- | ------------------------- | ------------------------------------------- |
+| Config  | `~/.config/bitty/`        | Lua 配置、keymap、theme、plugin 声明、AI 配置         |
+| Data    | `~/.local/share/bitty/`   | AI Session、Memory、Artifact、持久对象             |
+| State   | `~/.local/state/bitty/`   | 日志、Panel history、scrollback、恢复状态            |
+| Cache   | `~/.cache/bitty/`         | FTS index、embedding index、模型 metadata、可重建数据 |
+| Runtime | `$XDG_RUNTIME_DIR/bitty/` | socket、lock、PID、IPC 临时数据                    |
+
+例如：
+
+```text
+~/.config/bitty/
+├── config.lua
+├── ai.lua
+├── keymap.lua
+├── theme.lua
+└── plugins.lua
+
+~/.local/share/bitty/
+└── ai/
+    ├── catalog.sqlite
+    ├── sessions/
+    │   └── 2026/
+    │       └── 09/
+    │           └── 01K.../
+    │               ├── manifest.json
+    │               └── session.sqlite
+    ├── objects/
+    │   ├── ab/
+    │   │   └── abcd....zst
+    │   └── ...
+    ├── memory/
+    │   ├── global.sqlite
+    │   └── projects/
+    │       └── <project-id>.sqlite
+    └── archives/
+
+~/.local/state/bitty/
+├── logs/
+├── panels/
+│   └── <panel-id>/
+│       └── segments/
+└── recovery/
+
+~/.cache/bitty/
+└── ai/
+    ├── search.sqlite
+    ├── embeddings/
+    └── providers/
+
+$XDG_RUNTIME_DIR/bitty/
+├── bitty.sock
+└── locks/
+```
+
+这样 `~/.config/bitty` 就非常适合直接进入 dotfiles。
+
+甚至迁移到另一台电脑时：
+
+```text
+dotfiles
+    ↓
+恢复 Bitty 配置
+
+bitty-ai export/import
+    ↓
+恢复真正需要的 Session / Memory
+
+Cache / logs / runtime
+    ↓
+完全不用迁移
+```
+
+这会比“复制整个 `~/.local/share/opencode`”干净很多。
+
+另外 `.bitty/` 项目目录也应该遵守同一个原则：**只放 declarative、portable 的项目配置**，不要往项目里塞 SQLite、history、cache。
+
+---
+
+# 2. 不要做一个巨大的 `bitty-ai.db`
+
+我比较反对：
+
+```text
+bitty-ai.db
+
+projects
+sessions
+messages
+tool_calls
+tool_output
+memory
+panel_history
+context
+artifacts
+attachments
+embeddings
+logs
+...
+```
+
+全部往里面堆。
+
+不是因为 SQLite 扛不住，而是它们生命周期完全不同。
+
+比较好的结构是：
+
+```text
+                 ┌────────────────┐
+                 │ catalog.sqlite │
+                 │   很小         │
+                 └───────┬────────┘
+                         │
+          ┌──────────────┼─────────────┐
+          ↓              ↓             ↓
+     Session A       Session B      Session C
+     session.db      session.db     session.db
+          │
+          ↓
+     Object Store
+   tool output / file
+   image / attachment
+```
+
+其中 `catalog.sqlite` 只是 **Control Plane**。
+
+它只记录：
+
+```text
+session_id
+title
+project_id
+created_at
+updated_at
+status
+model
+provider
+summary
+size
+pinned
+archived
+storage_path
+```
+
+绝对不要把完整 message/tool output 塞进去。
+
+这样即使用户用了 Bitty 十年，拥有 20,000 个 Session，`catalog.sqlite` 可能依然只有几十 MB。
+
+---
+
+# 3. 一个 Session 一个 SQLite，我认为很适合 Bitty
+
+比如：
+
+```text
+sessions/
+└── 2026/09/<session-id>/
+    ├── manifest.json
+    └── session.sqlite
+```
+
+`session.sqlite` 可以包含：
+
+```text
+session
+events
+messages
+agents
+tool_calls
+context_snapshots
+summaries
+artifact_refs
+object_refs
+panel_refs
+memory_refs
+```
+
+这里我尤其建议采用 **event-oriented architecture**。
+
+因为 Bitty 现在已经出现：
+
+```text
+Session
+  ├── Agent A
+  │    ├── Panel 1
+  │    └── Panel 3
+  │
+  ├── Agent B
+  │    └── Panel 2
+  │
+  └── User
+       └── Panel 1
+```
+
+而且之前已经明确过：
+
+> Panel 生命周期 ≠ Agent 生命周期 ≠ Session 生命周期。
+
+那么 event model 就非常适合。
+
+比如：
+
+```text
+event_id
+sequence
+timestamp
+session_id
+agent_id?
+panel_id?
+type
+payload_ref
+parent_event_id?
+```
+
+事件可以是：
+
+```text
+user.message
+agent.message
+agent.tool_call
+agent.tool_result
+agent.context_compact
+agent.checkpoint
+panel.command
+panel.cwd_changed
+panel.process_exit
+artifact.created
+memory.created
+```
+
+这样 Panel、Agent、Session 不需要硬塞进一个严格树形结构。
+
+---
+
+# 4. 真正占空间的内容，不应该放 SQLite
+
+这是我觉得 Bitty 特别值得一开始就规划好的地方。
+
+例如：
+
+```text
+cargo test
+cargo build
+npm install
+git diff
+cat huge.log
+读取一个 10MB JSON
+编译器输出
+Agent 读取源码
+图片
+attachment
+```
+
+这些 raw content 很容易把 DB 撑到几十 GB。
+
+所以 SQLite 中只放：
+
+```text
+tool_call_id
+mime
+object_hash
+original_size
+compressed_size
+summary
+```
+
+真实内容：
+
+```text
+~/.local/share/bitty/ai/objects/
+```
+
+采用 CAS：
+
+```text
+objects/
+├── 1a/
+│   └── 1a9f8e....zst
+├── 42/
+│   └── 42cdd2....zst
+└── ...
+```
+
+也就是：
+
+```text
+content
+   ↓
+BLAKE3 / SHA-256
+   ↓
+hash
+   ↓
+zstd(content)
+```
+
+Session DB 只保存：
+
+```text
+object_ref = "blake3:1a9f8e..."
+```
+
+这还有一个非常大的优势：
+
+## 自动去重
+
+假设 Agent 反复读取：
+
+```text
+Cargo.toml
+README.md
+src/lib.rs
+```
+
+或者每次 Context 都带同一份 system prompt、tool schema、skill。
+
+不应该每次重复存一份。
+
+而是：
+
+```text
+System Prompt ────┐
+                  ↓
+            Object abc123
+
+Turn 1 ───────────┤
+Turn 2 ───────────┤
+Turn 3 ───────────┘
+```
+
+这会比单纯：
+
+```text
+messages.content TEXT
+```
+
+不断复制内容省很多空间。
+
+---
+
+# 5. Context 更不应该每轮完整保存
+
+这个对于 bitty-ai 特别重要。
+
+假设：
+
+```text
+Turn 1 context = 20K
+Turn 2 context = 25K
+Turn 3 context = 30K
+Turn 4 context = 35K
+```
+
+如果每轮把完整 Context 保存一次：
+
+```text
+20 + 25 + 30 + 35 = 110K
+```
+
+大量内容其实完全重复。
+
+Bitty 应该保存 **Context Recipe / Context Manifest**：
+
+```text
+ContextSnapshot #84
+
+system:
+    object:a12f
+
+core_prompt:
+    object:93bc
+
+skills:
+    object:22af
+    object:771a
+
+messages:
+    event:101
+    event:105
+    event:109
+
+summary:
+    object:7718
+
+tool_schema:
+    object:88cd
+
+project_context:
+    object:991f
+```
+
+换句话说：
+
+> Context Snapshot 保存“这一轮 Context 是如何组成的”，而不是再复制一份 Context。
+
+需要调试或者 `/export agent` 时再 materialize：
+
+```text
+Context Recipe
+      +
+Object Store
+      +
+Session Events
+      ↓
+完整 Context
+```
+
+这也非常有利于以后分析：
+
+```text
+为什么这个 Agent 做出了这个决定？
+当时到底看到了哪些文件？
+使用的是哪个 system prompt？
+加载了哪些 skills？
+compact 发生在哪一次？
+```
+
+这是 bitty-ai 很值得做的能力。
+
+---
+
+# 6. Memory 要和 Session 数据彻底区分
+
+我建议至少分成：
+
+```text
+Session/Episodic Data
+        ↓
+session.sqlite
+
+Long-term Memory
+        ↓
+memory/*.sqlite
+
+Derived Semantic Index
+        ↓
+~/.cache/bitty/ai/embeddings/
+```
+
+例如：
+
+### Session Memory
+
+只属于某次任务：
+
+```text
+“这个 bug 是由于 xxx 导致”
+“刚刚尝试方案 A 失败”
+```
+
+直接留在 Session。
+
+### Project Memory
+
+例如：
+
+```text
+这个项目使用 Rust 2024
+renderer 使用 wgpu
+插件 runtime 使用 piccolo
+不引入 HTTP client
+```
+
+可以：
+
+```text
+memory/projects/<project-id>.sqlite
+```
+
+### Global Memory
+
+例如用户长期的 AI Harness 偏好：
+
+```text
+memory/global.sqlite
+```
+
+而 embedding/vector index 我反而建议放 `$XDG_CACHE_HOME`。
+
+因为：
+
+> Memory 是 canonical data，embedding 是 Memory 的 derived representation。
+
+embedding 丢了可以重新生成。
+
+因此不要出现：
+
+```text
+memory.sqlite = 500MB
+embedding.sqlite = 8GB
+
+然后两个都必须备份
+```
+
+embedding 应该能：
+
+```bash
+bitty-ai index rebuild
+```
+
+直接重建。
+
+---
+
+# 7. Panel History 不建议直接塞 AI SQLite
+
+Panel 本质上还是 Terminal。
+
+Panel History 又至少存在两种东西：
+
+```text
+Structured History
+
+$ cargo test
+cwd=/project
+exit=1
+duration=3.2s
+```
+
+和：
+
+```text
+Raw terminal stream / scrollback
+
+Compiling ...
+warning ...
+error ...
+ANSI escape...
+...
+```
+
+前者很小，可以长期保存。
+
+后者可能极大。
+
+所以我会让 Bitty Core 把 Panel History 放：
+
+```text
+~/.local/state/bitty/panels/<panel-id>/
+```
+
+例如压缩的 segment：
+
+```text
+000001.zst
+000002.zst
+000003.zst
+```
+
+类似 append-only journal。
+
+而 AI Session 只保存：
+
+```text
+panel_id
+start_event
+end_event
+```
+
+或者：
+
+```text
+panel_history_ref
+```
+
+这样一个 Panel 即使产生 5GB shell 输出，也不会让 `session.sqlite` 爆炸。
+
+---
+
+# 8. `/export` 很适合做成 Lua 命令，但底层不能由 Lua 直接碰 DB
+
+这里我会稍微修改你的想法：
+
+> `/export` 的 **Command/UI 层** 可以是 Lua Plugin。
+>
+> 但 **Snapshot / Serialization / Storage API 必须是 Core 能力**。
+
+不要：
+
+```lua
+sqlite.open("session.sqlite")
+SELECT ...
+```
+
+否则以后 DB schema 一升级，插件全部炸掉。
+
+应该类似：
+
+```text
+Lua
+
+/export session
+        ↓
+bitty.storage.snapshot_session()
+        ↓
+Core Storage API
+        ↓
+Session DB + CAS
+```
+
+以后甚至：
+
+```text
+/export panel
+/export agent
+/export session
+/export workspace
+```
+
+全部只是不同的 frontend。
+
+这样 Core 将来从：
+
+```text
+SQLite v1
+    ↓
+SQLite v2
+    ↓
+SQLite + CAS
+```
+
+怎么迁移都跟 Lua Plugin 无关。
+
+---
+
+# 9. 三种 Export 的语义其实应该完全不同
+
+我很赞成你把它们分开。
+
+| Export      | 表示什么                       |
+| ----------- | -------------------------- |
+| `Panel`     | Terminal execution history |
+| `Agent`     | 某个 Agent 实际拥有/经历的 Context  |
+| `Session`   | 完整任务/对话/Agent/Panel 的逻辑集合  |
+| `Workspace` | 项目级多个 Session + Memory     |
+
+例如：
+
+```text
+/export panel
+```
+
+可以导出：
+
+```text
+commands
+cwd changes
+exit codes
+timestamps
+scrollback
+```
+
+甚至：
+
+```bash
+/export panel --commands-only
+/export panel --with-scrollback
+```
+
+而：
+
+```text
+/export agent
+```
+
+应该是：
+
+```text
+system prompt
+model/provider
+context lineage
+messages
+tool calls
+tool results
+summaries
+compaction history
+skills
+MCP/tool definitions
+referenced panels
+artifacts
+```
+
+这对于复现 Agent 行为非常有价值。
+
+Session 则更高一级：
+
+```text
+Session
+├── Agent A
+├── Agent B
+├── Panel 1
+├── Panel 2
+├── memories
+├── artifacts
+└── event graph
+```
+
+---
+
+# 10. Export 格式不要直接等于内部 SQLite
+
+这个也很重要。
+
+不要设计：
+
+```bash
+/export session
+```
+
+然后输出：
+
+```text
+session.sqlite
+```
+
+否则以后：
+
+```text
+schema v1
+schema v2
+schema v3
+```
+
+迁移起来非常痛苦。
+
+应该设计一个 **stable interchange format**。
+
+比如：
+
+```text
+my-session.bitty-session
+```
+
+本质：
+
+```text
+tar.zst
+
+manifest.json
+events.jsonl.zst
+objects/
+artifacts/
+memory.jsonl
+context/
+```
+
+`manifest.json`：
+
+```json
+{
+  "format": "bitty-session",
+  "version": 1,
+  "bitty_version": "0.8.0",
+  "session_id": "...",
+  "created_at": "...",
+  "objects": []
+}
+```
+
+于是：
+
+```text
+Internal DB Schema
+       ↓
+Exporter
+       ↓
+Bitty Session Format v1
+       ↓
+Importer
+       ↓
+Future Internal Schema
+```
+
+这样 Bitty 10 年后依然有机会导入 Bitty 1.0 的 Session。
+
+而如果需要对正在运行的 SQLite 做一致性快照，可以通过 SQLite Online Backup API，而不是简单 `cp session.sqlite`；SQLite 官方就是专门为活动数据库的一致快照提供这个 API 的。([SQLite][3])
+
+---
+
+# 11. 再加一层 Hot / Cold / Archive 生命周期
+
+这就能从根本上避免 OpenCode 的 25GB 单文件问题。
+
+可以定义：
+
+```text
+Active
+   ↓
+Closed
+   ↓
+Archived
+```
+
+### Active Session
+
+```text
+session.sqlite
+session.sqlite-wal
+session.sqlite-shm
+```
+
+频繁读写。
+
+### Closed Session
+
+关闭时：
+
+```text
+WAL checkpoint
+↓
+session.sqlite
+```
+
+SQLite 的 checkpoint 就是把 WAL 中的数据转回主数据库；这也是 WAL 生命周期的一部分。([SQLite][4])
+
+然后 Session 基本不再修改。
+
+这对 rsync / backup 非常友好：
+
+```text
+旧 Session 不变
+新 Session 新增
+CAS 只增加新 object
+```
+
+不会像：
+
+```text
+25GB opencode.db
+```
+
+今天聊一句话：
+
+```text
+整个 25GB 文件都发生变化
+```
+
+### Archived
+
+很久不用的 Session：
+
+```text
+session.sqlite
+objects
+    ↓
+session.bitty-session.zst
+```
+
+catalog 仍然保留：
+
+```text
+title
+date
+summary
+project
+archive_path
+```
+
+真正打开时再 restore。
+
+---
+
+# 12. Storage GC 应该从第一版就设计
+
+这也是很多 AI Harness 一开始没重视、几年以后很麻烦的地方。
+
+我建议一开始就有：
+
+```bash
+bitty storage stats
+
+Sessions     4.3 GB
+Objects      8.2 GB
+Panel state  2.1 GB
+Memory       42 MB
+Cache        6.4 GB
+Logs         312 MB
+
+Total       21.3 GB
+```
+
+以及：
+
+```bash
+bitty storage gc
+bitty storage gc --cache
+bitty storage gc --orphan-objects
+
+bitty session archive <id>
+bitty session delete <id>
+
+bitty storage doctor
+```
+
+CAS 最适合做 garbage collection：
+
+```text
+所有 Session/Memory
+      ↓
+扫描 object refs
+      ↓
+Reachable Set
+      ↓
+objects/
+      ↓
+删除 unreachable object
+```
+
+就是典型的 mark-and-sweep。
+
+---
+
+# 13. `.bitty/` 反而可以解决跨电脑 Project Identity
+
+这个可以和你之前设计的项目级 `.bitty/` 很漂亮地接起来。
+
+比如：
+
+```text
+project/
+├── .bitty/
+│   ├── project.toml
+│   ├── ai.lua
+│   ├── skills/
+│   └── ...
+└── src/
+```
+
+其中：
+
+```toml
+project_id = "01K5..."
+```
+
+这个可以进入 Git。
+
+然后机器 A：
+
+```text
+~/.local/share/bitty/ai/projects/01K5.../
+```
+
+机器 B clone 后同样识别：
+
+```text
+project_id = 01K5...
+```
+
+于是：
+
+```text
+Project identity
+        ≠
+absolute filesystem path
+```
+
+对 worktree 也很好：
+
+```text
+project_id
+    ├── workspace A
+    ├── workspace B
+    └── workspace C
+```
+
+不同 worktree 可以有不同 workspace state，但共享 project memory。
+
+---
+
+# 14. 我会把 Bitty 的最终结构定成这样
+
+核心关系可以概括成：
+
+```text
+                    Bitty Config
+                         │
+                  ~/.config/bitty
+                         │
+
+                 Global Catalog
+                         │
+              catalog.sqlite
+                         │
+       ┌─────────────────┼─────────────────┐
+       │                 │                 │
+       ▼                 ▼                 ▼
+   Session A         Session B         Session C
+   SQLite            SQLite            SQLite
+       │
+       ├──────── Agent Events
+       ├──────── Context Recipes
+       ├──────── Tool Calls
+       ├──────── Panel References
+       └──────── Object References
+                         │
+                         ▼
+                 Content Store
+                 objects/*.zst
+
+Project / Global Memory ───── memory/*.sqlite
+
+Panel History ─────────────── XDG_STATE_HOME
+
+Search / Embedding ────────── XDG_CACHE_HOME
+
+IPC / socket ──────────────── XDG_RUNTIME_DIR
+```
+
+我认为这里最关键的是四个原则：
+
+> **Config 不存状态。**
+> **SQLite 不存巨型 payload。**
+> **Context 不重复复制。**
+> **Session 是天然的 storage shard。**
+
+尤其第三点对 AI Harness 非常重要。现在的大模型 Context 本身高度重复，如果 Bitty 从一开始就使用 **immutable event + content-addressed object + context recipe**，那么不仅磁盘利用率更好，以后做 `/export agent`、Context Debugger、Agent Replay、Context Inspector、Memory Provenance 都会非常自然。
+
+而这其实也和 Bitty 目前的 Panel/Agent 解耦架构高度吻合：**Session DB 记录逻辑关系，CAS 保存内容，Panel 保存执行历史，Memory 保存跨 Session 知识，Context 只是这些资源在某个时间点的一次“组装结果”。**
+
+这套设计我认为比简单决定“到底用几个 SQLite”更重要，它基本可以成为 `bitty-ai/storage` 的第一份 RFC。
+
+[1]: https://www2.sqlite.org/wal.html?utm_source=chatgpt.com "Write-Ahead Logging"
+[2]: https://specifications.freedesktop.org/basedir/0.8/?utm_source=chatgpt.com "XDG Base Directory Specification"
+[3]: https://www.sqlite.org/backup.html?utm_source=chatgpt.com "SQLite Backup API"
+[4]: https://www.sqlite.org/c3ref/wal_checkpoint.html?utm_source=chatgpt.com "Checkpoint a database"
+

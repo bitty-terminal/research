@@ -1,0 +1,4607 @@
+我现在在做 bitty-ai 了，因为这个是跟 bitty 终端本身可以独立的，所以我就独立开始完成这个了。那么对于基础部分需要注意什么呢？
+bitty-terminal/bitty-ai这里面有哪些需要改得或者调整的呢？然后初阶段有哪些需要注意的呢？这个跟 AI 相关的东西有很多，我应该参考和借鉴哪些呢，我觉得应该是有很多比较好用的现成库可以用的？为了避免造轮子，而且 AI 基础设施如果不用现成的东西的话可能会踩很多坑，这些你可以多查查。
+
+总体判断
+
+把 bitty-ai 从 Bitty Terminal 主仓库中独立出来，我认为是对的，而且最好从一开始就把它定义成：
+
+    一个独立的 terminal-native Agent Runtime / AI Runtime，Bitty Terminal 只是它的一个 client。
+
+这样以后它既可以被 Bitty Panel 调用，也可以 headless 运行，甚至通过 ACP 接入 Zed / Neovim / VS Code 一类客户端，而不需要依赖 Bitty 的 renderer、PTY、Panel 系统。
+
+我看了当前 bitty-terminal/bitty-ai。现在基本还是纯 scaffolding：真正代码只有 bitty-ai-core placeholder，但 ModelProvider / ContextProvider / Agent / Tool Bus 的大边界已经确定。 当前 core 也明确声明尚未进入真实实现。
+
+所以现在正是最适合调整架构的时候。
+1. 当前仓库我最先会改的几个地方
+
+首先有两个很具体的 consistency 问题。
+
+README 和 AGENTS.md 都说：
+
+bitty-docs/docs/ai/
+
+是 AI architecture/security/design 的 canonical source。
+
+但我实际查看当前 bitty-docs/docs/，目前并没有 ai/ 目录。也就是说这个 canonical contract 现在实际上是 dangling reference。
+
+这应该优先建立：
+
+bitty-docs/docs/ai/
+├── README.md
+├── architecture.md
+├── model-provider.md
+├── context-provider.md
+├── agent-runtime.md
+├── tool-system.md
+├── permissions.md
+├── persistence.md
+├── protocol.md
+├── security.md
+└── decisions/
+    ├── 0001-runtime-boundaries.md
+    ├── 0002-model-provider-backend.md
+    ├── 0003-mcp.md
+    ├── 0004-storage.md
+    └── 0005-agent-client-protocol.md
+
+另一个 drift 是 AGENTS.md 仍写着：
+
+    workspace layout / MSRV / dependencies 等尚未确定。
+
+但实际 Cargo.toml 已经确定 edition 2024、resolver 3、MSRV 1.85，rust-toolchain.toml 又固定到了 1.98.1。
+
+这里不要回退配置，而应该直接补 ADR，把这些 scaffold decisions 正式承认为 accepted。
+
+还有一个更重要的问题：bitty-ai-core 到底是什么。
+
+目前 README 规划的是 5 个未来 crates，但真实 workspace 多出了 bitty-ai-core。
+
+我建议明确：
+
+    bitty-ai-core 只能包含稳定、无 I/O、无 provider、无 database 的 domain contracts。
+
+例如：
+
+IDs
+AgentEvent
+AgentCommand
+ModelRequest
+ModelEvent
+ToolCall
+ToolResult
+ContextItem
+Capability
+PermissionRequest
+Usage
+TokenBudget
+FinishReason
+Error types
+
+最好不要让这里直接依赖 reqwest、rmcp、SQLite、OpenAI SDK 之类东西。
+
+这样它就相当于 Codex 的 codex-protocol。Codex 也特意让 protocol crate 保持 minimal dependency，并避免 material business logic。
+2. 我建议重新整理 crate dependency graph
+
+你现在按“功能名称”拆：
+
+model-provider
+context-provider
+agent
+tool-bus
+workspace
+
+概念没错，但很容易后来出现：
+
+agent -> context
+context -> agent
+tool-bus -> agent
+workspace -> agent
+agent -> workspace
+
+这样的 dependency cycle。
+
+我更建议形成严格 DAG：
+
+                    ┌────────────────┐
+                    │ bitty-ai-core  │
+                    │ types/contracts│
+                    └───────┬────────┘
+                            │
+         ┌──────────────────┼────────────────────┐
+         ↓                  ↓                    ↓
+ bitty-ai-model      bitty-ai-context      bitty-ai-tools
+ ModelProvider       ContextProvider       Tool + MCP
+         │                  │                    │
+         └──────────────────┼────────────────────┘
+                            ↓
+                    bitty-ai-runtime
+                  Agent state machine
+                  permissions / loop
+                            │
+                  ┌─────────┴─────────┐
+                  ↓                   ↓
+            bitty-ai-store      bitty-ai-protocol
+            SQLite/event log    ACP / Bitty IPC
+                  └─────────┬─────────┘
+                            ↓
+                        bitty-ai
+                     binary / facade
+
+AgentWorkspace 我反而暂时不建议独立 crate。
+
+先作为 runtime 中的 domain object。等未来 workspace 确实承担 multi-agent coordination / background task / headless panel / remote execution 后再拆。
+
+否则现在容易产生很多 300 行的小 crate，却还不知道真正 dependency boundary 在哪里。
+3. ModelProvider：这里非常适合“不造轮子”
+
+这是我研究下来最明确的一点。
+
+不要自己重新实现 OpenAI / Anthropic / Gemini / Ollama / OpenRouter 的 HTTP client。
+
+现在 Rust 生态已经比以前成熟很多。
+首选：genai
+
+目前 rust-genai stable 0.6.x 已经原生支持 20+ providers，包括：
+
+OpenAI、OpenAI Responses、Anthropic、Gemini、Ollama、Vertex、Bedrock、OpenRouter、Groq、DeepSeek、xAI、Moonshot、Kimi 等，并且有 streaming、tool calling、reasoning、prompt cache、provider-specific options、custom endpoints。
+
+更重要的是它不是把所有东西粗暴伪装成 OpenAI API，而是尽量走 native protocol，例如 OpenAI Responses / Anthropic / Gemini。
+
+这非常适合 Bitty。
+
+我会这么做：
+
+bitty-ai-model
+    ↓
+Bitty ModelProvider trait
+    ↓
+GenAiProvider adapter
+    ↓
+genai
+    ↓
+OpenAI / Anthropic / Gemini / Ollama / ...
+
+但一定注意：
+
+    不要把 genai::* 类型暴露进 Bitty public API。
+
+例如不要：
+
+pub fn request(req: genai::chat::ChatRequest)
+
+而是：
+
+pub trait ModelProvider {
+    async fn execute(
+        &self,
+        request: ModelRequest,
+        ctx: RequestContext,
+    ) -> Result<ModelStream, ModelError>;
+}
+
+然后内部转换。
+
+这样以后 genai 不够用，可以换 Rig、官方 SDK、自己写某个 specialized provider，而 Bitty API 不变。
+4. Rig 也值得重点研究，但不要和 genai 同时作为核心
+
+2026 年现在的 Rig 已经发展得很不错，当前 0.42 把架构拆成：
+
+rig-core
+    portable contracts
+    messages
+    model provider
+    tools
+    memory
+    vector store
+
+rig-agent
+    agent runtime
+    hooks
+    state machine
+    extraction
+
+而且 rig-agent 已经有 serializable AgentRun state machine，这一点特别值得 Bitty 参考。
+
+不过我的建议是：
+方案	Bitty 适合程度
+genai 做 provider transport	★★★★★
+rig-core 做整个基础 contract	★★★★
+rig-agent 直接作为 Bitty Agent	★★
+Bitty 自己重新写 provider HTTP	★
+
+因为你实际上已经想设计自己的：
+
+ContextProvider
+Tool Bus
+AgentWorkspace
+consent ledger
+terminal semantic zones
+Bitty capability model
+
+如果直接建立在 rig-agent 上，很容易变成：
+
+    Bitty Runtime = Rig Runtime 的 wrapper
+
+这会削弱 Bitty 自己的架构。
+
+所以比较合理的是：
+
+    参考 Rig，甚至做一个 Rig adapter，但 Bitty Runtime 自己掌握 agent state machine。
+
+我建议专门写一个 ADR：
+
+ADR: Model backend substrate
+
+Option A: genai
+Option B: rig-core
+Option C: custom provider implementations
+
+Decision:
+genai as initial provider transport,
+Bitty-owned public contracts.
+
+5. MCP 千万不要自己实现
+
+这个现在已经非常明确。
+
+目前已经有 官方 Rust MCP SDK rmcp，当前版本已经到 3.x，并实现最新稳定 MCP 2026-07-28，包括：
+
+tools
+resources
+prompts
+sampling
+elicitation
+subscriptions
+tasks
+multi-round-trip requests
+streamable HTTP
+OAuth
+capability negotiation
+JSON Schema 2020-12
+
+所以：
+
+bitty-ai-tools
+        │
+        ├── NativeTool
+        ├── BuiltinTool
+        └── McpToolAdapter
+                 ↓
+                rmcp
+
+不要让：
+
+Tool == MCP Tool
+
+因为 Bitty 自己的 built-in terminal tools 不需要全部通过 MCP loopback。
+
+应该是：
+
+Bitty Tool abstraction
+        ↑
+ ┌──────┴──────┐
+native      MCP adapter
+
+这个区别很重要。
+
+另外 rmcp 今年刚出现过 DNS rebinding 高危漏洞，旧于 1.4.0 的 Streamable HTTP server 会被本地网页绕过 Host validation；已经修复。
+
+所以 Bitty 应该形成一个原则：
+
+    MCP Server / Client 不等于可信工具，MCP tool 仍然必须经过 Bitty permission pipeline。
+
+6. Permission System 应该成为 Bitty AI 的核心，而不是附属功能
+
+这个我觉得甚至比 Agent Loop 本身更重要。
+
+不要设计成简单的：
+
+Allow
+Ask
+Deny
+
+针对 tool name。
+
+应该抽象为 effect/capability：
+
+filesystem.read
+filesystem.write
+process.spawn
+process.kill
+network.connect
+secret.read
+clipboard.read
+git.push
+git.commit
+terminal.input
+terminal.output
+workspace.modify
+ui.notify
+mcp.invoke
+
+一次 ToolCall 最好先产生：
+
+ToolCall
+   ↓
+Effect Analysis
+   ↓
+Permission Policy
+   ↓
+Approval?
+   ↓
+Execution
+
+例如：
+
+terminal("cargo test")
+
+→ process.spawn
+→ cwd=/repo
+→ argv=["cargo", "test"]
+→ network=false
+→ filesystem.write=["target/"]
+
+然后 permission layer 决定：
+
+allow once
+allow for session
+allow scope
+deny once
+deny always
+
+Codex 当前已经发展成类似这种 granular sandbox/approval model，而且 command 会被拆成 independent segments 分析。
+
+OpenCode 也已经把权限区分为 bash/read/edit/web/task/...，被 deny 的工具甚至直接不暴露给模型。
+
+这两个都非常值得参考。
+7. 不要让 sandbox 与 Tool Bus 分离
+
+这是 AI Agent 很容易踩的一个坑。
+
+例如：
+
+Local shell
+    ↓
+permission gate
+    ↓
+sandbox
+
+MCP
+    ↓
+remote SSH executor
+
+如果 MCP 不经过统一 permission gate，那么 agent 就可能：
+
+    本地命令被拒绝 → 换 MCP remote executor → 绕过 sandbox。
+
+今年 Codex 就有人报告过类似 trust-boundary bypass 场景。
+
+所以 Bitty 必须有：
+
+                 ToolCall
+                    │
+                    ↓
+            Capability Resolver
+                    │
+                    ↓
+             Permission Engine
+                    │
+                    ↓
+                Dispatcher
+               /    |     \
+              /     |      \
+         native    MCP    remote
+
+而不是每种 tool 自己决定权限。
+
+这是我会列为 P0 invariant 的。
+8. Agent Runtime 最值得借鉴的是 “sans-I/O state machine”
+
+这一点我很建议你现在就定。
+
+不要写成：
+
+async fn run_agent() {
+    loop {
+        call_model().await;
+        execute_tool().await;
+        save_db().await;
+        send_ui().await;
+    }
+}
+
+这种刚开始很简单，半年以后会极难测试。
+
+最好是：
+
+Agent State Machine
+        │
+        ├── NeedModelCall
+        ├── NeedToolExecution
+        ├── NeedApproval
+        ├── NeedContext
+        ├── EmitOutput
+        └── Completed
+
+外面的 driver 才执行 I/O：
+
+                 AgentCore
+                  sans-I/O
+                     │
+         ┌───────────┼───────────┐
+         ↓           ↓           ↓
+      Model       Tool Bus      Store
+         ↓           ↓           ↓
+                 Driver
+
+这样最大的好处是：
+
+Agent = deterministic state transition
+
+你可以做到：
+
+replay
+pause
+resume
+fork
+inspect
+debug
+mock
+evaluate
+serialize
+
+Rig 现在的 serializable AgentRun 就非常值得研究。
+
+Codex 的 Submission Queue / Event Queue protocol 也有类似思路。
+
+这对 Bitty 尤其重要，因为以后 Panel 很可能实时展示：
+
+Thinking
+Model streaming
+Tool pending
+Approval required
+Tool running
+Tool output
+Context compressed
+Retry
+Cancelled
+
+这些天然应该是 events。
+9. 从第一天就设计 Event Log
+
+我甚至建议 Session persistence 不要只存：
+
+messages
+
+而是存：
+
+Session
+Turn
+Event
+
+例如：
+
+UserMessage
+ContextAssembled
+ModelRequestStarted
+TextDelta
+ReasoningDelta
+ToolCallProposed
+PermissionRequested
+PermissionGranted
+ToolStarted
+ToolOutput
+ToolCompleted
+ModelUsage
+TurnCompleted
+TurnCancelled
+ContextCompressed
+
+然后 UI 只是：
+
+Event Stream -> View
+
+数据库也是：
+
+Event Stream -> Persist
+
+这以后对 Debug 非常值钱。
+
+因为 AI 系统最难调试的不是：
+
+    最终输出错了。
+
+而是：
+
+    到底是 context 错了、模型错了、tool 错了、retry 错了还是 permission 错了？
+
+OpenTelemetry 现在已经专门有 GenAI semantic conventions，用于记录 model call、token usage、tool invocation 等。
+
+所以建议直接：
+
+tracing
+tracing-subscriber
+tracing-opentelemetry
+OpenTelemetry GenAI semantic conventions
+
+Rust tracing-opentelemetry 当前也已经很成熟。
+10. ContextProvider 是 Bitty 真正值得自己做的东西
+
+这部分我反而不建议大量依赖 Agent framework。
+
+Bitty 天然拥有别的 Agent 不容易获得的 structured terminal context：
+
+PTY session
+command boundary
+cwd
+exit code
+foreground process
+shell integration
+Panel
+Workspace
+visible viewport
+selected text
+collapsed command output
+command history
+process metadata
+
+因此不要做：
+
+terminal scrollback → 全部塞给 LLM
+
+而应该：
+
+ContextItem {
+    id,
+    source,
+    kind,
+    trust,
+    sensitivity,
+    freshness,
+    priority,
+    estimated_tokens,
+    content,
+}
+
+然后：
+
+Context Sources
+      ↓
+Context Items
+      ↓
+Budgeter
+      ↓
+Dedup
+      ↓
+Redaction
+      ↓
+Compression
+      ↓
+Provider-specific Prompt
+
+你 README 里已经提到了 stable ID、semantic zones 和 budget assembly，这个方向是对的。
+Token counting 也不要全局统一
+
+比如 tiktoken-rs 对 OpenAI 很好，而且现在支持 GPT-5.x 等。
+
+但不能：
+
+所有 provider → tiktoken
+
+应该：
+
+TokenEstimator trait
+    ├── OpenAI tokenizer
+    ├── provider count API
+    └── heuristic estimator
+
+Budget 永远允许：
+
+estimated != billed
+
+11. Memory 初期不要上 Vector DB
+
+这是很容易过度设计的地方。
+
+初期：
+
+SQLite
+├── sessions
+├── turns
+├── events
+├── messages
+├── context_snapshots
+├── permissions
+└── FTS5
+
+完全够。
+
+Hermes 现在就是把：
+
+Persistent curated memory
+
+和：
+
+完整 session history + SQLite FTS5 search
+
+分开的；session search 可以不经过 LLM，直接全文搜索。
+
+这个思路非常值得借鉴。
+
+我甚至建议：
+
+v0.1
+SQLite + FTS5
+
+v0.2
+optional embeddings
+
+v0.3+
+pluggable semantic memory
+
+而不是第一天：
+
+SQLite + Qdrant + embedding model + reranker
+
+Bitty 是桌面程序，保持部署简单很重要。
+
+如果偏向 lightweight，我会选：
+
+    rusqlite + dedicated database worker
+
+而不是 ORM。
+
+如果未来 bitty-ai daemon 有大量 concurrent DB I/O，再考虑 SQLx。SQLx 0.9 对 SQLite 也已经有成熟支持。
+12. ACP 我认为值得现在就加入设计
+
+这个是这次调研里另一个我很推荐的东西。
+
+现在已经有正式的 Agent Client Protocol (ACP)，并且有官方 Rust SDK：
+
+agent-client-protocol
+agent-client-protocol-http
+agent-client-protocol-rmcp
+
+它本质解决：
+
+Agent ↔ Client
+
+而 MCP 是：
+
+Agent ↔ Tool / Resource
+
+所以 Bitty AI 的架构可以非常漂亮：
+
+                        ACP
+                         │
+            ┌────────────┴────────────┐
+            │        bitty-ai         │
+            │                         │
+Bitty UI ──→│     Agent Runtime       │←── Zed
+            │                         │←── Neovim
+            │                         │←── other clients
+            └────────────┬────────────┘
+                         │
+                        MCP
+                         │
+                     Tool servers
+
+ACP 的目标本身就是连接任何 editor/client 和 agent，目前已经有 Zed 等生态。
+
+我的建议不是：
+
+    “Bitty 内部全部必须使用 ACP。”
+
+而是：
+
+bitty-ai-runtime
+      ↑
+      │ adapter
+      ↓
+bitty-ai-acp
+
+这样以后：
+
+bitty-ai acp
+
+就能独立运行。
+
+这会真正验证“bitty-ai 与 bitty-terminal 独立”。
+
+ACP v2 目前仍属于 draft/unstable surface，所以 v0.1 先跟 stable v1，不要追 unstable v2。
+13. 现阶段我建议直接使用的 Rust dependencies
+领域	推荐	建议
+Async runtime	tokio	直接用
+Cancellation	tokio-util::CancellationToken	必须有
+Stream	futures	直接用
+Serialization	serde, serde_json	基础
+JSON Schema	schemars	Tool schema
+Schema validation	jsonschema	外部 schema
+Model providers	genai	首选
+Agent contracts参考	rig-core	调研/可选 adapter
+MCP	rmcp	官方 SDK
+ACP	agent-client-protocol	推荐
+HTTP fallback	reqwest + rustls	必要时
+Retry	backon	很合适
+Persistence	rusqlite	首选
+Secrets memory	secrecy	推荐
+OS credentials	keyring	推荐
+Logging	tracing	必须
+Observability	OpenTelemetry	推荐
+Snapshot tests	insta	很适合 Agent events
+HTTP mocks	wiremock	Provider contract tests
+Property tests	proptest	parser/budget/stream
+OpenAI tokenizer	tiktoken-rs	provider-specific
+Filesystem capability	cap-std	可参考/局部使用
+
+CancellationToken 特别值得早点进入所有长生命周期 API，因为它可以形成 session → turn → model/tool 的 child-token tree。
+
+也就是：
+
+SessionToken
+    ├── TurnToken
+    │     ├── ModelToken
+    │     ├── ToolToken
+    │     └── ContextToken
+    │
+    └── TurnToken
+
+以后用户按 Esc、切 workspace、取消 agent，整个 cascade 才容易正确终止。
+14. Retry 要非常谨慎
+
+LLM API 会遇到：
+
+429
+5xx
+timeout
+connection reset
+truncated stream
+
+backon 已经提供 async exponential retry 等机制，没有必要自己写。
+
+但是 Bitty 的原则应该是：
+
+Retry(model read)        ✓
+
+Retry(HTTP GET)          ✓
+
+Retry(tool schema list)  ✓
+
+Retry(git push)          ✕
+
+Retry(rm -rf)            ✕
+
+Retry(payment)           ✕
+
+也就是：
+
+    Retry policy 必须认识 idempotency。
+
+千万不要统一：
+
+retry(3)
+
+包住所有 ToolCall。
+15. Secret management 一开始就做好
+
+secrecy 很适合 API key：
+
+SecretString
+
+避免：
+
+#[derive(Debug)]
+struct ProviderConfig {
+    api_key: String,
+}
+
+导致 log 时把 secret 打出来。
+
+secrecy 就是专门防 Debug/log 泄露，并在 drop 时 zeroize secret。
+
+长期 credential 则用系统 credential storage，例如 keyring，它已经支持 macOS / Windows / Linux keyrings。
+
+另外可以直接参考 Codex 的 environment filtering：
+
+*KEY*
+*SECRET*
+*TOKEN*
+
+默认不传入 Agent process environment。Codex 当前就这么处理。
+16. 最值得研究的几个项目
+
+这几个我建议你接下来直接 source-level study。
+项目	最值得 Bitty 学什么
+OpenAI Codex	protocol、event model、sandbox、approval、exec policy
+Goose	MCP-first Tool architecture、extension system、security inspector
+Rig	portable contracts、AgentRun state machine
+Hermes Agent	memory、SQLite/FTS5、skills、terminal backend
+OpenCode	permission layering、provider independence、tool lifecycle
+ACP Rust SDK	Agent ↔ Client protocol
+rmcp	MCP implementation
+Codex
+
+重点看：
+
+codex-rs/protocol
+codex-rs/core/src/tools
+exec_policy
+approvals
+sandboxing
+app-server
+
+它现在的 approval system 已经非常细。
+Goose
+
+Goose 目前大量 Tool 都建立在 MCP abstraction 上，McpClientTrait 把 external / builtin extension 做了比较统一的隔离。
+
+它的 Security / Egress / Adversary / Permission / Repetition inspector 思路也很值得研究。
+
+不过更值得研究的是它踩过的坑。
+
+今年刚出现过：
+
+    goose review 因为调用 Git 而受到恶意 .git/config core.fsmonitor 影响，导致在模型/permission layer 之前就能执行命令。
+
+这说明一个特别重要的 Bitty 原则：
+
+    不仅“模型调用的工具”需要 sandbox，Agent 自己为了收集 context 而运行的 git / shell / parser 同样属于攻击面。
+
+17. deny.toml 也可以稍微收紧
+
+当前已经做得不错：
+
+unknown-registry = deny
+unknown-git = deny
+
+并且 license allowlist 也已经配置。
+
+但当前还有：
+
+wildcards = "allow"
+external-default-features = "allow"
+
+在 dependency 很少的现在，其实反而是最适合严格的时候。
+
+另外现在 ignore：
+
+RUSTSEC-2026-0192
+RUSTSEC-2024-0436
+
+这两个目前分别是 ttf-parser、paste unmaintained informational advisory，并不是直接漏洞。
+
+可以 ignore，但最好写 rationale，例如：
+
+ignore = [
+    # transitive via X; informational/unmaintained;
+    # revisit after upstream migration
+    "RUSTSEC-2026-0192",
+]
+
+AI Agent 这种可以执行用户机器操作的软件，dependency security baseline 比普通 CLI 再严格一点是值得的。
+18. v0.1 千万别做太多 AI 功能
+
+我建议第一版只完成一条真正完整的 vertical slice：
+
+User Input
+    ↓
+Context Assembly
+    ↓
+Model Request
+    ↓
+Streaming
+    ↓
+Tool Call
+    ↓
+Permission
+    ↓
+Tool Execution
+    ↓
+Tool Result
+    ↓
+Model Continue
+    ↓
+Final Answer
+    ↓
+SQLite Event Persistence
+    ↓
+Replay
+
+只要这个链条做漂亮，整个 bitty-ai 的骨架就建立起来了。
+
+暂时不要急着做：
+
+multi-agent
+RAG
+vector DB
+self-evolution
+long-term semantic memory
+browser automation
+voice
+image generation
+embedded llama.cpp
+fine tuning
+A2A
+distributed agents
+
+这些都是后面的插件能力。
+19. 我会把 v0.1 定义成这些验收条件
+
+这是我目前最推荐的一条开发顺序：
+
+    冻结 core contracts：SessionId / TurnId / ModelRequest / ModelEvent / ToolCall / ContextItem / PermissionRequest；然后实现 fake ModelProvider + fake Tool，保证 Agent state machine 可以完全离线测试。
+
+    接入 genai，只先支持 2~3 类 provider：OpenAI Responses、Anthropic、Ollama/OpenAI-compatible；必须支持 streaming、usage、reasoning/tool event，不要只支持 final text。
+
+    实现 SQLite event store + FTS5，以及 deterministic replay；同时加入 cancellation、bounded channel 和 backpressure。
+
+    做统一 Tool abstraction，再用官方 rmcp 做 MCP adapter；所有 native/MCP tools 必须经过同一个 permission engine。
+
+    加 tracing + OpenTelemetry，把 model/tool/context/latency/token/cost 作为第一等 telemetry；最后实现 ACP adapter，让 bitty-ai 可以完全脱离 Bitty Terminal 独立运行。
+
+完成这五步，我才会称它为：
+
+    Bitty AI Runtime v0.1
+
+而不是“接了几个模型 API 的聊天模块”。
+20. 最重要的设计原则
+
+如果压缩成一句话，我会把 Bitty AI 的 architecture principle 定成：
+
+Protocols are replaceable.
+Providers are replaceable.
+Models are replaceable.
+Tools are replaceable.
+UIs are replaceable.
+
+But:
+
+Events,
+Context semantics,
+Capability policy,
+Consent,
+Session state
+
+belong to Bitty.
+
+也就是说：
+
+genai / rmcp / ACP / SQLite / OpenTelemetry 这些成熟基础设施尽量直接用；Context / Permission / Event / Runtime 这些决定 Bitty 特性的东西自己掌握。
+
+这会比从零写 AI 基础设施稳得多，同时又不会让 bitty-ai 变成某个现成 Agent framework 的 wrapper。
+
+目前仓库本身的工程 scaffold 已经相当完整：CI、CodeQL、cargo-deny、MSRV、toolchain、CarryCtx 工作流都已经有了；真正下一步不是继续补工程模板，而是尽快建立 bitty-docs/docs/ai，然后先冻结上面这些 Core Contracts + dependency ADRs。
+
+我尤其建议最先写 model-provider.md、agent-runtime.md、permissions.md、event-model.md 四份，因为这四个一旦定下来，后面的代码基本就能自然展开。
+
+那么这个 bitty-ai 应该会拆分成哪些 crates 呢？然后是不是有很多东西是 bitty 本身实现的，比如命令输出日志的展开和隐藏、IPC 等等东西呢？
+
+是的，bitty-ai 不应该把 Bitty Terminal 已经拥有的能力重新实现一遍。最清晰的边界应该是：
+
+    Bitty 负责“终端是什么、UI 怎么显示、进程实际发生了什么”；bitty-ai 负责“AI 如何理解这些信息、如何决策、如何请求能力”。
+
+所以像你说的 命令输出折叠/展开、Panel、workspace、PTY、IPC server、终端渲染，绝大多数都应该属于 Bitty 本体，而不是 bitty-ai。
+我建议的 bitty-ai crates
+
+初期不要拆到十几二十个 crate。我觉得 7~9 个左右比较合适：
+
+bitty-ai/
+├── crates/
+│   ├── bitty-ai-core
+│   ├── bitty-ai-model
+│   ├── bitty-ai-context
+│   ├── bitty-ai-tools
+│   ├── bitty-ai-runtime
+│   ├── bitty-ai-store
+│   ├── bitty-ai-protocol
+│   └── bitty-ai-cli
+└── Cargo.toml
+
+依赖关系大致：
+
+                    bitty-ai-core
+                         │
+          ┌──────────────┼──────────────┐
+          ↓              ↓              ↓
+    bitty-ai-model  bitty-ai-context  bitty-ai-tools
+          │              │              │
+          └──────────────┼──────────────┘
+                         ↓
+                  bitty-ai-runtime
+                    │          │
+                    ↓          ↓
+             bitty-ai-store  bitty-ai-protocol
+                    \          /
+                     \        /
+                      ↓      ↓
+                     bitty-ai-cli
+
+1. bitty-ai-core
+
+这是最底层。
+
+只放 domain types + contracts：
+
+SessionId
+TurnId
+AgentId
+
+Message
+ContentBlock
+ModelRequest
+ModelEvent
+Usage
+
+ContextItem
+ContextSource
+ContextBudget
+
+ToolCall
+ToolResult
+
+Capability
+PermissionRequest
+PermissionDecision
+
+AgentEvent
+AgentCommand
+
+原则：
+
+no HTTP
+no SQLite
+no MCP
+no terminal
+no Bitty UI
+
+甚至最好尽量：
+
+serde
+thiserror
+uuid
+
+这种基础依赖就够了。
+
+这是整个 bitty-ai 最稳定的一层。
+2. bitty-ai-model
+
+负责所有 LLM Provider。
+
+例如：
+
+ModelProvider
+ModelRegistry
+ModelCapabilities
+ModelConfig
+
+OpenAI
+Anthropic
+Gemini
+Ollama
+OpenRouter
+...
+
+内部可以接：
+
+genai
+
+以后必要时再：
+
+rig adapter
+direct OpenAI adapter
+local model adapter
+
+但上层只认识：
+
+trait ModelProvider
+
+不认识 genai::*。
+3. bitty-ai-context
+
+这个会成为 Bitty 非常重要的特色。
+
+负责：
+
+ContextProvider
+ContextItem
+ContextAssembler
+ContextBudget
+ContextRanking
+ContextDedup
+ContextCompression
+Redaction
+
+例如以后 Bitty Terminal 可以告诉它：
+
+current cwd
+visible viewport
+command history
+selected output
+last failed command
+current process
+workspace
+Git status
+active panel
+
+bitty-ai-context 决定：
+
+    哪些东西应该送给模型。
+
+但它不负责采集 PTY 本身。
+
+这个区别很关键。
+4. bitty-ai-tools
+
+负责 Agent 能调用什么。
+
+例如：
+
+Tool
+ToolRegistry
+ToolSchema
+ToolExecutor
+ToolCall
+ToolResult
+
+CapabilityResolver
+PermissionPolicy
+
+MCP adapter
+
+内部可以：
+
+rmcp
+
+但还是：
+
+Bitty Tool abstraction
+        ↑
+      MCP
+
+而不是：
+
+Bitty Tool = MCP Tool
+
+以后 Bitty 自己的一些能力：
+
+terminal.run
+terminal.read_output
+panel.open
+workspace.switch
+notification.show
+
+都可以作为 native tool 暴露给 bitty-ai。
+5. bitty-ai-runtime
+
+这是 核心中的核心。
+
+负责 Agent：
+
+Agent state machine
+Turn lifecycle
+tool loop
+model loop
+permission loop
+cancellation
+retry coordination
+event emission
+
+例如：
+
+Idle
+ ↓
+AssemblingContext
+ ↓
+WaitingModel
+ ↓
+Streaming
+ ↓
+ToolRequested
+ ↓
+WaitingApproval
+ ↓
+ExecutingTool
+ ↓
+WaitingModel
+ ↓
+Completed
+
+这个 crate 不应该知道：
+
+    Panel 长什么样。
+
+它只发：
+
+AgentEvent::ToolCallStarted(...)
+AgentEvent::TextDelta(...)
+AgentEvent::PermissionRequested(...)
+
+谁消费这些 event，是另一回事。
+6. bitty-ai-store
+
+负责 persistence：
+
+SQLite
+sessions
+turns
+events
+permissions
+usage
+memory
+context snapshots
+FTS5
+
+例如：
+
+SessionStore
+EventStore
+MemoryStore
+ConsentStore
+
+初期 SQLite 足够。
+
+这里我甚至建议设计成：
+
+trait EventStore
+trait SessionStore
+
+SQLite 只是默认实现。
+7. bitty-ai-protocol
+
+这个名字很重要。
+
+它负责的是：
+
+    bitty-ai 如何被外部程序控制。
+
+例如：
+
+ACP
+Bitty IPC adapter
+JSON-RPC
+stdio
+Unix socket
+named pipe
+
+但这里要注意：
+不等于 Bitty 的 IPC implementation。
+
+更准确地说：
+
+bitty repo
+    bitty-ipc
+       ↓
+actual socket / pipe transport
+
+bitty-ai
+    bitty-ai-protocol
+       ↓
+AI protocol / messages / adapters
+
+例如 Bitty 发：
+
+{
+  "method": "ai.session.send",
+  "params": {
+    "session": "...",
+    "message": "分析刚才失败的命令"
+  }
+}
+
+然后 bitty-ai 返回：
+
+AgentEvent
+AgentEvent
+AgentEvent
+...
+
+IPC 本身怎么传输：
+
+Unix socket
+Windows named pipe
+in-process channel
+
+应该主要由 Bitty infrastructure 控制。
+8. bitty-ai-cli
+
+最后才是 executable：
+
+bitty-ai chat
+bitty-ai run
+bitty-ai serve
+bitty-ai acp
+bitty-ai models
+bitty-ai mcp list
+
+例如：
+
+bitty-ai serve
+
+就可以在完全没有 Bitty Terminal的情况下运行。
+
+这也是验证你“bitty-ai 独立于 Bitty”的最好办法。
+哪些东西明确属于 Bitty 本身？
+
+你刚说的命令输出展开/隐藏，就是一个很好的例子。
+命令输出折叠
+
+应该是：
+
+PTY
+ ↓
+Command semantic model
+ ↓
+CommandBlock
+ ├── command
+ ├── output
+ ├── exit_code
+ ├── duration
+ └── collapsed
+ ↓
+Renderer
+
+这完全是：
+
+Bitty Terminal
+
+的 UI / terminal semantics。
+
+AI 只可能说：
+
+“给我 command block #183 的完整输出”
+
+或者：
+
+“关注最近三个失败命令”
+
+但：
+
+collapsed = true
+展开动画
+显示多少行
+快捷键
+Flash jump label
+
+全部属于 Bitty UI。
+AI 和 UI 最好通过 semantic ID 联系
+
+这个其实和你之前设计的 Flash / output collapse 非常契合。
+
+比如 Bitty 内部：
+
+workspace: ws-1
+panel: panel-4
+session: term-2
+command: cmd-183
+output: out-183
+
+AI 不需要拿整个 UI tree。
+
+而是：
+
+ContextItem {
+    id: "command:cmd-183",
+    kind: Command,
+    ...
+}
+
+AI 如果需要：
+
+Tool:
+terminal.get_command_output("cmd-183")
+
+然后 Bitty 返回。
+
+甚至 AI 可以产生一个 UI suggestion：
+
+Reveal(cmd-183)
+Focus(cmd-183)
+Highlight(cmd-183)
+
+然后由 Bitty 决定怎么显示。
+
+这就非常漂亮：
+
+AI understands semantic objects
+Bitty owns visual representation
+
+Panel 也属于 Bitty
+
+比如以后：
+
+AI Chat Panel
+AI Task Panel
+Agent Timeline Panel
+Context Inspector Panel
+Permission Panel
+
+这些应该都是：
+
+Bitty Plugin / Panel
+
+不是 bitty-ai.
+
+bitty-ai 只提供：
+
+AgentEvent
+SessionState
+ContextState
+PermissionRequest
+
+Panel 把它渲染出来。
+
+因此甚至未来可以有：
+
+bitty-ai
+   │
+   ├── Bitty Panel
+   ├── CLI
+   ├── Zed
+   ├── Neovim
+   └── custom UI
+
+AI runtime 完全不用知道谁在显示自己。
+IPC 也主要属于 Bitty，但 AI protocol 属于 bitty-ai
+
+这里比较容易混淆。
+
+我会拆成两层：
+
+Transport
+────────────
+Unix Socket
+Named Pipe
+in-process channel
+
+         ↓
+
+Protocol
+────────────
+SessionCreate
+MessageSend
+CancelTurn
+ApproveTool
+AgentEvent
+ContextRequest
+
+Transport 属于：
+
+bitty-ipc
+
+Protocol 可以属于：
+
+bitty-ai-protocol
+
+甚至更极端一点：
+
+bitty-protocol
+
+作为整个 Bitty platform 的共享 protocol crate。
+
+然后：
+
+bitty-protocol
+├── terminal
+├── panel
+├── workspace
+├── plugin
+└── ai
+
+这是以后值得考虑的。
+PTY / Shell Integration 更不能放 bitty-ai
+
+Bitty 已经天然掌握：
+
+shell command boundary
+OSC
+PTY output
+cwd
+foreground process
+exit status
+terminal dimensions
+shell integration
+
+bitty-ai 只需要通过 ContextProvider 获取一个规范化表示：
+
+CommandContext {
+    id,
+    command,
+    cwd,
+    exit_code,
+    started_at,
+    duration,
+    output_summary,
+}
+
+这样 bitty-ai 不需要：
+
+理解 VT100
+解析 ANSI
+管理 PTY
+识别 shell prompt
+
+这些都已经是终端模拟器自己最擅长的事情。
+
+千万不要让 AI 层重新解析终端字节流。
+Sandbox 反而可能横跨两边
+
+这是少数需要特别处理的。
+
+比如 AI 请求：
+
+rm foo
+
+执行可能由：
+
+Bitty process subsystem
+
+真正完成。
+
+但权限判断：
+
+这个 Agent 是否可以删除 foo？
+
+属于：
+
+bitty-ai permission engine
+
+因此：
+
+Agent
+ ↓
+ToolCall
+ ↓
+bitty-ai Capability / Permission
+ ↓
+Approved
+ ↓
+Bitty Process API
+ ↓
+actual execution
+
+也就是：
+
+    AI 决定“是否允许它请求”；Bitty 决定“如何安全执行”。
+
+未来 Bitty 自己应该有一个统一 executor：
+
+bitty-exec
+
+负责：
+
+process spawn
+env filtering
+cwd
+PTY
+sandbox
+resource limits
+timeout
+kill
+
+AI 不应该再实现第二套 process executor。
+最终整个 Bitty 可以形成这种结构
+
+我觉得你这个项目现在已经越来越适合这种 architecture：
+
+                     ┌────────────────────┐
+                     │      bitty-ai      │
+                     │                    │
+                     │ Model              │
+                     │ Context            │
+                     │ Agent Runtime      │
+                     │ Tools              │
+                     │ Permission         │
+                     │ Memory             │
+                     └─────────┬──────────┘
+                               │
+                         semantic API
+                               │
+                     ┌─────────▼──────────┐
+                     │       Bitty        │
+                     │                    │
+                     │ PTY / Terminal     │
+                     │ Command Model      │
+                     │ Process Executor   │
+                     │ IPC                │
+                     │ Workspace          │
+                     │ Panel              │
+                     │ Plugin Host        │
+                     │ Rendering          │
+                     └────────────────────┘
+
+再往外：
+
+                         bitty-ai
+                       /    |     \
+                      /     |      \
+                   ACP   Bitty IPC  CLI
+                    |       |       |
+                   Zed    Bitty UI  headless
+
+这其实是一个相当健康的边界。
+一个很实用的判断规则
+
+以后你在纠结“这个功能应该放 bitty 还是 bitty-ai”时，可以问：
+
+    关闭 AI 后，这个能力 Bitty 是否仍然应该存在？
+
+如果答案是 yes：
+
+命令输出折叠        → Bitty
+Flash 跳转          → Bitty
+Panel               → Bitty
+Workspace           → Bitty
+IPC                 → Bitty
+PTY                 → Bitty
+文件浏览器          → Bitty/plugin
+Git Panel           → Bitty/plugin
+terminal semantic ID → Bitty
+
+如果答案是 no：
+
+Prompt assembly      → bitty-ai
+Context budgeting    → bitty-ai
+Model selection      → bitty-ai
+Tool calling loop    → bitty-ai
+Agent state machine  → bitty-ai
+AI memory            → bitty-ai
+permission reasoning → bitty-ai
+MCP client           → bitty-ai
+
+如果是两边都需要：
+
+Process execution
+IPC
+Context
+Permission
+
+就拆成：
+
+Bitty = mechanism
+bitty-ai = policy / semantics
+
+这个原则尤其适合 Bitty：Bitty 提供 mechanisms，bitty-ai 提供 AI policy。
+
+还有我以前说的 agent 基本的工具调用部分会有哪些基本的呢？我之前其实说过这些：
+你可以看看 /mnt/data/Workspace/Projects/ctxctl 这个，也就是 ctxctl 这个工具吗？其实你可以直接用看看效果，有 cli 也有 mcp，就是我想的之后如果做 bitty-ai 部分肯定是有工具调用的，我想的是不仅是 pi-agent 那样基本的功能，我想在读和写部分变得更好，在读这个部分之前已经说了可以把那个输出的部分给压缩，也就是 cargo test, cargo build 这种的直接变成一句话这种的，那么对于读文件我想的就是可以通过抽象语法树 AST 了，也就是可以看看我这个 ctxctl 这个工具，我觉得之后 agent 工具可以加入个这种的快速阅读代码相关的功能吧？比如想要了解一个项目，那么我们只需要快速了解各个代码的核心部分就行了吧，比如一个代码有哪些类、有哪些方法、有哪些函数、结构体等等是吧，但是具体里面的内容我们就不需要了，因为我们本身就不需要读取那么多，而且我想的是之后不仅是对于一个单文件进行调用，而且可以直接对于一个项目调用这种的工具，比如一个 src 文件，直接输出了有哪些文件，各个文件有哪些内容，各个文件相互依赖是怎么样的等等是吧。也就是像 ctxctl 这样，但是 ctxctl 只能读单文件，如果可以读多文件一整个项目的话就更好了，然后就是这个读取了之后我们就知道想要的部分了，这样的话就可以只读我们想要的部分和相关依赖的区域了，而且读可以同时读多个文件的需要的内容。
+再说编辑部分，我觉得也是可以一次编辑多个文件，就是调用这种我们写好的工具，就跟读取那样应该可以同时写入更多文件，为什么我会这么考虑呢，是因为读和写在现在的 Agent 好像主要都是通过调用多次工具来实现的，每次调用都算一次 LLM API 调用，那么多次后就会算更多的成本，而且可能会出现缓存命中失败，以下是结论：
+结论先说：读写多个文件在 Hermes 里不必然是多次 API 请求——「工具调用次数」和「模型 API 往返次数」是两个不同层级。我顺手用本机 state.db 做了实测，下面有真实数据。
+
+一、机制：一次 request 可以带多个 tool_calls
+
+Hermes 的 agent loop（见 docs/developer-guide/agent-loop）：
+  - 一次 assistant 消息里可以并列产出多个 tool_calls（parallel tool calling）；
+  - 单 tool call 直接在主线程执行，多个 tool call 走 ThreadPoolExecutor 并发执行，结果按原顺序回插历史；
+  - 消息序列是 Assistant(with tool_calls) → Tool → Tool → ... → Assistant，只有 tool role 允许连续多条；
+  - 然后才发起下一次 API 调用，把 N 个工具结果一起喂回。
+
+所以：一次 request 返回 N 个 tool call，N 个结果只需 1 次后续 request 消化。
+
+二、本机实测（~/.hermes/state.db）
+
+  全库统计：含工具调用的 assistant 消息 22,368 条，承载工具调用 29,925 次；
+  其中 4,420 条（19.8%）是并行批次，单条消息里最多的并行数量达 30 个 read_file；
+  相比逐个调用，省下 7,557 次 API 往返（若不批量需 29,925 次，实际 22,368 次）。
+
+  本次会话就是活例：第一条 assistant 消息同时发了 web_search + terminal → 回两条 tool 结果 → 才进入下一次 request。
+
+  另外注意：某个早期 session（653 条 assistant 消息）全部是单 tool call —— 说明并行不是必然，取决于模型和 provider 是否稳定输出 multi tool_calls。
+
+三、什么时候「必须」多次往返
+
+  - 数据依赖：B 的路径/内容来自 A 的结果 → 只能串行（先 1 次往返拿 A，再 1 次拿 B）。
+  - 模型/protocol 限制：chat_completions / anthropic_messages / codex_responses 三种 API mode 的并行支持与解析方式不同；部分模型压根不吐并行 tool_calls。
+  - Hermes 会把交互型工具（如 clarify）强制串行。
+  - 并行批次后仍需一次 request 看结果，所以「N 个文件」最少是 2 次往返，不是 1 次。
+
+四、成本视角
+
+每次往返都要重发整个 conversation，input token 累积（有 prompt caching 会缓解），因此减少往返对 latency 和花费都有意义。
+
+五、四种「批量」手段，按场景选
+
+  1) 同一 turn 并列多个 read_file / write_file / patch —— 省往返，但结果仍全部进 context（token 不省）。
+  2) execute_code —— 写 Python 在循环里调 read_file/write_file/search_files（RPC 暴露 7 个工具），1 次往返处理 N 个文件，且只有 stdout 回上下文，token 也省。官方建议「3+ 调用且中间有逻辑」时优先用它；我上面那几条统计就是这么跑的（4 次 execute_code 扫完整库）。
+  3) patch mode='patch'（V4A 多文件补丁）—— 一次工具调用改多个文件。
+  4) delegate_task —— 把海量文件读写丢给 subagent（独立 conversation），父上下文只收最终摘要；但子 agent 内部的 tool call 是它自己的 API 调用，总账上并不消失。
+
+经验法则：独立无依赖 → 同 turn 并列；有依赖 → 串行；机械化 N 文件循环 → execute_code；需要判断和探索 → 直接调用工具或 delegate。
+
+参考：https://hermes-agent.nousresearch.com/docs/developer-guide/agent-loop （Sequential vs Concurrent 一节）、/docs/guides/delegation-patterns （execute_code vs delegation 对比表）。
+
+
+那么我之后设计肯定是会考虑这些的，那么如何实现这些呢？我就想到了 opencode 是支持 lsp 和 lint 的，而且 neovim 就是通过 mason 来进行管理这些的，那么我想的就是我们只需要把相关的接口实现好，然后只要用户安装和配置自己的 lsp, lint 是不是就好了呢？而且 lsp 和 lint 我觉得不止是能实现以上我说的这些，应该还可以辅助代码检查和格式化等等功能以及找相关的代码？之后bitty-ai原生应该需要设计很多更好用的东西
+
+对，而且我现在看完你当前的 ctxctl 后，我觉得这个方向其实比“给 bitty-ai 加几个传统 coding tools”更有潜力。
+
+你现在的 ctxctl 已经不是简单的 read_file 包装：它明确采用 Tree-sitter 定位 symbol → original-source slice → byte-stable output，并且把 outline / symbol / read / deps / exec 分离出来；ctx-symbol 本身也已经是可复用 library crate，而不是绑死 CLI。
+
+所以我的建议会比之前更进一步：
+
+    bitty-ai 不应该以 read_file/write_file/bash 为中心，而应该有一个原生的 Code Intelligence Runtime。
+
+    read_file / shell 只是 fallback primitive；正常情况下 Agent 应该操作 Project、Symbol、Reference、Diagnostic、Edit Transaction 这些更高层对象。
+
+一、先把一个核心概念定下来
+
+你之前总结得是对的：
+
+    Tool Call 数量 ≠ Model API Round Trip 数量。
+
+例如：
+
+Model request #1
+    ↓
+Assistant:
+    read(a)
+    read(b)
+    read(c)
+    ↓
+并行执行
+    ↓
+tool_result(a)
+tool_result(b)
+tool_result(c)
+    ↓
+Model request #2
+
+这是：
+
+3 tool calls
+2 model requests
+
+Hermes 当前确实就是多个 tool calls 并发执行，结果按原顺序统一放回 conversation，再进入下一轮模型请求。
+
+而且 Hermes 的 execute_code 更进一步：
+
+LLM
+ ↓
+execute_code
+ ↓
+read 100 files
+ ↓
+本地过滤
+ ↓
+只把 2 KB 最终结果送回模型
+
+中间 tool results 根本不进入 model context。
+
+所以 Bitty AI 优化的真正目标应该是三个：
+
+减少 Model Round Trips
+减少进入 Context 的 Bytes/Tokens
+提高一次 Tool Invocation 的 Information Density
+
+而不是简单追求：
+
+tool calls 越少越好
+
+二、Bitty AI 最好不要暴露几十个低级工具
+
+我反而建议模型直接看到大概 8~12 个高质量工具。
+
+比如：
+Tool	作用	Backend
+project.inspect	项目整体结构 / module / symbol map	Tree-sitter + manifests
+code.search	text / symbol / structural / semantic search	rg + AST + LSP
+code.read	一次读取多个 symbol / range / file	Tree-sitter
+code.graph	imports / references / calls / inheritance	AST + LSP
+code.edit	transactional multi-file edits	Bitty
+code.rename	semantic rename	LSP
+code.check	diagnostics / lint / compile / test	LSP + linters
+code.format	format changed files/ranges	formatter/LSP
+terminal.run	command execution + structured compression	Bitty + ctx-exec
+git	status/diff/history等语义化 Git 操作	Git
+tool.batch	独立工具并行执行	runtime
+tool.pipeline	有依赖的本地批处理	runtime
+
+也就是说模型不会主要生活在：
+
+cat
+grep
+sed
+find
+
+世界里。
+
+而是在：
+
+Project
+Symbol
+Reference
+Diagnostic
+Edit
+Command
+
+这些 semantic objects 上操作。
+三、ctxctl outline 应该升级成 project.inspect
+
+你现在的：
+
+ctxctl outline src/main.rs
+
+解决的是：
+
+file
+ ↓
+symbols
+
+下一步 Bitty 可以做：
+
+project / directory
+ ↓
+files
+ ↓
+symbols
+ ↓
+imports
+ ↓
+references
+ ↓
+dependency graph
+
+比如 Agent 调：
+
+{
+  "root": "src",
+  "depth": 3,
+  "include": [
+    "files",
+    "symbols",
+    "imports",
+    "edges"
+  ],
+  "budget_tokens": 4000
+}
+
+返回类似：
+
+src/
+├── main.rs
+│   ├── fn main
+│   └── fn run
+│
+├── agent/
+│   ├── mod.rs
+│   │   ├── struct Agent
+│   │   └── impl Agent
+│   ├── runtime.rs
+│   │   ├── struct Runtime
+│   │   ├── fn execute_turn
+│   │   └── fn dispatch_tool
+│   └── context.rs
+│       ├── struct Context
+│       └── fn assemble
+│
+└── tools/
+    ├── mod.rs
+    └── shell.rs
+
+Dependencies:
+
+main.rs
+  → agent::Runtime
+
+agent/runtime.rs
+  → context::Context
+  → tools::ToolRegistry
+
+tools/shell.rs
+  → bitty_process
+
+这已经足够让模型理解：
+
+    “这个项目大概是什么样。”
+
+而完全不需要把所有源代码读一遍。
+四、这里可以直接借鉴 Aider RepoMap
+
+你现在这个思路和 Aider 的 RepoMap 会非常契合。
+
+Aider 不是把所有 symbol 都扔进 context，而是构造 repository dependency graph，然后根据相关性/centrality，在给定 token budget 内选出最重要的一部分。
+
+所以 Bitty 可以进一步做：
+
+ProjectIndex
+      │
+      ├── files
+      ├── definitions
+      ├── references
+      ├── imports
+      └── call edges
+             ↓
+         graph ranking
+             ↓
+      Context budget
+
+比如用户问：
+
+为什么 Agent Runtime 会死锁？
+
+Bitty 不需要输出整个项目。
+
+可以从：
+
+AgentRuntime
+
+作为 seed：
+
+AgentRuntime
+ ↓
+execute_turn
+ ↓
+ToolDispatcher
+ ↓
+ProcessExecutor
+ ↓
+CancellationToken
+
+只选择这一小片 dependency neighborhood。
+
+这其实就是你 ctxctl 思想的 project-level generalization。
+五、不过不能只靠 AST
+
+这里我会明确分四层：
+
+          Code Intelligence
+                 │
+    ┌────────────┼────────────┐
+    ↓            ↓            ↓
+ Syntax       Semantic      Search
+Tree-sitter     LSP          rg
+    │            │            │
+    └────────────┼────────────┘
+                 ↓
+               Index
+            SCIP(optional)
+
+Tree-sitter
+
+负责：
+
+file outline
+class/function/struct
+syntax ranges
+imports
+AST query
+structural matching
+code slicing
+
+它非常快，而且代码甚至语法不完整时仍能提供有用 parse tree。
+
+这也是 ctx-symbol 现在已经做得很好的部分：保存 byte range，再从 original source 取 slice，而不是重新生成源代码。
+六、LSP 则应该负责“语义”
+
+这就是你想到 OpenCode 的方向。
+
+LSP 本身远远不只是 diagnostics。
+
+当前标准本身涵盖诸如：
+
+document symbols
+workspace symbols
+
+go to definition
+go to declaration
+go to type definition
+go to implementation
+
+find references
+
+hover
+signature help
+
+call hierarchy
+type hierarchy
+
+rename
+
+code action
+
+diagnostics
+
+document formatting
+range formatting
+
+LSP 本来的目标就是让一个 language server 可以复用于不同编辑器/IDE。
+
+所以 Bitty AI 完全可以这样：
+
+code.definition
+       ↓
+LSP textDocument/definition
+
+code.references
+       ↓
+LSP textDocument/references
+
+code.rename
+       ↓
+LSP textDocument/rename
+
+code.diagnostics
+       ↓
+LSP diagnostics
+
+code.actions
+       ↓
+LSP textDocument/codeAction
+
+七、这一点甚至可以比 OpenCode 更进一步
+
+当前 OpenCode 已经集成很多 LSP，并自动监听文件变化和 diagnostics。
+
+但它现在有一个很有意思的限制：
+
+    虽然内部 LSP client 支持 completion、hover、definition 等完整功能，目前真正暴露给 AI 的主要还是 diagnostics tool。
+
+所以这里反而给 Bitty 留了很大设计空间。
+
+Bitty 不应该暴露：
+
+lsp_definition
+lsp_reference
+lsp_hover
+
+这种带实现细节的接口。
+
+应该是：
+
+code.definition
+code.references
+code.implementations
+code.inspect_symbol
+
+内部优先：
+
+LSP
+
+如果没有：
+
+Tree-sitter + search fallback
+
+Agent 根本不用知道 LSP 存不存在。
+八、一个特别强的工具：code.read
+
+这个应该是 ctxctl symbol 的超级版。
+
+例如：
+
+{
+  "targets": [
+    {
+      "path": "src/runtime.rs",
+      "symbol": "execute_turn"
+    },
+    {
+      "path": "src/tools.rs",
+      "symbol": "dispatch"
+    },
+    {
+      "path": "src/context.rs",
+      "symbol": "assemble"
+    }
+  ],
+  "mode": "compact",
+  "include": [
+    "signature",
+    "docs"
+  ],
+  "budget_tokens": 3000
+}
+
+一次 tool call：
+
+read 3 files
+parse 3 AST
+extract 3 symbols
+compact
+sort
+budget
+
+最后只给模型：
+
+3 个它真正想看的 symbol
+
+而不是模型分别：
+
+read A
+model
+read B
+model
+read C
+model
+
+这就是你想解决的问题。
+
+而且即使模型本身支持 parallel tool calling：
+
+read A
+read B
+read C
+
+code.read 仍然有优势。
+
+因为它可以在 tool 内部：
+
+deduplicate
+sort
+compress
+token budget
+filter
+
+这是普通 parallel tool calls 做不到的。
+九、code.search 应该是“四模搜索”
+
+我会设计：
+
+mode = text
+mode = symbol
+mode = structural
+mode = semantic
+
+底层：
+
+text
+    → ripgrep
+
+symbol
+    → Tree-sitter index / LSP workspace symbol
+
+structural
+    → Tree-sitter / ast-grep
+
+semantic
+    → LSP definition/reference/type
+
+特别是 ast-grep 非常值得参考。
+
+它就是基于 AST 做跨语言 structural search / rewrite，并且支持很多语言。
+
+比如传统 grep：
+
+foo(...)
+
+不知道：
+
+foo
+
+究竟是变量、调用还是声明。
+
+AST search 可以说：
+
+    找所有 foo() function calls。
+
+这对 Agent 很有价值。
+十、甚至应该有 code.graph
+
+这个是普通 Agent 很欠缺的能力。
+
+比如：
+
+{
+  "target": "AgentRuntime::run",
+  "relations": [
+    "calls",
+    "called_by",
+    "references",
+    "imports",
+    "implements"
+  ],
+  "depth": 2
+}
+
+返回：
+
+AgentRuntime::run
+ ├── calls
+ │   ├── ContextAssembler::assemble
+ │   ├── ModelProvider::stream
+ │   └── ToolDispatcher::dispatch
+ │
+ ├── called_by
+ │   └── Session::execute
+ │
+ └── references
+     ├── src/session.rs:182
+     └── tests/runtime.rs:74
+
+这样 Agent 可以直接问：
+
+    如果我修改这个函数，会影响什么？
+
+进一步甚至可以：
+
+code.impact
+
+得到：
+
+Potential impact:
+  4 callers
+  2 implementations
+  7 tests
+  1 public API
+
+这会比传统 coding agent 反复 grep 强很多。
+十一、SCIP 可以作为“大项目索引层”
+
+这不是 v0.1 必须，但很值得留接口。
+
+SCIP 是专门的 language-agnostic code intelligence index protocol，可以表示 definition/reference/implementation 等 code navigation 数据，而且有 Rust bindings。
+
+所以未来：
+
+small project
+    ↓
+Tree-sitter + LSP live queries
+
+large project
+    ↓
+persistent ProjectIndex / SCIP
+
+huge / cross repo
+    ↓
+SCIP index
+
+会比较自然。
+
+但我不会第一版就做。
+十二、LSP 的确可以让用户自己配置
+
+你拿 Mason 类比是正确的。
+
+Mason 本质就是：
+
+    管理 LSP、DAP、linters、formatters 等外部 tooling，并把 executable 暴露给 Neovim。
+
+但我不建议 bitty-ai v0.1 自己做一个 Mason。
+
+第一版只需要：
+
+discover
+configure
+launch
+communicate
+health-check
+
+例如：
+
+[languages.rust]
+extensions = ["rs"]
+roots = ["Cargo.toml"]
+
+[languages.rust.lsp]
+command = "rust-analyzer"
+
+[languages.rust.formatter]
+command = "rustfmt"
+
+[[languages.rust.linters]]
+command = "cargo"
+args = ["clippy", "--message-format=json"]
+
+TypeScript：
+
+[languages.typescript.lsp]
+command = "typescript-language-server"
+args = ["--stdio"]
+
+[languages.typescript.formatter]
+command = "biome"
+args = ["format"]
+
+Bitty 做：
+
+PATH discovery
+project config
+user config
+capability detection
+
+就够了。
+
+以后再加：
+
+bitty toolchain install rust-analyzer
+
+这种 package manager。
+十三、甚至 LSP Client 本身也不用从 JSON-RPC 开始造
+
+Rust 里现在有 async-lsp，是基于 Tower 的 asynchronous LSP framework，同时支持 Language Server 和 Language Client，并支持 middleware。
+
+tower-lsp 更偏 server abstraction。
+
+因为 Bitty 是：
+
+LSP Client
+
+所以我会优先评估：
+
+async-lsp
+
+而不是自己：
+
+spawn process
+parse Content-Length
+write JSON-RPC
+track IDs
+handle cancellation
+handle server requests
+
+全部从头实现。
+十四、Lint / Compiler / Formatter 不要和 LSP 混成一个东西
+
+我建议抽象为：
+
+LanguageToolchain
+├── SyntaxProvider
+├── SemanticProvider
+├── DiagnosticProvider
+├── FormatterProvider
+└── BuildProvider
+
+例如 Rust：
+
+Syntax
+    tree-sitter-rust
+
+Semantic
+    rust-analyzer
+
+Diagnostic
+    rust-analyzer
+    cargo check
+    cargo clippy
+
+Formatter
+    rustfmt
+
+Build
+    cargo check/build/test
+
+TypeScript：
+
+Syntax
+    tree-sitter-typescript
+
+Semantic
+    typescript-language-server
+
+Diagnostic
+    tsserver / eslint / biome
+
+Formatter
+    biome / prettier
+
+也就是说：
+
+    能力优先，而不是工具优先。
+
+Agent 只问：
+
+diagnose this project
+
+它不应该关心：
+
+到底是 eslint 还是 biome。
+
+十五、编辑部分我也非常赞成你做成 multi-file
+
+而且我建议不是：
+
+write_many
+
+这么简单。
+
+应该直接做：
+
+    Edit Transaction
+
+例如：
+
+{
+  "operations": [
+    {
+      "type": "replace_symbol",
+      "path": "src/runtime.rs",
+      "symbol": "execute",
+      "content": "..."
+    },
+    {
+      "type": "insert_after",
+      "path": "src/error.rs",
+      "symbol": "RuntimeError",
+      "content": "..."
+    },
+    {
+      "type": "create",
+      "path": "src/cancel.rs",
+      "content": "..."
+    }
+  ]
+}
+
+一次完成：
+
+validate
+ ↓
+check file versions
+ ↓
+apply in memory
+ ↓
+detect overlapping edits
+ ↓
+parse AST
+ ↓
+optional format
+ ↓
+commit all files
+ ↓
+diagnostics
+ ↓
+compact result
+
+结果：
+
+3 files changed
++82 -17
+
+runtime.rs
+  execute_turn modified
+
+error.rs
+  Cancelled variant added
+
+cancel.rs
+  created
+
+Diagnostics:
+  0 errors
+  1 warning
+
+模型完全没必要看到 300 行 diff，除非它要求。
+十六、一定要给 multi-file edit 做 stale-write protection
+
+这是 Agent 编辑特别容易踩的坑。
+
+每次读：
+
+src/foo.rs
+
+可以返回：
+
+revision/hash
+
+编辑时：
+
+{
+  "path": "src/foo.rs",
+  "expected_hash": "abc123",
+  "..."
+}
+
+如果期间用户或者别的 Agent 改了：
+
+hash mismatch
+
+Bitty 就拒绝。
+
+否则 multi-agent / 用户同时修改时：
+
+Agent A reads
+User edits
+Agent A writes old version
+
+非常危险。
+十七、LSP 的 WorkspaceEdit 可以直接借鉴
+
+LSP rename / code actions 本身就可能产生：
+
+WorkspaceEdit
+
+跨多个文件修改。
+
+所以 Bitty 自己的：
+
+EditTransaction
+
+完全可以设计得接近：
+
+WorkspaceEdit
+
+然后：
+
+LSP rename
+      ↓
+WorkspaceEdit
+      ↓
+Bitty EditTransaction
+      ↓
+validation / permission / apply
+
+而不是 LSP 自己直接碰文件。
+
+这样非常统一。
+十八、修改完成之后，可以形成一个 Verification Pipeline
+
+比如 Agent 修改完：
+
+3 files
+
+Bitty 自动知道 affected scope：
+
+changed files
+     ↓
+Tree-sitter parse
+     ↓
+formatter
+     ↓
+LSP diagnostics
+     ↓
+linter
+     ↓
+compiler/check
+     ↓
+targeted tests
+
+然后只返回：
+
+Verification
+
+syntax       PASS
+format       PASS
+LSP          PASS
+clippy       2 warnings
+tests        38 passed
+
+Relevant:
+src/runtime.rs:82 unused variable `state`
+
+而不是把：
+
+cargo test
+
+那几百行 raw output 塞回来。
+
+这正好可以直接复用你现在 ctx-exec 的思路。
+
+ctxctl 当前已经明确把 command output compression 当成主要能力之一，并且 benchmark 里 log-analysis 的 session cost 降幅非常明显。
+十九、所以 ctx-symbol / ctx-exec 不应该复制进 bitty-ai
+
+这是我看了现在仓库后非常明确的建议。
+
+你现在已经拆成：
+
+ctx-symbol
+ctx-exec
+ctxctl
+
+三个 workspace members。
+
+这是非常好的结构。
+
+Bitty 可以：
+
+bitty-ai-code
+    ↓
+ctx-symbol
+
+bitty-ai-terminal / tools
+    ↓
+ctx-exec
+
+而不是：
+
+bitty-ai
+    ↓
+exec ctxctl subprocess
+
+更不要复制源码。
+
+也就是说：
+
+ctxctl
+      ┐
+      ├── ctx-symbol
+      └── ctx-exec
+
+bitty-ai
+      ┐
+      ├── ctx-symbol
+      └── ctx-exec
+
+ctxctl 保持：
+
+    stateless CLI context optimizer
+
+Bitty 则在上面构建：
+
+    stateful project intelligence runtime
+
+这是很清晰的关系。
+二十、我甚至建议新增一个 bitty-ai-code crate
+
+结合我们上一轮 crates 设计，我现在会调整为：
+
+bitty-ai-core
+bitty-ai-model
+bitty-ai-context
+bitty-ai-code        ← 新增
+bitty-ai-tools
+bitty-ai-runtime
+bitty-ai-store
+bitty-ai-protocol
+bitty-ai-cli
+
+其中：
+
+bitty-ai-code/
+├── project/
+│   ├── discover
+│   ├── graph
+│   └── index
+│
+├── syntax/
+│   └── ctx-symbol
+│
+├── search/
+│   ├── text
+│   ├── symbol
+│   └── structural
+│
+├── lsp/
+│   ├── client
+│   ├── pool
+│   └── capabilities
+│
+├── diagnostics/
+├── edit/
+├── format/
+└── toolchain/
+
+这个 crate 会成为 Bitty AI coding 能力的核心之一。
+二十一、tool.batch 和 tool.pipeline 也值得原生存在
+
+这是解决你前面 API 往返问题的关键。
+tool.batch
+
+解决：
+
+A B C 相互独立
+
+比如：
+
+{
+  "calls": [
+    {"tool": "code.read", "args": {"target": "A"}},
+    {"tool": "code.read", "args": {"target": "B"}},
+    {"tool": "code.read", "args": {"target": "C"}}
+  ]
+}
+
+runtime：
+
+join_all()
+
+并发执行。
+
+即使 provider 自己不稳定支持 parallel tool calling，也能批量。
+tool.pipeline
+
+解决：
+
+B 依赖 A
+
+例如：
+
+project.inspect
+    ↓
+选出 symbols
+    ↓
+read symbols
+    ↓
+find references
+    ↓
+compact
+
+如果每一步都回模型：
+
+LLM → tool → LLM → tool → LLM
+
+非常贵。
+
+可以：
+
+LLM
+ ↓
+pipeline
+ ↓
+local deterministic operations
+ ↓
+final result
+ ↓
+LLM
+
+这就是 Hermes execute_code 思路，但我初期会比 Hermes 更严格。
+
+Hermes 是：
+
+Python arbitrary program
+
+Bitty v0.1 可以先：
+
+typed DAG / pipeline DSL
+
+这样：
+
+更容易限制权限
+更容易 budget
+更容易 trace
+更容易 replay
+更容易 cache
+
+以后再考虑：
+
+sandboxed Lua
+sandboxed Python
+WASM
+
+二十二、最终 Agent 阅读代码可能会变成这样
+
+传统 Agent：
+
+ls
+ ↓
+read Cargo.toml
+ ↓
+read src/main.rs
+ ↓
+grep Runtime
+ ↓
+read runtime.rs
+ ↓
+grep Tool
+ ↓
+read tool.rs
+ ↓
+...
+
+Bitty AI：
+
+project.inspect(root)
+ ↓
+
+code.graph("AgentRuntime", depth=2)
+ ↓
+
+code.read([
+    AgentRuntime::run,
+    ContextAssembler::assemble,
+    ToolDispatcher::dispatch
+])
+ ↓
+
+code.references(AgentRuntime::run)
+
+可能 3~4 个工具交互就理解整个相关子系统。
+
+而且每次返回的都是：
+
+high-density semantic context
+
+这才是你这个方案真正厉害的地方。
+我最推荐的 v0.1 路线
+
+这一阶段甚至不用急着做所有 LSP 能力。先完成：
+
+ctx-symbol
+        ↓
+ProjectIndex
+        ↓
+project.inspect
+code.search
+code.read
+code.graph
+        ↓
+multi-file EditTransaction
+        ↓
+ctx-exec
+        ↓
+code.check
+
+然后第二阶段接：
+
+LSP
+├── definition
+├── references
+├── implementations
+├── diagnostics
+├── rename
+└── code actions
+
+第三阶段再：
+
+tool.pipeline
+persistent project index
+SCIP
+semantic impact analysis
+
+其中我觉得 ProjectIndex + token-budgeted Project Map 会是下一步最值得你做的部分。因为这正好把 ctxctl 已经验证成功的“单文件 token-efficient reading”，自然扩展成：
+
+    整个 repository 的 token-efficient understanding。
+
+这会比单纯模仿 OpenCode 的 LSP diagnostics，或者模仿 Hermes 的 read_file/write_file，更有 Bitty 自己的辨识度。
+
+对于 Bitty 这种设计来说，**真正把各种底层能力“组装成 Agent / Harness”的那一层，Lua 插件系统会非常合适**。
+
+但我会把边界划得很清楚：
+
+> **Rust 负责能力，Lua 负责组合。**
+
+也就是不要让 Lua 去重新实现 Agent 基础设施，而是让 Lua 决定这些基础设施**如何协作**。
+
+## 可以理解成三层
+
+```text
+┌──────────────────────────────────────┐
+│            Lua Harness               │
+│                                      │
+│ agent loop / workflow / policy       │
+│ context strategy / tool selection    │
+│ hooks / UI / model routing           │
+└──────────────────┬───────────────────┘
+                   │
+            stable Rust API
+                   │
+┌──────────────────▼───────────────────┐
+│          Bitty AI Runtime            │
+│                                      │
+│ LLM / Tools / Context / Session      │
+│ Memory / Artifact / Sandbox / AST    │
+│ Permission / Event / IPC             │
+└──────────────────┬───────────────────┘
+                   │
+┌──────────────────▼───────────────────┐
+│              Rust Core               │
+│ PTY / filesystem / SQLite / network  │
+│ parser / process / renderer / IPC    │
+└──────────────────────────────────────┘
+```
+
+这里 Lua 最有价值的地方，就是最上面这一层。
+
+---
+
+## 例如 Agent 本身完全可以只是 Lua 组装出来的
+
+假设 Rust 已经提供：
+
+```lua
+bitty.ai.chat()
+bitty.tools.shell()
+bitty.tools.read_file()
+bitty.tools.ast_symbols()
+bitty.context.search()
+bitty.context.compact()
+bitty.session.checkpoint()
+bitty.permission.request()
+```
+
+那么一个 Agent 可以只是：
+
+```lua
+local agent = ai.agent {
+    name = "coding",
+
+    model = models.fast(),
+
+    tools = {
+        tools.shell(),
+        tools.read_file(),
+        tools.ast_symbols(),
+        tools.search_code(),
+    },
+
+    context = context.hybrid {
+        recent_messages = 20,
+        use_ast = true,
+        use_fts = true,
+        auto_compact = true,
+    },
+
+    permissions = permissions.default(),
+}
+```
+
+然后：
+
+```lua
+agent:run()
+```
+
+这时候所谓的 Agent，其实已经不是一个复杂的 Rust 类型了。
+
+它更像：
+
+> **一份 Runtime Configuration + Workflow。**
+
+这非常符合 Lua 的强项。
+
+---
+
+# Harness 更适合 Lua
+
+其实相比“Agent”，我觉得 **Harness 才是真正最适合 Lua 的东西**。
+
+因为 Harness 本质上是：
+
+```text
+模型
++
+Prompt
++
+Tool Set
++
+Context Strategy
++
+Agent Loop
++
+Permission Policy
++
+Retry
++
+Hooks
++
+Memory
++
+UI
+```
+
+这些都属于：
+
+> policy / orchestration
+
+而不是底层机制。
+
+Lua 天然适合这种：
+
+```lua
+harness {
+    before_tool = function(ctx, call)
+        ...
+    end,
+
+    after_tool = function(ctx, result)
+        ...
+    end,
+
+    before_model = function(ctx)
+        ...
+    end,
+
+    on_context_overflow = function(ctx)
+        ...
+    end,
+}
+```
+
+这和 Neovim / Nginx / OpenResty / AwesomeWM 一类系统的思想其实很接近：
+
+```text
+C / Rust:
+mechanism
+
+Lua:
+policy
+```
+
+---
+
+# 甚至可以出现完全不同的 Harness
+
+同一个 Bitty AI Runtime，可以装不同 Harness。
+
+例如：
+
+```text
+bitty-ai-core
+      │
+      ├── coding.lua
+      ├── sysadmin.lua
+      ├── research.lua
+      ├── terminal-assistant.lua
+      ├── autonomous.lua
+      └── minimal.lua
+```
+
+比如 Coding Harness：
+
+```lua
+require("bitty.ai").harness {
+    tools = {
+        "ast",
+        "grep",
+        "read",
+        "patch",
+        "test",
+    },
+
+    context = "code-aware",
+
+    output = "compact",
+}
+```
+
+System Admin：
+
+```lua
+harness {
+    tools = {
+        "shell",
+        "systemd",
+        "journal",
+        "network",
+        "process",
+    },
+
+    permissions = "sudo-confirm",
+
+    context = "system-aware",
+}
+```
+
+Research：
+
+```lua
+harness {
+    tools = {
+        "web",
+        "browser",
+        "files",
+        "notes",
+    },
+
+    context = "long-memory",
+}
+```
+
+它们底层甚至完全使用相同的 Rust runtime。
+
+---
+
+# 这会让 Bitty 出现一个非常有意思的架构
+
+现在很多 AI Coding Agent 本质上是：
+
+```text
+App
+└── Agent
+    ├── model
+    ├── tools
+    ├── loop
+    └── UI
+```
+
+这些全部绑死。
+
+而 Bitty 可以做成：
+
+```text
+Bitty
+├── AI Runtime
+│
+├── Harness A
+│   └── Agent
+│
+├── Harness B
+│   └── Agent
+│
+└── Harness C
+    └── Multi-Agent
+```
+
+甚至：
+
+```lua
+workspace:agent("architect")
+workspace:agent("coder")
+workspace:agent("reviewer")
+```
+
+然后 Harness 决定：
+
+```lua
+architect:on("plan_ready", function(plan)
+    coder:send(plan)
+end)
+
+coder:on("finished", function(diff)
+    reviewer:review(diff)
+end)
+```
+
+这时候 Lua 已经变成：
+
+> **Agent orchestration DSL**
+
+了。
+
+---
+
+# Multi-Agent 更需要这种插件层
+
+比如：
+
+```lua
+local team = agents.team {
+    planner,
+    coder,
+    reviewer,
+}
+
+team:workflow {
+    planner >> coder >> reviewer
+}
+```
+
+甚至以后可以：
+
+```lua
+team:on("review.failed", function(result)
+    coder:retry(result.feedback)
+end)
+```
+
+如果这些逻辑全写 Rust：
+
+```rust
+match state {
+    PlannerFinished => ...
+    CodingFinished => ...
+    ReviewFailed => ...
+}
+```
+
+会越来越僵硬。
+
+因为 Agent workflow 本来就是变化非常快的部分。
+
+Lua 改一下即可：
+
+```lua
+if review.score < 0.8 then
+    coder:retry(review.feedback)
+end
+```
+
+这才是插件系统真正的价值。
+
+---
+
+# Context Builder 同样应该可插件化
+
+这点尤其符合你前面那个思路。
+
+Rust 提供 primitives：
+
+```text
+AST parser
+FTS
+SQLite
+embedding
+file reader
+symbol index
+tool history
+summary
+```
+
+Lua：
+
+```lua
+context.builder {
+    budget = 32000,
+
+    sources = {
+        recent_messages(10),
+
+        current_task(),
+
+        ast_symbols {
+            depth = 2,
+        },
+
+        relevant_files {
+            top_k = 8,
+        },
+
+        tool_history {
+            compact = true,
+        },
+
+        memory {
+            top_k = 5,
+        },
+    },
+}
+```
+
+所以：
+
+```text
+Rust:
+怎么查
+
+Lua:
+查什么
+查多少
+什么时候查
+如何组合
+```
+
+这个边界非常漂亮。
+
+---
+
+# Tool 本身也应该分两级
+
+例如底层 primitive：
+
+```text
+shell.exec
+fs.read
+fs.write
+git.diff
+process.list
+ast.symbols
+```
+
+这些 Rust 实现。
+
+Lua 可以组合成高级 Tool：
+
+```lua
+tool("cargo_test", function(ctx)
+    local r = shell.exec("cargo test --message-format=json")
+
+    return {
+        success = r.code == 0,
+        summary = summarize_cargo(r.stdout),
+        artifact = r.stdout,
+    }
+end)
+```
+
+于是 Agent 看到的不是：
+
+```text
+shell(command)
+```
+
+而是：
+
+```text
+cargo_test()
+```
+
+这正好对应你之前想做的：
+
+> 不让 Agent 处理大量原始输出，而是给结构化、高信息密度的结果。
+
+---
+
+# 但有几类东西不要放 Lua
+
+我会明确把这些留在 Rust：
+
+```text
+SQLite persistence
+Session transaction
+Tool isolation
+Sandbox
+Permission enforcement
+PTY
+Process lifecycle
+IPC
+Secret handling
+Filesystem boundary
+Network policy
+Token accounting
+Artifact storage
+Model transport
+```
+
+因为这些属于：
+
+```text
+correctness
+security
+performance
+resource ownership
+```
+
+Lua 可以“配置”：
+
+```lua
+permissions.shell = "confirm"
+```
+
+但是实际权限检查：
+
+```text
+必须 Rust enforce
+```
+
+不能：
+
+```lua
+if lua_says_allowed then
+    run_command()
+```
+
+否则插件就能绕过安全模型。
+
+因此最好是：
+
+```text
+Lua proposes
+Rust enforces
+```
+
+---
+
+# 最终可能形成这样的 API
+
+我觉得 Bitty AI 最后可以非常像：
+
+```lua
+local ai = require("bitty.ai")
+
+return ai.harness {
+    model = ai.models.router {
+        default = "fast",
+        coding = "strong",
+    },
+
+    context = ai.context {
+        budget = 48000,
+
+        sources = {
+            ai.context.task(),
+            ai.context.recent(16),
+            ai.context.ast(),
+            ai.context.memory(),
+            ai.context.tool_results {
+                compact = true,
+            },
+        },
+    },
+
+    tools = {
+        ai.tools.fs,
+        ai.tools.git,
+        ai.tools.shell,
+        ai.tools.ast,
+    },
+
+    memory = ai.memory.sqlite(),
+
+    hooks = {
+        before_tool = require("plugins.permissions"),
+        after_tool = require("plugins.compact-output"),
+    },
+}
+```
+
+这已经非常接近：
+
+```text
+Neovim configuration
++
+Agent Harness
+```
+
+---
+
+## 我甚至建议 Bitty 不要内置一个“唯一正确的 Agent”
+
+Bitty Core 可以只提供：
+
+```text
+AI Runtime
+```
+
+官方再提供一个：
+
+```text
+bitty-ai-default
+```
+
+作为默认 Harness。
+
+用户则可以安装：
+
+```text
+bitty-ai-coding
+bitty-ai-devops
+bitty-ai-research
+bitty-ai-minimal
+```
+
+或者：
+
+```lua
+~/.config/bitty/ai.lua
+```
+
+自己组。
+
+这样就会形成一个非常明显的区别：
+
+```text
+Claude Code
+Codex
+OpenCode
+    ↓
+产品本身就是 Harness
+
+
+Bitty
+    ↓
+提供 Harness Runtime
+    ↓
+Harness 本身也可以是插件
+```
+
+这其实比“在终端里面塞一个 AI Agent”要更有意思。
+
+---
+
+## 最核心的一句话
+
+我会把整个设计归纳成：
+
+```text
+Rust = Agent Kernel
+Lua  = Agent Userspace
+```
+
+甚至这个比喻还挺准确。
+
+Rust 管：
+
+```text
+process
+storage
+security
+IPC
+tools
+context primitives
+```
+
+Lua 管：
+
+```text
+agent
+workflow
+policy
+prompt
+hooks
+context composition
+tool composition
+UI behavior
+```
+
+所以你之前设计的 **Lua 插件系统并不是 Bitty AI 外围的一个附加功能**。
+
+如果继续沿现在这个方向发展，它实际上很可能成为：
+
+> **Bitty AI / Agent Harness 的主要“组装语言”和用户空间。**
+
+而 `ctxctl` 那一套 AST、context、checkpoint、compressed tool output 等能力，则更像是这个 `Agent Kernel` 暴露给 Lua Harness 的 primitives。这样 Bitty、Bitty AI、插件系统和你之前做的 context infrastructure 就真正串起来了。
+对，而且我觉得 `.bitty/` 很自然应该主要属于 **Lua / Harness 用户空间层**，而不是 Rust Core 的内部数据目录。
+
+更准确地说：
+
+> `.bitty/` 应该描述“这个项目希望 Bitty 怎么工作”，而不是保存“Bitty 运行过程中产生了什么”。
+
+这两个最好严格分开。
+
+## 我会这样划分
+
+项目里：
+
+```text
+my-project/
+├── .bitty/
+│   ├── init.lua
+│   ├── agents/
+│   │   ├── coder.lua
+│   │   ├── reviewer.lua
+│   │   └── architect.lua
+│   ├── context/
+│   │   └── coding.lua
+│   ├── tools/
+│   │   └── cargo.lua
+│   ├── prompts/
+│   │   └── review.md
+│   ├── policies/
+│   │   └── permissions.lua
+│   └── plugins.lua
+├── Cargo.toml
+└── src/
+```
+
+这里的 `.bitty/` 基本就是：
+
+```text
+Project-local Bitty Userspace
+```
+
+而实际运行数据放：
+
+```text
+~/.local/share/bitty/
+├── bitty.db
+├── sessions/
+├── artifacts/
+└── cache/
+```
+
+配置则：
+
+```text
+~/.config/bitty/
+├── init.lua
+├── plugins.lua
+└── ai.lua
+```
+
+所以形成三层：
+
+```text
+~/.config/bitty/
+      │
+      │ Global configuration
+      ▼
+   Bitty defaults
+      │
+      ▼
+project/.bitty/
+      │
+      │ Project-specific policy
+      ▼
+ Agent / Harness
+      │
+      ▼
+~/.local/share/bitty/
+      │
+      └── Runtime state / history
+```
+
+这个边界我认为非常重要。
+
+---
+
+## `.bitty/init.lua` 会很自然
+
+例如：
+
+```lua
+return {
+    project = {
+        name = "bitty",
+    },
+
+    ai = {
+        harness = "coding",
+    },
+
+    context = {
+        include = {
+            "src/**",
+            "crates/**",
+            "Cargo.toml",
+        },
+
+        exclude = {
+            "target/**",
+            "node_modules/**",
+        },
+    },
+
+    tools = {
+        cargo = true,
+        git = true,
+        ast = true,
+    },
+}
+```
+
+甚至可以进一步：
+
+```lua
+local bitty = require("bitty")
+
+bitty.project {
+    language = "rust",
+
+    context = bitty.context.rust {
+        workspace = true,
+        ast = true,
+    },
+
+    agents = {
+        require(".bitty.agents.coder"),
+        require(".bitty.agents.reviewer"),
+    },
+}
+```
+
+这时候 `.bitty` 和：
+
+```text
+.nvim/
+.vscode/
+.github/
+.direnv/
+```
+
+有点类似，但它描述的是：
+
+> **这个 repository 的 Bitty 工作环境。**
+
+---
+
+# `.bitty/agents/` 会尤其有价值
+
+比如：
+
+```text
+.bitty/
+└── agents/
+    ├── coder.lua
+    ├── reviewer.lua
+    ├── debugger.lua
+    └── release.lua
+```
+
+`reviewer.lua`：
+
+```lua
+return agent {
+    name = "reviewer",
+
+    model = "strong",
+
+    tools = {
+        "git.diff",
+        "ast.symbols",
+        "fs.read",
+    },
+
+    permissions = {
+        write = false,
+        shell = false,
+    },
+
+    context = {
+        "git_diff",
+        "changed_symbols",
+        "project_rules",
+    },
+}
+```
+
+而 `coder.lua`：
+
+```lua
+return agent {
+    name = "coder",
+
+    tools = {
+        "fs",
+        "git",
+        "shell",
+        "ast",
+    },
+
+    permissions = {
+        write = true,
+        shell = "confirm-dangerous",
+    },
+}
+```
+
+这样不同 Agent 的能力边界可以直接成为 repository configuration。
+
+---
+
+# Harness 甚至也可以项目级
+
+比如：
+
+```text
+.bitty/harness/
+├── default.lua
+├── bugfix.lua
+└── release.lua
+```
+
+运行：
+
+```bash
+bitty ai --harness bugfix
+```
+
+`bugfix.lua`：
+
+```lua
+return harness {
+    agents = {
+        "investigator",
+        "coder",
+        "reviewer",
+    },
+
+    workflow = function(ctx)
+        local diagnosis = ctx.investigator:run()
+        local patch = ctx.coder:run(diagnosis)
+        return ctx.reviewer:run(patch)
+    end,
+}
+```
+
+这就非常强了，因为 repository 不只是保存源码，还保存：
+
+> **AI 应该如何参与这个项目开发。**
+
+---
+
+# 甚至可以把项目知识也放进去
+
+例如：
+
+```text
+.bitty/
+├── init.lua
+├── AGENTS.md
+├── context/
+│   ├── architecture.md
+│   ├── conventions.md
+│   └── release.md
+└── agents/
+```
+
+Lua 定义“怎么加载”，Markdown 保存“给模型看的知识”。
+
+例如：
+
+```lua
+context.add {
+    ".bitty/context/architecture.md",
+    ".bitty/context/conventions.md",
+}
+```
+
+我觉得这比把所有东西强行 Lua 化更好。
+
+因为：
+
+```text
+Configuration / Logic → Lua
+
+Knowledge / Prompt     → Markdown
+
+State / History        → SQLite
+
+Large data             → Filesystem
+```
+
+边界特别清楚。
+
+---
+
+# 但这里有一个非常重要的问题：安全
+
+这是 `.bitty/init.lua` 最大的问题。
+
+假设你：
+
+```bash
+git clone https://github.com/evil/project
+cd project
+bitty
+```
+
+然后 Bitty 自动执行：
+
+```text
+.bitty/init.lua
+```
+
+而 Lua 有：
+
+```lua
+os.execute("curl ...")
+```
+
+那基本等价于：
+
+> `cd` 进入一个陌生仓库就执行任意代码。
+
+这是不能接受的。
+
+所以我强烈建议从最开始就设计：
+
+```text
+Project Trust
+```
+
+第一次进入：
+
+```text
+This repository contains .bitty configuration.
+
+.bitty/init.lua requests:
+  ✓ read project files
+  ✓ AST access
+  ! shell execution
+  ! network access
+
+Trust this project?
+
+[Trust Once]
+[Trust Permanently]
+[Inspect]
+[Ignore]
+```
+
+类似：
+
+* VS Code Workspace Trust
+* direnv `allow`
+* Neovim project-local config 的安全问题
+
+这个很关键。
+
+---
+
+## 最好让 project Lua 默认是 capability sandbox
+
+也就是项目 Lua 并不能：
+
+```lua
+os.execute(...)
+io.open("/etc/passwd")
+require("socket")
+```
+
+而只能：
+
+```lua
+bitty.fs.read(...)
+bitty.tools.register(...)
+bitty.agent(...)
+```
+
+比如：
+
+```text
+Lua VM
+├── math
+├── string
+├── table
+└── bitty API
+
+NOT exposed:
+├── os
+├── io
+├── package.loadlib
+└── raw filesystem
+```
+
+需要能力时：
+
+```lua
+permissions {
+    shell = true,
+    network = false,
+}
+```
+
+最终还是：
+
+```text
+Lua requests capability
+      ↓
+Rust checks trust + policy
+      ↓
+Rust executes
+```
+
+正好还是之前那句话：
+
+> **Lua proposes, Rust enforces.**
+
+---
+
+# 我甚至建议 `.bitty/` 不保存 runtime state
+
+比如不要这样：
+
+```text
+.bitty/
+├── sessions.db
+├── history.jsonl
+├── cache/
+└── embeddings/
+```
+
+否则立刻会出现：
+
+```text
+git status
+
+?? .bitty/cache/...
+?? .bitty/session.db
+```
+
+以及多人协作冲突。
+
+`.bitty/` 最好基本可以：
+
+```bash
+git add .bitty
+```
+
+也就是 **可版本控制、可分享、可审查**。
+
+所以：
+
+```text
+.bitty/
+      ↓
+Declarative / reproducible
+
+~/.local/share/bitty/
+      ↓
+Mutable / machine-local
+```
+
+这是非常好的 invariant。
+
+---
+
+# 可以进一步区分四种 scope
+
+最终 Bitty 很可能需要：
+
+```text
+1. Built-in
+   Bitty 内置默认值
+
+2. User
+   ~/.config/bitty/
+
+3. Project
+   <repo>/.bitty/
+
+4. Session
+   runtime override
+```
+
+优先级：
+
+```text
+Built-in
+   ↓
+User config
+   ↓
+Project config
+   ↓
+CLI / Session override
+```
+
+例如：
+
+```bash
+bitty ai --model gpt-x
+```
+
+最终覆盖：
+
+```lua
+~/.config/bitty/ai.lua
+```
+
+和：
+
+```lua
+.bitty/init.lua
+```
+
+这和很多成熟工具的 configuration layering 很一致。
+
+---
+
+# `.bitty` 甚至可以成为项目的 AI Interface
+
+这是我觉得最值得发展的地方。
+
+以后别人 clone Bitty 本身：
+
+```bash
+git clone bitty-terminal/bitty
+cd bitty
+```
+
+Bitty 读取：
+
+```text
+.bitty/
+```
+
+就知道：
+
+```text
+这是 Rust workspace
+核心 crate 在哪里
+哪些目录不能改
+怎么 build
+怎么 test
+架构文档在哪里
+有哪些推荐 Agent
+review 应该检查什么
+release 怎么执行
+```
+
+相当于 repository 自己声明：
+
+> **“AI 应该怎样理解和操作我。”**
+
+比单独一个：
+
+```text
+AGENTS.md
+```
+
+更进一步。
+
+`AGENTS.md` 是静态知识：
+
+```text
+AI 应该知道什么
+```
+
+`.bitty/` 则可以是：
+
+```text
+AI 应该知道什么
++
+AI 有什么工具
++
+Context 怎么构造
++
+Agent 怎么运行
++
+Workflow 怎么组织
++
+权限是什么
+```
+
+所以如果你继续沿 Bitty 的 Lua 插件系统 + AI Runtime 这条路走，`.bitty/` 确实很可能自然出现，而且它不是普通“配置文件夹”，而更接近：
+
+> **repository-local Agent/Harness environment。**
+
+我会把最核心的边界定成这一句：
+
+```text
+.bitty/               = Project Intent & Policy
+~/.config/bitty/      = User Preferences
+~/.local/share/bitty/ = Runtime State & History
+Rust Core             = Enforcement & Mechanism
+```
+
+这套划分会非常稳。
+
+可以，而且我觉得这几乎是 `.bitty/` 出现之后最自然的扩展之一。
+
+不过建议把 **Skills、MCP、Agent、Harness、Prompt、Policy** 分开，不要全部塞进一个 `plugins/`。
+
+```text
+.bitty/
+├── init.lua
+├── agents/
+│   ├── coder.lua
+│   └── reviewer.lua
+├── harness/
+│   └── default.lua
+├── skills/
+│   ├── rust-review/
+│   │   ├── SKILL.md
+│   │   └── scripts/
+│   └── release-check/
+│       └── SKILL.md
+├── mcp/
+│   ├── github.lua
+│   ├── database.lua
+│   └── local-tools.lua
+├── tools/
+│   └── cargo.lua
+├── prompts/
+├── context/
+└── policies/
+```
+
+## Skills 很适合项目级
+
+因为 Skill 本质上描述的是：
+
+> “在这个项目里，某类任务应该怎么做。”
+
+例如：
+
+```text
+.bitty/skills/rust-review/SKILL.md
+```
+
+可以写：
+
+```markdown
+# Rust Review
+
+检查：
+- unsafe 使用
+- panic 路径
+- blocking I/O
+- Tokio task 生命周期
+- public API compatibility
+
+优先运行：
+- cargo fmt --check
+- cargo clippy
+- cargo test
+```
+
+那么 Agent 在 Bitty 仓库里执行 code review 时，可以自动发现：
+
+```text
+global skills
++
+project/.bitty/skills
+```
+
+项目级 Skill 甚至应该优先于全局 Skill。
+
+这和 `.github/workflows`、`AGENTS.md` 有点类似，但更 Agent-native。
+
+---
+
+## MCP 也可以放，但这里要区分“配置”和“实现”
+
+例如：
+
+```text
+.bitty/mcp/github.lua
+```
+
+最好描述：
+
+```lua
+return {
+    command = "github-mcp-server",
+
+    args = {
+        "--stdio",
+    },
+
+    env = {
+        token = bitty.secret("GITHUB_TOKEN"),
+    },
+
+    permissions = {
+        network = true,
+    },
+}
+```
+
+也就是说：
+
+> `.bitty/mcp/` 保存 MCP server definition，而不是把 secret 或 runtime state 放进去。
+
+尤其不要：
+
+```lua
+env = {
+    token = "ghp_xxxxx"
+}
+```
+
+因为 `.bitty/` 应该默认可提交 Git。
+
+正确做法应该类似：
+
+```text
+Project config
+      ↓
+secret reference
+      ↓
+Bitty secret store / environment
+```
+
+---
+
+# 甚至可以支持项目自带 MCP Server
+
+例如 Bitty 自己仓库里：
+
+```text
+.bitty/
+└── mcp/
+    └── bitty-dev/
+        ├── server.rs
+        ├── Cargo.toml
+        └── mcp.lua
+```
+
+配置：
+
+```lua
+return mcp.server {
+    name = "bitty-dev",
+
+    command = "cargo",
+    args = {
+        "run",
+        "--manifest-path",
+        ".bitty/mcp/bitty-dev/Cargo.toml",
+    },
+}
+```
+
+于是这个 MCP 是：
+
+> repository-specific development tooling
+
+例如暴露：
+
+```text
+bitty_architecture()
+list_crates()
+find_panel_api()
+run_protocol_tests()
+inspect_lua_api()
+```
+
+这种工具非常适合大型项目。
+
+---
+
+# 但我会强调一个重要层级
+
+Bitty 自身已经有 Native Tool API，所以不要所有东西都 MCP 化。
+
+大致可以这样划：
+
+```text
+Native Tool
+├── fs.read
+├── shell
+├── AST
+├── PTY
+├── git
+└── process
+
+Lua Tool
+├── cargo_test
+├── review_diff
+└── inspect_workspace
+
+MCP
+├── GitHub
+├── Jira
+├── database
+├── browser
+└── third-party service
+```
+
+也就是说：
+
+> **本地、性能敏感、核心能力 → Native Tool**
+>
+> **组合逻辑 → Lua Tool**
+>
+> **跨进程 / 外部生态 → MCP**
+
+这样不会把架构绕复杂。
+
+---
+
+## Skill、Tool、MCP 其实是三个完全不同的东西
+
+这个边界值得从一开始就明确。
+
+```text
+Skill
+    ↓
+How to do something
+    ↓
+知识 / Workflow / Guidance
+
+Tool
+    ↓
+Do something
+    ↓
+Capability
+
+MCP
+    ↓
+Expose capabilities across process boundary
+    ↓
+Protocol
+```
+
+例如：
+
+```text
+Skill:
+"如何发布 Bitty"
+
+Tool:
+cargo_publish()
+
+MCP:
+GitHub MCP Server
+```
+
+一个 Skill 可以调用：
+
+```text
+cargo
+git
+GitHub MCP
+```
+
+所以：
+
+```text
+Skill ≠ Tool
+Skill ≠ MCP
+MCP ≠ Agent
+```
+
+最好避免未来把这些概念混成一个 Plugin。
+
+---
+
+# `.bitty/skills` 会特别适合 Git
+
+因为 Skill 往往是：
+
+```text
+Markdown
++
+script
++
+template
+```
+
+例如：
+
+```text
+.bitty/skills/release/
+├── SKILL.md
+├── check.lua
+└── templates/
+    └── release-notes.md
+```
+
+可以直接：
+
+```bash
+git diff .bitty/skills/
+```
+
+团队成员也能 review：
+
+> Agent 的工作方式到底发生了什么变化？
+
+这是非常好的特性。
+
+---
+
+# MCP 则要引入 Trust Model
+
+这点比普通 `.bitty/init.lua` 还重要。
+
+别人仓库如果带：
+
+```text
+.bitty/mcp/evil.lua
+```
+
+然后：
+
+```lua
+command = "./malware"
+```
+
+绝对不能 clone 后自动运行。
+
+Bitty 应该弹：
+
+```text
+Project requests MCP servers:
+
+  bitty-dev
+    command: cargo run ...
+    cwd: .bitty/mcp/bitty-dev
+    network: disabled
+
+  github
+    command: github-mcp-server
+    network: enabled
+    secrets:
+      - GITHUB_TOKEN
+
+Allow?
+
+[Allow once]
+[Trust project]
+[Inspect]
+[Deny]
+```
+
+而且：
+
+```text
+MCP declaration
+      ↓
+Rust permission engine
+      ↓
+process spawn
+```
+
+仍然坚持：
+
+```text
+Lua declares
+Rust enforces
+```
+
+---
+
+# 可以有全局和项目两套
+
+例如：
+
+```text
+~/.config/bitty/
+├── skills/
+│   ├── general-coding/
+│   └── linux-admin/
+└── mcp/
+    ├── github.lua
+    └── filesystem.lua
+```
+
+项目：
+
+```text
+project/.bitty/
+├── skills/
+│   └── bitty-release/
+└── mcp/
+    └── bitty-dev.lua
+```
+
+加载规则可以：
+
+```text
+Built-in
+   ↓
+User
+   ↓
+Project
+```
+
+甚至允许覆盖：
+
+```text
+project skill shadows user skill
+```
+
+但建议显式 namespace：
+
+```text
+builtin:rust
+user:linux-admin
+project:release
+```
+
+这样避免名字冲突。
+
+---
+
+# Harness 就负责组装这些东西
+
+比如：
+
+```lua
+return harness {
+    skills = {
+        "project:rust-review",
+        "project:release",
+    },
+
+    tools = {
+        "fs",
+        "git",
+        "cargo",
+    },
+
+    mcp = {
+        "github",
+        "project:bitty-dev",
+    },
+}
+```
+
+于是整个关系就很清楚：
+
+```text
+                 .bitty/
+                    │
+      ┌─────────────┼─────────────┐
+      │             │             │
+   Skills         Tools          MCP
+      │             │             │
+      └─────────────┼─────────────┘
+                    ▼
+                 Harness
+                    │
+                    ▼
+                  Agent
+```
+
+---
+
+## 最后我甚至会把 `.bitty` 定义成一个 Project Agent Manifest
+
+它不再只是：
+
+```text
+配置目录
+```
+
+而是描述：
+
+```text
+这个项目有哪些 Agent
+有哪些 Skills
+有哪些 Tools
+有哪些 MCP servers
+有哪些 Context Sources
+有哪些 Policies
+如何组成 Harness
+```
+
+也就是：
+
+```text
+.bitty/
+    ↓
+Agent Development Environment
+```
+
+如果 Bitty 以后真的走到这个方向，那么 `.bitty/` 很可能会变成整个项目的 **AI integration layer**，地位有点像：
+
+```text
+.github/
+Cargo.toml
+pyproject.toml
+.devcontainer/
+```
+
+但它描述的是 **“AI / Agent 应该怎样理解、操作和自动化这个 repository”**。
+
+这会比单纯支持 `MCP config` 或 `SKILL.md` 强很多。

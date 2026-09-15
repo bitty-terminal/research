@@ -1,0 +1,1341 @@
+**历史上这些能力并不是没有出现过，而是通常被拆散在不同项目里。** 到 2026 年为止，我没有看到主流 terminal emulator 把下面这一整套东西同时做成核心 abstraction：
+
+> `Terminal Emulator + first-class generic Panel + Plugin UI Runtime + IPC + Workspace + arbitrary application surface`
+
+但已经有几个项目分别走到了其中相当远的位置。**其中 Zellij 是目前最值得 Bitty 认真研究的直接先例，Emacs 则是理念上最接近的先例。**
+
+## 1. Zellij：目前和 Bitty Panel 最像
+
+Zellij 官方对 plugin 的定义非常值得注意：
+
+> plugin 与 terminal pane 一样，是 workspace 的 **first-class citizen**。
+
+插件可以：
+
+* render 自己的 UI
+* 接收 input
+* 响应 Zellij state/event
+* 控制 Zellij
+* 作为普通 pane / floating pane 存在
+* 通过 WASM sandbox 运行
+
+甚至 Zellij 自己的 UI——tab bar、status bar、session manager、file picker 等——很多本身就是 plugin。([Zellij][1])
+
+架构其实已经很像：
+
+```text
+Zellij Workspace
+├── Terminal Pane
+├── Terminal Pane
+├── Plugin Pane
+│   └── File Picker
+├── Plugin Pane
+│   └── Status
+└── Plugin Pane
+    └── Custom UI
+```
+
+而且它支持从 CLI 启动 plugin pane，包括 floating plugin pane，并有 pipe/message 机制。([Zellij][2])
+
+所以严格来说：
+
+> **Zellij 已经证明了“Pane 不一定是 PTY”这个 architecture 是可行的。**
+
+这是 Bitty 非常重要的 prior art。
+
+### 但它和 Bitty 仍然有一个本质区别
+
+Zellij 是：
+
+```text
+Terminal Emulator
+      ↓
+   Zellij
+      ↓
+Terminal / WASM TUI Pane
+```
+
+Bitty 如果自己就是 terminal emulator，则可以变成：
+
+```text
+Bitty
+├── GPU renderer
+├── Terminal Engine
+├── Panel Compositor
+├── Plugin Runtime
+└── UI Runtime
+```
+
+也就是说 Bitty 不受外部 terminal 的 character-cell rendering model 限制。
+
+因此未来可以允许：
+
+```text
+TerminalPanel
+MarkdownPanel
+ImagePanel
+GraphPanel
+FilePanel
+WebViewPanel
+CanvasPanel
+VideoPanel
+CustomPanel
+```
+
+而 Zellij plugin 本质上还是一个 **terminal workspace 中的 TUI UI surface**。
+
+这可能正是两者最大的边界。
+
+---
+
+# 2. kitty：已经相当接近其中一部分
+
+kitty 比很多 terminal emulator 更值得研究，因为它现在的能力其实非常多。
+
+kitty 本身支持：
+
+```text
+OS Window
+└── Tab
+    ├── kitty window
+    ├── kitty window
+    └── kitty window
+```
+
+并有 tiling-style layouts。([Kovid Goyal's Software Projects][3])
+
+它还有三套非常关键的 extension mechanism：
+
+```text
+Kittens
+Remote Control
+Watchers
+```
+
+Custom kitten 本质上是 Python terminal program，可以作为 overlay 运行，获取当前 terminal 内容，然后控制 kitty instance。([Kovid Goyal's Software Projects][4])
+
+它的 remote control 已经非常像我们刚才讨论的 Bitty IPC：
+
+```bash
+kitten @ launch
+kitten @ send-text
+kitten @ focus-window
+kitten @ close-tab
+kitten @ ls
+```
+
+可以通过 socket 控制运行中的 kitty。([Kovid Goyal's Software Projects][5])
+
+所以：
+
+```text
+Bitty IPC
+```
+
+完全可以认真研究：
+
+```text
+kitty remote control
++
+tmux control mode
++
+Hyprland IPC
+```
+
+这几个设计。
+
+---
+
+## 3. 更有意思的是：kitty 现在真的有 `panel`
+
+这个是目前 kitty 比较新的方向。
+
+kitty 0.34 开始支持 Wayland panel，而后不断扩展；官方现在甚至有：
+
+```bash
+kitten panel
+```
+
+可以让任意 terminal program 作为 desktop：
+
+* dock
+* panel
+* overlay
+* background
+
+例如甚至可以：
+
+```bash
+kitten panel --edge=background htop
+```
+
+让 `htop` 成为桌面背景。([Kovid Goyal's Software Projects][6])
+
+kitty 0.43 又加入了 `desktop-ui` kitten，可以利用 XDG Desktop Portal 替换一些桌面组件，例如用 terminal UI 替代 GUI File Open/Save dialog。([Kovid Goyal's Software Projects][7])
+
+所以 kitty 已经开始从：
+
+```text
+terminal emulator
+```
+
+向：
+
+```text
+terminal-powered desktop component
+```
+
+试探了。
+
+这与你现在对 Bitty 的想法有一个很有意思的交集。
+
+### 但注意它的 `panel` 和 Bitty Panel 不是一回事
+
+kitty panel 更接近：
+
+```text
+Wayland Layer Shell surface
+        ↓
+terminal program
+```
+
+即：
+
+```text
+Desktop
+├── kitty panel: cava
+├── kitty panel: btop
+└── kitty panel: status bar
+```
+
+而我们讨论的 Bitty 是：
+
+```text
+Bitty Window
+├── Panel: terminal
+├── Panel: file explorer
+├── Panel: graph
+├── Panel: browser
+└── Panel: AI chat
+```
+
+所以只是名字相同。
+
+**Bitty Panel 更接近 internal compositor node / application surface。**
+
+---
+
+# 4. WezTerm：programmable，但 Pane 仍然主要是 terminal
+
+WezTerm 在 automation / configuration 方面实际上非常强。
+
+它有：
+
+```text
+Lua configuration
+Lua API
+Plugins
+Mux
+Workspace
+Domain
+CLI IPC
+```
+
+例如 `wezterm.mux` 可以操作：
+
+```text
+windows
+tabs
+panes
+workspaces
+domains
+```
+
+([WezTerm][8])
+
+同时：
+
+```bash
+wezterm cli
+```
+
+可以操作正在运行的实例：
+
+```text
+activate-pane
+split-pane
+spawn
+kill-pane
+get-text
+send-text
+zoom-pane
+rename-workspace
+...
+```
+
+并通过 `$WEZTERM_UNIX_SOCKET` 等机制找到运行实例。([WezTerm][9])
+
+Mux 甚至支持：
+
+```text
+local
+Unix socket
+SSH
+TLS
+```
+
+远程 domains。([WezTerm][10])
+
+所以它非常适合作为 Bitty：
+
+> **Workspace + IPC + remote execution architecture**
+
+的参考。
+
+---
+
+## 但是 WezTerm plugin 和 Bitty plugin 的设想差别比较大
+
+WezTerm plugin 官方定义是：
+
+> 一组 Lua 文件，为 core 增加预定义 functionality。
+
+本质上更接近：
+
+```lua
+plugin.apply_to_config(config)
+```
+
+([WezTerm][11])
+
+所以：
+
+```text
+WezTerm Plugin
+      ↓
+extend configuration / behavior
+```
+
+而不是：
+
+```text
+Bitty Plugin
+      ↓
+register Panel type
+      ↓
+create arbitrary UI application
+```
+
+WezTerm 的 pane 也明确属于 multiplexer model：
+
+> mux 管理运行在 panes 中的 programs。([WezTerm][8])
+
+所以你的直觉是对的：
+
+> **WezTerm 很 programmable，但没有把“Plugin Application Panel”作为核心 UI model。**
+
+---
+
+# 5. tmux：不是 UI 参考，而是 IPC / daemon 参考
+
+tmux 更老，但在 Bitty architecture 上非常值得研究。
+
+它的：
+
+```text
+server
+session
+window
+pane
+client
+```
+
+模型已经被验证几十年。
+
+特别是：
+
+```bash
+tmux -C
+tmux -CC
+```
+
+Control Mode。
+
+它本质是：
+
+```text
+Client
+   │
+   │ text protocol
+   ▼
+tmux server
+   │
+   ├── session
+   ├── window
+   └── pane
+```
+
+而且不仅有 command response，还有 asynchronous notification。([GitHub][12])
+
+这几乎就是我们上一条说的：
+
+```text
+Bitty IPC
+
+RPC
++
+Event Stream
+```
+
+的成熟先例。
+
+甚至 iTerm2 就利用 tmux Control Mode，把远程 tmux window/pane 映射成本地 native iTerm2 window/tab/pane。([iTerm2][13])
+
+所以 Bitty IPC 很值得研究这一条演化线：
+
+```text
+tmux control mode
+       ↓
+iTerm2 native integration
+
+kitty remote control
+
+WezTerm CLI / mux socket
+
+Hyprland IPC
+       ↓
+Bitty IPC
+```
+
+---
+
+# 6. iTerm2：已经出现了“终端旁边放应用”的思想
+
+iTerm2 其实也是个很有意思的参考。
+
+当前官方文档已经包含：
+
+```text
+Web Browser
+AI Chat
+Toolbelt
+Python API
+tmux Integration
+Triggers
+Coprocesses
+```
+
+这些已经不完全属于“传统 terminal emulator”。([iTerm2][14])
+
+所以它已经开始出现：
+
+```text
+Terminal
++
+browser
++
+AI
++
+automation
+```
+
+这样的 product direction。
+
+但是这些更多是：
+
+> iTerm2 内置的 feature。
+
+而不是：
+
+```text
+Panel API
+     ↓
+任何第三方插件都可以定义应用
+```
+
+这是非常重要的区别。
+
+---
+
+# 7. Warp：2026 年已经明显走向“终端 IDE”
+
+这个尤其值得注意，因为 Warp 自己现在已经不太把自己仅仅称为 terminal 了。
+
+截至 2026 年 8 月，Warp 官方把自己称为：
+
+> **Agentic Development Environment**
+
+现在已经包括：
+
+* Terminal mode
+* Agent mode
+* File tree
+* Code editor
+* LSP
+* code review
+* third-party CLI agent integration
+
+([Warp][15])
+
+实际上就是：
+
+```text
+Warp
+├── Terminal
+├── Agent Chat
+├── File Tree
+├── Editor
+├── LSP
+└── Code Review
+```
+
+因此你之前说：
+
+> “终端未来是不是可以变成 IDE？”
+
+答案已经可以从市场上得到部分验证：
+
+**Warp 正在这么做。**
+
+---
+
+## 但 Bitty 和 Warp 可以存在很明显的区别
+
+Warp 更像：
+
+```text
+terminal
+      ↓
+developer environment
+      ↓
+built-in features
+```
+
+而 Bitty 如果按照我们讨论的 architecture：
+
+```text
+terminal
+      ↓
+generic application platform
+      ↓
+plugins decide what it becomes
+```
+
+那么：
+
+```text
+Warp = IDE-like terminal product
+
+Bitty = programmable terminal workspace platform
+```
+
+差别非常大。
+
+Bitty 可以：
+
+```text
+bitty-dev
+bitty-cloud
+bitty-minimal
+bitty-ops
+```
+
+而不要求 core 自己成为 IDE。
+
+---
+
+# 8. 真正理念上最像 Bitty 的，可能其实是 Emacs
+
+这个我认为非常值得注意。
+
+如果抛开“terminal emulator”这个身份，Bitty 的长期思想实际上可能更像 **Emacs**，甚至比 Neovim 更像。
+
+Emacs 的核心不是：
+
+> text editor。
+
+它实际上是：
+
+```text
+Emacs Lisp runtime
++
+buffer system
++
+window system
++
+application platform
+```
+
+所以一个 Emacs window 可以显示：
+
+```text
+Buffer
+├── source code
+├── terminal
+├── shell
+├── file manager
+├── web browser
+├── email
+├── debugger
+├── Git
+└── arbitrary application
+```
+
+GNU Emacs 本身就有：
+
+* `term`：terminal emulator
+* `shell` / `eshell`
+* Dired：file manager
+* EWW：web browser
+* Gnus：mail/news
+
+官方文档直接支持这些能力。([GNU][16])
+
+最关键的其实是：
+
+```text
+Emacs Window
+     ↓
+Buffer
+```
+
+window 不关心 buffer 是：
+
+```text
+code
+email
+browser
+terminal
+file manager
+```
+
+这和我们给 Bitty 设计的：
+
+```text
+Bitty Panel
+     ↓
+Panel Content
+```
+
+非常相似。
+
+---
+
+# 9. 所以可以画出一条非常有意思的“思想谱系”
+
+```text
+                    Terminal lineage
+                           │
+          ┌────────────────┼─────────────────┐
+          │                │                 │
+        tmux             kitty            WezTerm
+          │                │                 │
+      server/IPC       remote control     mux/Lua
+          │            kittens/panel      workspace
+          │                │                 │
+          └──────────────┬─┴─────────────────┘
+                         │
+                         ▼
+                       Bitty
+                         │
+              Generic Panel Runtime
+                         │
+              Plugin Application API
+                         │
+        ┌────────────────┼─────────────────┐
+        ▼                ▼                 ▼
+     Terminal          IDE              Desktop
+     workspace      configuration       applications
+```
+
+另一边：
+
+```text
+Emacs
+  │
+Buffer + Window + Lisp
+  │
+  ├── editor
+  ├── terminal
+  ├── mail
+  ├── browser
+  └── file manager
+  │
+  └──────────────────────┐
+                         ▼
+                       Bitty
+                Panel + Plugin + Lua
+```
+
+以及现代产品：
+
+```text
+Warp
+ │
+Terminal → Agentic Development Environment
+ │
+ └───────────────────────┐
+                         ▼
+                       Bitty
+```
+
+---
+
+# 10. 放在一起看区别就非常清楚了
+
+| 项目           | Pane 非 PTY |     Plugin UI | IPC/control | Workspace | 可变成应用平台 |
+| ------------ | ---------: | ------------: | ----------: | --------: | ------: |
+| tmux         |          ❌ |             ❌ |       **✅** |         ✅ |       ❌ |
+| kitty        |       基本 ❌ |       Kittens |       **✅** |        部分 |      部分 |
+| WezTerm      |       基本 ❌ | Lua extension |           ✅ |     **✅** |      部分 |
+| Zellij       |      **✅** |    **✅ WASM** |      ✅/Pipe |     **✅** | **很接近** |
+| iTerm2       |       部分内置 |    Python API |           ✅ |         ✅ |      部分 |
+| Warp         |   **✅ 内置** |         非核心模型 |          内部 |         ✅ |  IDE 导向 |
+| Emacs        |      **✅** |   **✅ Elisp** |      server |     **✅** |   **✅** |
+| **Bitty 设想** |      **✅** |         **✅** |       **✅** |     **✅** |   **✅** |
+
+所以我认为最准确的结论是：
+
+> **Bitty 并不是在发明一个此前完全没人碰过的方向，而是有机会把过去分散在 Zellij、kitty、WezTerm、tmux、Emacs、Warp 中的几个非常成功的思想，统一到 terminal emulator 自己的 application model 中。**
+
+而真正可能形成 Bitty 差异化的，不是“支持 split”“支持插件”“支持 IPC”这些单项能力，而是：
+
+```text
+Panel is a first-class application surface
+```
+
+这一条。
+
+如果 Bitty 从底层就规定：
+
+```rust
+Panel != Pty
+```
+
+而是：
+
+```rust
+enum PanelSurface {
+    Terminal(...),
+    Plugin(...),
+    Native(...),
+    // optional
+    WebView(...),
+}
+```
+
+甚至进一步抽象掉具体实现：
+
+```text
+Panel
+ ├── lifecycle
+ ├── rendering surface
+ ├── input
+ ├── capabilities
+ ├── commands
+ ├── events
+ └── IPC identity
+```
+
+那么以后 **File Explorer、AI Chat、Git、Markdown、监控 Dashboard、邮件、浏览器并不是给 Bitty “硬加进去的 feature”**，而只是 Panel API 的不同消费者。
+
+我觉得这才是 Bitty 与 kitty / WezTerm 拉开架构差异最关键的一刀。而在真正设计这部分 RFC 时，**Zellij Plugin API + tmux Control Mode + kitty Remote Control + Emacs Buffer/Window model** 这四个应该直接作为重点 references。
+
+[1]: https://zellij.dev/documentation/plugins.html?utm_source=chatgpt.com "Plugins - Zellij User Guide"
+[2]: https://zellij.dev/documentation/zellij-plugin-and-pipe.html?utm_source=chatgpt.com "Zellij Plugin & Pipe - Zellij User Guide"
+[3]: https://sw.kovidgoyal.net/kitty/overview/?utm_source=chatgpt.com "Overview - kitty"
+[4]: https://sw.kovidgoyal.net/kitty//kittens/custom/?utm_source=chatgpt.com "Custom kittens - kitty"
+[5]: https://sw.kovidgoyal.net/kitty/remote-control/?utm_source=chatgpt.com "Control kitty from scripts - kitty"
+[6]: https://sw.kovidgoyal.net/kitty/kittens/panel/?highlight=panel&utm_source=chatgpt.com "Draw a GPU accelerated dock panel on your desktop - kitty"
+[7]: https://sw.kovidgoyal.net/kitty/kittens/desktop-ui/?utm_source=chatgpt.com "Using terminal programs to provide Linux desktop components - kitty"
+[8]: https://wezterm.org/config/lua/wezterm.mux/index.html?utm_source=chatgpt.com "module: wezterm.mux - Wez's Terminal Emulator"
+[9]: https://wezterm.org/cli/cli/index.html?utm_source=chatgpt.com "wezterm cli - Wez's Terminal Emulator"
+[10]: https://wezterm.org/multiplexing.html?utm_source=chatgpt.com "Multiplexing - Wez's Terminal Emulator"
+[11]: https://wezterm.org/config/plugins.html?utm_source=chatgpt.com "Plugins - Wez's Terminal Emulator"
+[12]: https://github.com/tmux/tmux/wiki/Control-Mode?utm_source=chatgpt.com "Control Mode · tmux/tmux Wiki · GitHub"
+[13]: https://iterm2.com/3.3/documentation-tmux-integration.html?utm_source=chatgpt.com "tmux Integration - Documentation - iTerm2 - macOS Terminal Replacement"
+[14]: https://iterm2.com/documentation.html?utm_source=chatgpt.com "Documentation - iTerm2 - macOS Terminal Replacement"
+[15]: https://docs.warp.dev/?utm_source=chatgpt.com "Getting started with Warp | Warp"
+[16]: https://www.gnu.org/software/emacs/manual/html_node/emacs/Shell.html?utm_source=chatgpt.com "Shell (GNU Emacs Manual)"
+
+
+我觉得这可能正是 **Bitty 最有吸引力的长期形态之一**：
+
+> **默认很小，但上限非常高。**
+
+它不一定真的变成一个“操作系统”，但完全可以逐渐呈现出一种 **OS-like workspace / programmable environment** 的感觉。
+
+## 1. 最理想的状态：Minimal Core + 无限扩展
+
+Bitty core 可以始终保持：
+
+```text
+Bitty Core
+├── Terminal
+├── Panel
+├── Workspace
+├── Layout
+├── Input
+├── Command
+├── Event
+├── IPC
+└── Plugin Runtime
+```
+
+默认启动可能就是：
+
+```text
+┌──────────────────────┐
+│ $                    │
+│                      │
+│                      │
+└──────────────────────┘
+```
+
+甚至比很多现代 IDE 简单得多。
+
+但用户愿意折腾的话：
+
+```text
+Bitty
+├── File Explorer
+├── Git
+├── Editor
+├── LSP
+├── AI
+├── SSH
+├── Docker
+├── Kubernetes
+├── Email
+├── Telegram
+├── Browser
+├── RSS
+├── Music
+├── System Monitor
+└── ...
+```
+
+就可以逐渐长成自己的工作环境。
+
+这就是 Emacs 非常成功的一种哲学：
+
+> **核心不是提供所有功能，而是提供足够强的 primitives。**
+
+---
+
+## 2. “像操作系统”主要不是因为功能多
+
+这一点很重要。
+
+Bitty 真正出现 OS-like 感觉，并不是因为：
+
+```text
+能看邮件
+能浏览网页
+能管理文件
+```
+
+而是因为它开始拥有：
+
+```text
+Application lifecycle
+Window/Panel management
+IPC
+Permission / Capability
+Process management
+Notifications
+Clipboard
+Filesystem access
+Network access
+Session management
+Workspace management
+```
+
+这时候架构开始很像：
+
+```text
+Operating System
+├── process
+├── window
+├── IPC
+├── permissions
+└── services
+```
+
+Bitty 则是：
+
+```text
+Bitty Environment
+├── plugin/application
+├── panel
+├── IPC
+├── capability
+└── services
+```
+
+所以它是一种：
+
+> **user-space micro environment**
+
+而不是传统意义上的 OS。
+
+---
+
+## 3. 很像 Emacs，但 Bitty 可以更现代
+
+Emacs 大致是：
+
+```text
+Emacs
+├── Lisp Runtime
+├── Buffer
+├── Window
+├── Frame
+├── Command
+└── Packages
+```
+
+Bitty 可以对应成：
+
+```text
+Bitty
+├── Plugin Runtime
+├── Panel
+├── Workspace
+├── Window
+├── Command
+└── Packages
+```
+
+映射非常自然：
+
+| Emacs         | Bitty         |
+| ------------- | ------------- |
+| Buffer        | Panel content |
+| Window        | Panel         |
+| Frame         | OS Window     |
+| major mode    | Panel type    |
+| minor mode    | Extension     |
+| Elisp package | Bitty plugin  |
+| command       | command       |
+| keymap        | keymap        |
+| hook          | event         |
+| daemon/server | IPC daemon    |
+
+所以 Bitty 很可能会出现类似：
+
+```text
+Emacs Lisp ecosystem
+```
+
+对应的：
+
+```text
+Bitty plugin ecosystem
+```
+
+---
+
+# 4. 一个用户可以把 Bitty 用成纯终端
+
+比如有人完全不想折腾：
+
+```toml
+[bitty]
+plugins = []
+```
+
+得到：
+
+```text
+Bitty
+└── Terminal
+```
+
+它仍然应该是一个优秀的 terminal emulator。
+
+这一点非常重要：
+
+> **扩展能力不能成为基础使用的负担。**
+
+比如：
+
+* 不装 WebView 就不要 WebView runtime
+* 不用 AI 就不要 AI dependency
+* 不用 Git panel 就不要加载
+* 不用 plugin 就尽量没有额外 overhead
+
+这其实是 Bitty 很适合坚持的原则：
+
+```text
+pay only for what you use
+```
+
+这和 Rust / Unix 的工程哲学也很契合。
+
+---
+
+# 5. 另一个用户可以把 Bitty 配成 IDE
+
+例如：
+
+```text
+┌───────────┬──────────────────────────┐
+│ Files     │ Vim / Editor             │
+│           │                          │
+├───────────┼──────────────────────────┤
+│ Git       │ AI                       │
+│           │                          │
+├───────────┴──────────────────────────┤
+│ Terminal                             │
+└──────────────────────────────────────┘
+```
+
+甚至一个配置：
+
+```text
+bitty-dev
+```
+
+就变成完整开发环境。
+
+这里最漂亮的是：
+
+> IDE 是 configuration，而不是 product identity。
+
+这是和 VS Code / JetBrains 非常不同的。
+
+---
+
+# 6. 还可以配置成 DevOps Console
+
+例如：
+
+```text
+┌───────────┬──────────────────────────┐
+│ SSH       │ Kubernetes               │
+├───────────┼──────────────────────────┤
+│ Logs      │ Grafana                  │
+├───────────┴──────────────────────────┤
+│ Terminal                             │
+└──────────────────────────────────────┘
+```
+
+Bitty 就成了：
+
+> Operations Workspace
+
+---
+
+# 7. 甚至可以变成个人信息环境
+
+例如：
+
+```text
+┌────────────┬─────────────────────────┐
+│ RSS        │ Browser                 │
+├────────────┼─────────────────────────┤
+│ Telegram   │ Email                   │
+├────────────┴─────────────────────────┤
+│ Notes / Terminal                     │
+└──────────────────────────────────────┘
+```
+
+这就已经很接近：
+
+```text
+Emacs
+```
+
+或者历史上的：
+
+```text
+Smalltalk environment
+```
+
+这种“整个计算环境都可以编程”的感觉。
+
+---
+
+# 8. 最有意思的是配置本身可能成为一种文化
+
+以后可能有人分享：
+
+```text
+~/.config/bitty/
+```
+
+就像现在分享：
+
+```text
+dotfiles
+nvim config
+hyprland config
+tmux config
+```
+
+一样。
+
+例如：
+
+```text
+github.com/alice/dotfiles
+└── bitty/
+    ├── init.lua
+    ├── keymaps.lua
+    ├── layouts.lua
+    ├── plugins.lua
+    └── themes.lua
+```
+
+然后 Reddit / GitHub 上出现：
+
+```text
+Show me your Bitty setup
+```
+
+这种东西。
+
+这对于一个高度 customizable 的工具来说其实非常重要，因为它说明：
+
+> 用户不是“使用 Bitty”，而是在“构建自己的 Bitty”。
+
+这就是 Emacs、Neovim、Hyprland 很有魅力的地方。
+
+---
+
+# 9. Bitty 甚至可以有 distribution
+
+这一步也很自然。
+
+例如：
+
+```text
+Bitty
+```
+
+保持极简。
+
+社区再做：
+
+```text
+LazyBitty
+AstroBitty
+BittyCraft
+BittyDev
+```
+
+类似：
+
+```text
+Neovim
+├── LazyVim
+├── AstroNvim
+├── NvChad
+└── LunarVim
+```
+
+Bitty core 不需要承担：
+
+> “默认把所有东西都做完。”
+
+社区自己组合：
+
+```text
+plugins
++ keymaps
++ layouts
++ themes
++ defaults
+```
+
+就可以形成 distribution。
+
+我觉得这种生态形态其实非常适合 Bitty。
+
+---
+
+# 10. 甚至 Plugin 可以做 Plugin
+
+再往后会出现：
+
+```text
+plugin
+├── panel
+├── commands
+├── services
+└── extension points
+```
+
+然后其他插件扩展它：
+
+```text
+Bitty
+  ↓
+Git Plugin
+  ↓
+GitHub Plugin
+  ↓
+AI Review Plugin
+```
+
+或者：
+
+```text
+Editor
+ ├── LSP
+ ├── Treesitter
+ ├── Formatter
+ └── Debugger
+```
+
+这样插件生态就不再是 flat：
+
+```text
+Bitty
+├── plugin A
+├── plugin B
+└── plugin C
+```
+
+而会形成：
+
+```text
+Bitty
+  ↓
+platform plugin
+  ↓
+extension
+  ↓
+extension
+```
+
+这才是真正成熟的 ecosystem。
+
+---
+
+# 11. 但有一条边界最好始终坚持
+
+即：
+
+> **Bitty 不应该试图自己成为完整 Desktop Environment。**
+
+不要走成：
+
+```text
+Bitty Core
+├── Mail
+├── Browser
+├── Git
+├── AI
+├── Docker
+├── Kubernetes
+├── File Manager
+├── Music
+├── ...
+└── 💀
+```
+
+最终 core 巨大无比。
+
+而应该始终：
+
+```text
+Bitty Core
+     │
+     ▼
+Generic primitives
+     │
+     ▼
+Plugin ecosystem
+```
+
+也就是：
+
+> **Bitty should provide mechanisms, not applications.**
+
+Core 提供：
+
+```text
+Panel
+IPC
+Command
+Event
+Capability
+Layout
+Rendering
+Input
+```
+
+至于：
+
+```text
+Telegram
+GitHub
+Docker
+Browser
+Email
+```
+
+都是 ecosystem。
+
+---
+
+# 12. 所以 Bitty 很适合形成一种“两极化”的使用体验
+
+这可能反而是它最漂亮的特点：
+
+```text
+            Bitty Core
+                │
+       ┌────────┴────────┐
+       ▼                 ▼
+Minimalists           Hackers
+   │                     │
+Terminal            50 plugins
+only                custom panels
+   │                custom IPC
+   │                Lua scripts
+   │                workflows
+   ▼                     ▼
+~5 MB               Personal OS-like
+terminal            environment
+```
+
+一个人可以说：
+
+> “我只需要一个快速漂亮的 terminal。”
+
+另一个人可以说：
+
+> “Bitty 是我整个开发环境。”
+
+两个人用的仍然是同一个 Bitty。
+
+---
+
+## 我觉得这其实可以成为 Bitty 非常核心的设计哲学
+
+可以概括成一句非常适合项目的原则：
+
+> **Small by default, limitless by design.**
+
+中文就是：
+
+> **默认极简，设计上无限扩展。**
+
+如果以后 Bitty 的架构真的围绕：
+
+```text
+Panel
+Plugin
+IPC
+Command
+Event
+Capability
+Workspace
+```
+
+稳定下来，那么它的长期发展路线确实很可能越来越像 **“现代版本的 Emacs，但以 terminal / workspace 为中心”**。
+
+而且它与 Emacs 最大的时代差异也会很明显：Emacs 建立于 editor-centric 世界，而 Bitty 可以建立在 **terminal + GPU UI + IPC + plugin sandbox + AI Agent + remote workspace** 这一代基础设施上。

@@ -1,0 +1,47 @@
+再说编辑部分，我觉得也是可以一次编辑多个文件，就是调用这种我们写好的工具，就跟读取那样应该可以同时写入更多文件，为什么我会这么考虑呢，是因为读和写在现在的 Agent 好像主要都是通过调用多次工具来实现的，每次调用都算一次 LLM API 调用，那么多次后就会算更多的成本，而且可能会出现缓存命中失败，以下是结论：
+结论先说：读写多个文件在 Hermes 里不必然是多次 API 请求——「工具调用次数」和「模型 API 往返次数」是两个不同层级。我顺手用本机 state.db 做了实测，下面有真实数据。
+
+一、机制：一次 request 可以带多个 tool_calls
+
+Hermes 的 agent loop（见 docs/developer-guide/agent-loop）：
+  - 一次 assistant 消息里可以并列产出多个 tool_calls（parallel tool calling）；
+  - 单 tool call 直接在主线程执行，多个 tool call 走 ThreadPoolExecutor 并发执行，结果按原顺序回插历史；
+  - 消息序列是 Assistant(with tool_calls) → Tool → Tool → ... → Assistant，只有 tool role 允许连续多条；
+  - 然后才发起下一次 API 调用，把 N 个工具结果一起喂回。
+
+所以：一次 request 返回 N 个 tool call，N 个结果只需 1 次后续 request 消化。
+
+二、本机实测（~/.hermes/state.db）
+
+  全库统计：含工具调用的 assistant 消息 22,368 条，承载工具调用 29,925 次；
+  其中 4,420 条（19.8%）是并行批次，单条消息里最多的并行数量达 30 个 read_file；
+  相比逐个调用，省下 7,557 次 API 往返（若不批量需 29,925 次，实际 22,368 次）。
+
+  本次会话就是活例：第一条 assistant 消息同时发了 web_search + terminal → 回两条 tool 结果 → 才进入下一次 request。
+
+  另外注意：某个早期 session（653 条 assistant 消息）全部是单 tool call —— 说明并行不是必然，取决于模型和 provider 是否稳定输出 multi tool_calls。
+
+三、什么时候「必须」多次往返
+
+  - 数据依赖：B 的路径/内容来自 A 的结果 → 只能串行（先 1 次往返拿 A，再 1 次拿 B）。
+  - 模型/protocol 限制：chat_completions / anthropic_messages / codex_responses 三种 API mode 的并行支持与解析方式不同；部分模型压根不吐并行 tool_calls。
+  - Hermes 会把交互型工具（如 clarify）强制串行。
+  - 并行批次后仍需一次 request 看结果，所以「N 个文件」最少是 2 次往返，不是 1 次。
+
+四、成本视角
+
+每次往返都要重发整个 conversation，input token 累积（有 prompt caching 会缓解），因此减少往返对 latency 和花费都有意义。
+
+五、四种「批量」手段，按场景选
+
+  1) 同一 turn 并列多个 read_file / write_file / patch —— 省往返，但结果仍全部进 context（token 不省）。
+  2) execute_code —— 写 Python 在循环里调 read_file/write_file/search_files（RPC 暴露 7 个工具），1 次往返处理 N 个文件，且只有 stdout 回上下文，token 也省。官方建议「3+ 调用且中间有逻辑」时优先用它；我上面那几条统计就是这么跑的（4 次 execute_code 扫完整库）。
+  3) patch mode='patch'（V4A 多文件补丁）—— 一次工具调用改多个文件。
+  4) delegate_task —— 把海量文件读写丢给 subagent（独立 conversation），父上下文只收最终摘要；但子 agent 内部的 tool call 是它自己的 API 调用，总账上并不消失。
+
+经验法则：独立无依赖 → 同 turn 并列；有依赖 → 串行；机械化 N 文件循环 → execute_code；需要判断和探索 → 直接调用工具或 delegate。
+
+参考：https://hermes-agent.nousresearch.com/docs/developer-guide/agent-loop （Sequential vs Concurrent 一节）、/docs/guides/delegation-patterns （execute_code vs delegation 对比表）。
+
+
+那么我之后设计肯定是会考虑这些的，那么如何实现这些呢？我就想到了 opencode 是支持 lsp 和 lint 的，而且 neovim 就是通过 mason 来进行管理这些的，那么我想的就是我们只需要把相关的接口实现好，然后只要用户安装和配置自己的 lsp, lint 是不是就好了呢？而且 lsp 和 lint 我觉得不止是能实现以上我说的这些，应该还可以辅助代码检查和格式化等等功能以及找相关的代码？之后bitty-ai原生应该需要设计很多更好用的东西

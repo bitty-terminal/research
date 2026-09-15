@@ -1,0 +1,1225 @@
+盘点下各个终端模拟器的特点，比如 kitty, konsole, ghostty, alacritty, iterm2, windows terminal, wezterm, foot, GNOME terminal, warp 等等，一些小众或者新出的，比如 kafu, ratty, horizon, tabby, hyper, waveterm 等等，以及我正在开发的 bitty。
+我看 waveterm 是不是可以直接渲染浏览器网页，这个可以研究下
+
+先给结论：现在的终端模拟器已经明显分成了几条路线
+
+如果把 2026 年的终端生态放在一张图上，我觉得可以分成五类：
+路线	代表	核心目标
+极简高速 Terminal	Alacritty、foot	把 VT/PTY、输入、字体、渲染做好，其余交给 tmux/shell
+现代原生 Terminal	Ghostty、Konsole、Windows Terminal、GNOME Terminal	强调桌面集成、开箱即用
+Programmable Terminal	kitty、WezTerm、iTerm2	Terminal + scripting + automation + mux
+Terminal Workspace	Horizon、WaveTerm、Tabby、Hyper	Terminal 只是工作区里的一种 UI
+Agentic Environment	Warp、Kaku，以及部分 WaveTerm	终端逐渐成为 AI Agent 的调度/观察界面
+
+而 Bitty 现在真正有潜力进入的是第四类，并进一步变成一种不同于 WaveTerm/Warp 的 programmable application shell：Terminal Panel 只是其中一种 Panel，而不是整个程序的本体。
+一、先盘点你提到的这些终端
+1. Alacritty：把“少做事情”做到极致
+
+Alacritty 的哲学一直很清楚：
+
+    高性能终端模拟器，不重新实现窗口管理器、multiplexer、插件平台。
+
+它目前主要提供 GPU rendering、Vi Mode、Search、Regex Hints、Multi-Window，而 tabs/splits 这种事情仍倾向交给 tmux/Zellij/WM。官方也明确说，它通过和其他程序组合，而不是把其他程序的能力重新做一遍。
+
+所以它的价值不是“功能丰富”，而是：
+
+Terminal Emulator 本身应该有多薄？
+
+这恰好是 Bitty 应该保留的一个参照物：
+
+bitty-core
+    PTY
+    VT
+    scrollback
+    input
+    renderer
+
+即使上面长出了很多 Panel，也不要让 Terminal Core 本身变成一个巨型 framework。
+2. foot：Wayland 原教旨主义式终端
+
+foot 很有 Linux/Wayland 风格：
+
+    Wayland native
+
+    很轻
+
+    Server/daemon mode
+
+    Sixel
+
+    IME text-input-v3
+
+    URL keyboard mode
+
+    shell integration
+
+    多窗口共享 font/glyph cache
+
+尤其值得注意的是：
+
+foot --server
+       │
+       ├── footclient
+       ├── footclient
+       └── footclient
+
+server 统一管理 Wayland、VT parsing 和渲染，多个窗口共享字体缓存，因此启动更快、内存更低。
+
+这对 Bitty 的启发主要不是 UI，而是：
+
+长期驻留的 core/service + 很薄的 frontend/client。
+3. Ghostty：现代“原生终端”的代表
+
+Ghostty 的方向和 Alacritty 不一样。
+
+它既追求性能，又非常重视 platform-native UI：
+
+    macOS：Swift + AppKit/SwiftUI
+
+    Linux：GTK4
+
+    核心：Zig libghostty
+
+    macOS Metal
+
+    Linux OpenGL
+
+    native tabs / splits
+
+    Kitty Graphics Protocol
+
+    platform integration
+
+    AppleScript automation
+
+它最大的设计价值其实是：
+
+    terminal core 与 platform shell 分离。
+
+               ┌─ macOS AppKit/SwiftUI
+libghostty ────┤
+               └─ Linux GTK4
+
+Bitty 未来如果支持多个 UI backend，这个思路非常值得参考。
+
+但 Ghostty 目前本质仍然是：
+
+    非常好的 Terminal Application
+
+而不是通用 Application Workspace。
+4. GNOME Terminal：传统 desktop terminal 的标准答案
+
+GNOME Terminal 是最典型的：
+
+GTK
+ │
+VTE
+ │
+PTY
+
+它主要解决：
+
+    tabs
+
+    profiles
+
+    fonts/colors
+
+    command/shell profile
+
+    shell/SSH profile
+
+    desktop integration
+
+它代表的是一个非常重要的 baseline：
+
+    普通用户到底期待一个 Terminal 最基本有什么？
+
+Bitty 无论扩展多远，Terminal Panel 的基本体验至少不能输给这一类成熟 terminal。
+5. Konsole：传统桌面 Terminal 中功能非常完整的一类
+
+Konsole 相比 GNOME Terminal 更偏 power user：
+
+    split view
+
+    tabs
+
+    detachable views
+
+    profiles
+
+    search
+
+    saved tab layouts
+
+    KDE integration
+
+甚至已经可以：
+
+Save Tab Layout
+Load Tab Layout
+
+它其实已经带一点“workspace”的雏形。
+
+但它的抽象仍然是：
+
+Window
+ └── Tab
+      └── Terminal View
+
+而不是：
+
+Workspace
+ └── Panel
+      ├── Terminal
+      ├── Browser
+      ├── File
+      └── ...
+
+6. Windows Terminal：非常优秀的“Shell Host”
+
+Windows Terminal 的重点是：
+
+    PowerShell / CMD / WSL / SSH profile
+
+    tabs
+
+    panes
+
+    GPU text rendering
+
+    Unicode
+
+    profiles
+
+    JSON/configuration
+
+    custom actions
+
+    tab tear-out
+
+它其实非常清楚地把自己定位成：
+
+    host applications for command-line shells
+
+而没有试图变成 IDE。
+
+这是微软式的“系统组件”设计，API surface 相对保守。
+7. kitty：最值得 Bitty 仔细研究的项目之一
+
+kitty 的特点并不仅仅是“快”。
+
+真正重要的是它已经同时拥有：
+Terminal protocol
+
+Kitty Graphics Protocol 已经影响到了大量其他终端，包括 Ghostty、WezTerm。
+Window/layout system
+
+OS Window
+ └── Tab
+      ├── kitty window
+      ├── kitty window
+      └── kitty window
+
+支持：
+
+    Tall
+
+    Fat
+
+    Grid
+
+    Horizontal
+
+    Vertical
+
+    Stack
+
+    arbitrary splits
+
+Kittens
+
+kitty 可以通过 Python 扩展：
+
+    image viewer
+
+    diff
+
+    file picker
+
+    SSH
+
+    remote file editing
+
+    themes
+
+    clipboard
+
+    broadcast
+
+    command palette
+
+    quick terminal
+
+Remote Control
+
+更重要的是：
+
+kitten @ launch
+kitten @ set-colors
+kitten @ set-enabled-layouts
+...
+
+外部程序可以操控 window/tab/layout/session。
+
+这其实已经非常接近 Bitty 的 IPC 思路。
+
+区别在于：
+
+    kitty 的可编程对象仍然主要是 terminal window。
+
+而 Bitty 可以把对象提升成：
+
+Panel
+ ├── TerminalPanel
+ ├── BrowserPanel
+ ├── FilePanel
+ ├── MarkdownPanel
+ └── AgentPanel
+
+这会产生非常大的结构差异。
+8. WezTerm：现阶段最成熟的 Programmable Terminal 之一
+
+WezTerm 有几个非常关键的特点。
+Lua runtime
+
+几乎整个用户行为都可以通过 Lua 配置和事件系统控制。
+内置 Multiplexer
+
+WezTerm 自己有：
+
+Mux
+ ├── Domain
+ │    ├── Window
+ │    │    ├── Tab
+ │    │    │    └── Pane
+
+甚至 GUI 可以和 mux 分离。
+
+支持：
+
+    local domain
+
+    SSH domain
+
+    Unix domain
+
+    TLS remote mux
+
+    WSL
+
+    serial
+
+    remote persistence
+
+它现在甚至已经有 wezterm.plugin。Lua API 可以访问 Mux、Pane、Window、Workspace 等大量内部对象。
+
+所以如果说：
+
+    kitty 给 Bitty 最大的参考是 Remote Control / scripting
+
+那么：
+
+    WezTerm 给 Bitty最大的参考就是 Lua + Object Model + Mux。
+
+Bitty 的 Lua Runtime RFC 值得重点对照 WezTerm，而不仅仅是 Neovim。
+9. iTerm2：老牌终端实际上比想象中激进得多
+
+iTerm2 非常值得重新研究。
+
+它有：
+
+    Shell Integration
+
+    Marks
+
+    Command boundaries
+
+    current directory tracking
+
+    hostname tracking
+
+    triggers
+
+    automatic profiles
+
+    session restoration
+
+    Python API
+
+    tmux control mode
+
+    image protocol
+
+    AI Chat
+
+这里有一个特别重要的变化：
+iTerm2 现在也能直接浏览网页了
+
+iTerm2 3.6 引入了 Web Browser Profile：
+
+Window
+ └── Tab
+      ├── Terminal Session
+      ├── Web Browser Session
+      └── Terminal Session
+
+Browser 基于 WKWebView，可以直接作为 split pane 存在，还支持：
+
+    Back/Forward
+
+    Reader Mode
+
+    ad blocking
+
+    password manager
+
+    bookmarks
+
+    selection
+
+    AI 对当前网页提问
+
+    browser session + terminal session 同一套 workspace
+
+所以 WaveTerm 已经不是唯一能“终端里直接打开真正网页”的项目了。
+
+这是一个相当重要的趋势。
+10. Hyper：Web 技术做 Terminal 的经典案例
+
+Hyper 的核心思想非常直接：
+
+    Terminal built on web technologies
+
+它基于：
+
+    Electron
+
+    xterm.js
+
+    React/JS ecosystem
+
+    npm plugins
+
+插件甚至可以直接访问 Electron API。
+
+它最大的贡献其实是证明了：
+
+    Terminal UI 可以变成一个 Web Application Plugin Host。
+
+但 Hyper 同时也暴露了这条路线的问题：
+
+    Electron footprint
+
+    JS plugin compatibility
+
+    API breakage
+
+    插件可以触碰非常深的内部实现
+
+    security surface 大
+
+Hyper 从 hterm 切到 xterm.js 时，很多直接修改 DOM 的插件就失效了。
+
+所以它对于 Bitty 更像是一个：
+
+“插件 API 不应该怎么设计”的案例库。
+11. Tabby：Hyper 思路的更实用版本
+
+Tabby 现在其实功能非常多：
+
+    Electron
+
+    Angular
+
+    xterm
+
+    SSH client
+
+    SFTP
+
+    Serial
+
+    Telnet
+
+    nested splits
+
+    Quake mode
+
+    secret storage
+
+    plugin manager
+
+    workspace plugins
+
+插件甚至包括：
+
+    Docker
+
+    workspace manager
+
+    save output
+
+    SSH tools
+
+    MCP server
+
+Tabby 和 Hyper 最大区别是：
+
+    Hyper 更像可 Hack 的 Web Terminal；
+
+    Tabby 更像 GUI Remote/Terminal Workbench。
+
+对于 Bitty 的 connections / plugin manager 很值得参考。
+12. 你写的 kafu，我认为应该是 Kaku
+
+我没有找到一个对应的活跃 Kafu terminal 项目；应该是你想说：
+
+tw93/Kaku。
+
+Kaku 是目前很新的项目，而且实际上是一个 深度定制的 WezTerm fork：
+
+    macOS only
+
+    Rust
+
+    保持 WezTerm Lua compatibility
+
+    优化默认配置
+
+    内置 shell tool suite
+
+    AI assistant
+
+    Claude Code / Codex / Gemini CLI 等 AI tool configuration
+
+    natural-language → command
+
+    failed command auto-fix
+
+所以 Kaku 的创新不主要在 terminal engine，而在：
+
+    “WezTerm 很强，但是让用户自己配太累，那我给一套极佳默认工作流。”
+
+这其实是非常有价值的思路。
+
+Bitty 即使高度可配置，也应该有：
+
+Zero-config good defaults
++
+Power-user programmable layer
+
+而不是装上之后先让用户写 400 行 Lua。
+13. Ratty：技术实验型终端
+
+Ratty 很有意思：
+
+    Rust
+
+    Ratatui
+
+    wgpu/Bevy
+
+    GPU text
+
+    Kitty Graphics Protocol
+
+    inline 3D object
+
+    甚至有 3D terminal mode
+
+它不是 Bitty 产品设计上的主要对手，但证明了一件事：
+
+    Terminal viewport 并不一定只能是 text grid。
+
+这和 Bitty 的 Rich UI / Panel 方向其实有哲学上的联系。
+14. Horizon：目前和 Bitty 的 Panel 思路非常接近
+
+Horizon 是近期非常值得注意的一个。
+
+它不是：
+
+Tabs
+  └── splits
+
+而是：
+
+Infinite Canvas
+ ├── Terminal Panel
+ ├── Terminal Panel
+ ├── Terminal Panel
+ └── ...
+
+用户可以：
+
+    pan
+
+    zoom
+
+    arbitrary position
+
+    resize
+
+    workspace grouping
+
+    minimap
+
+    grid/rows/columns auto-layout
+
+架构也非常清晰：
+
+Rust
+eframe / egui
+wgpu
+alacritty_terminal
+SQLite
+
+每个 Panel 有自己的 PTY/event thread。
+
+现在它甚至已经加入：
+
+    Claude Code
+
+    Codex
+
+    OpenCode
+
+    Gemini CLI
+
+    token dashboard
+
+    Git panel
+
+    Markdown editor
+
+    SSH host UI
+
+    session persistence
+
+Horizon 和 Bitty 的区别会很有意思：
+Horizon
+
+Panel ≈ Terminal Session
+Canvas ≈ layout
+
+Bitty 的方向
+
+Panel = generic application surface
+
+Panel
+├── Terminal
+├── File
+├── Browser
+├── Agent
+├── Markdown
+├── System Monitor
+└── third-party plugin
+
+因此 Horizon 更像：
+
+    Terminal Canvas
+
+而 Bitty 可以继续往：
+
+    Application Compositor inside a terminal workspace
+
+发展。
+15. Warp：已经不太应该把它叫“Terminal Emulator”了
+
+Warp 自己现在的官方定位已经是：
+
+    Agentic Development Environment
+
+而且 2026 年 4 月已经开放了核心产品源码。
+
+目前 Warp 的中心已经变成：
+
+Agent
+├── Claude Code
+├── Codex
+├── OpenCode
+├── Gemini
+└── Warp Agent
+
+配合：
+
+    multi-threaded workflows
+
+    worktrees
+
+    agent sessions
+
+    cloud agents
+
+    code review
+
+    native editing
+
+    terminal
+
+所以它已经从：
+
+Terminal + AI
+
+逐渐变成：
+
+Agent Manager
+   +
+Terminal
+   +
+Code Review
+   +
+Automation
+
+这反而和 Bitty 将来的 AI 方向有一些重叠。
+
+但我仍然认为 Bitty 不应该正面复制 Warp。
+
+Bitty 更适合：
+
+Claude Code
+Codex
+OpenCode
+Gemini CLI
+Hermes
+...
+   │
+   ▼
+Bitty Agent/Task Manager
+
+而不是自己变成“又一个 coding agent”。
+二、WaveTerm：这个项目确实非常值得重点研究
+
+WaveTerm 和 Bitty 的相似度，我认为甚至比 Warp 更高。
+
+它自己的定义是：
+
+    terminal + graphical capabilities
+
+包括：
+
+    terminal
+
+    files
+
+    code editor
+
+    Markdown/image/video/PDF/CSV preview
+
+    browser
+
+    sysinfo
+
+    process viewer
+
+    AI
+
+    remote connections
+
+核心 UI 抽象叫做：
+Block
+
+Wave 默认 widget 配置已经明确出现：
+
+view: "term"
+view: "preview"
+view: "web"
+view: "sysinfo"
+view: "processviewer"
+
+这和 Bitty 的：
+
+Panel(type)
+
+非常相似。
+三、WaveTerm 确实能直接渲染真正的网页
+
+答案是：
+是，而且不是“把 HTML 转成终端字符”
+
+它是真正嵌入 Chromium browser。
+
+Wave 当前代码里的 WebViewModel：
+
+    import type { WebviewTag } from "electron"
+
+    持有 React.RefObject<WebviewTag>
+
+    最终真正创建 <webview>
+
+    有 back / forward / home / reload
+
+    URL bar
+
+    media mute
+
+    user-agent emulation
+
+    navigation state
+
+而 preload 代码也直接运行在 webview guest page 内，并通过 Electron ipcRenderer 和主应用交互，例如：
+
+    图片右键
+
+    mouse back/forward
+
+所以实际上是：
+
+Wave window
+│
+├── React UI
+│
+├── xterm.js Terminal Block
+│
+├── Monaco Editor Block
+│
+└── Electron <webview>
+      │
+      └── Chromium
+           └── github.com / localhost / docs / dashboard / ...
+
+Wave 的 dependencies 里也可以直接看到：
+
+    Electron
+
+    xterm.js
+
+    xterm WebGL
+
+    Monaco
+
+    React
+
+所以 Wave 做 Web Panel 技术上非常自然。
+
+它已经把 Chromium 整个带进应用了。
+四、甚至可以直接：
+
+wsh web open github.com
+
+wsh web open localhost:3000
+
+Wave 的 wsh CLI 可以：
+
+    创建 blocks
+
+    删除 blocks
+
+    修改 metadata
+
+    控制 widgets
+
+    打开网页
+
+    打开文件
+
+    edit
+
+    run command
+
+    AI
+
+    SSH
+
+    shared variables
+
+    remote/local file exchange
+
+这部分我认为 Bitty 必须重点借鉴。
+
+因为：
+
+Wave wsh
+≈
+kitty remote control
+≈
+Bitty IPC + CLI
+
+但 Wave 已经把 GUI widget 也放进来了：
+
+wsh web open ...
+wsh view ...
+wsh edit ...
+wsh run ...
+
+Bitty 将来完全可能有：
+
+bitty panel open terminal
+bitty panel open web https://...
+bitty panel open file .
+bitty panel open markdown README.md
+
+bitty panel list
+bitty panel focus 8
+bitty panel move 8 workspace:2
+bitty panel split 8 right
+
+bitty agent list
+bitty task list
+
+而 IPC 底层和 CLI 共用同一个 object model。
+五、WaveTerm 的 Custom Web Widget 已经很接近“应用”
+
+例如：
+
+"github": {
+    "icon": "brands@github",
+    "label": "github",
+    "blockdef": {
+        "meta": {
+            "view": "web",
+            "url": "https://github.com",
+            "pinnedurl": "https://github.com"
+        }
+    }
+}
+
+就可以产生一个 GitHub widget。
+
+这意味着用户完全可以做：
+
+GitHub
+Grafana
+Kibana
+Prometheus
+Jenkins
+ArgoCD
+Cloudflare
+AWS Console
+OpenWebUI
+Telegram Web
+Discord
+Gmail
+Notion
+Linear
+
+之类的 Panel。
+
+所以你之前所说的：
+
+    一个 Panel 就像一个小应用程序
+
+WaveTerm 已经部分证明这条路线在产品层面是成立的。
+六、但 WaveTerm 有一个非常关键的“捷径”
+
+它能这么容易做到是因为：
+它本来就是 Electron
+
+所以：
+
+Web Panel = Chromium WebView
+
+几乎是现成能力。
+
+而 Bitty 如果是 native Rust application，就不能这么轻松地说：
+
+panel.render("https://github.com");
+
+浏览器本身是一个巨大系统：
+
+HTML parser
+CSS
+layout
+JavaScript
+DOM
+network
+cookies
+TLS
+GPU compositor
+video
+audio
+WebGL
+WebAssembly
+accessibility
+IME
+clipboard
+downloads
+OAuth
+sandbox
+process isolation
+...
+
+这已经是 Chromium/WebKit 的工作量。
+七、而且 Electron 自己现在都不太推荐 <webview>
+
+Electron 官方目前明确提醒：
+
+<webview> 基于 Chromium guest/OOPIF，架构变化大，建议考虑：
+
+    WebContentsView
+
+    iframe
+
+    或避免 embedded content 的架构
+
+所以 不要照抄 WaveTerm 的 <webview> 实现。
+
+应该借鉴的是：
+
+    Web 是一种 Panel 类型
+
+而不是：
+
+    Web Panel 必须通过 Electron <webview> 实现。
+
+这个区别非常重要。
+八、Bitty 如果以后支持 Web Panel，我建议这样设计
+
+核心不要知道 Chromium/WebKit 的存在。
+
+                 Bitty Core
+                     │
+              PanelProvider API
+                     │
+        ┌────────────┼──────────────┐
+        │            │              │
+ TerminalProvider FileProvider   WebProvider
+                                      │
+                         ┌────────────┴──────────┐
+                         │                       │
+                    Native WebView          External
+
+例如 API 只定义：
+
+trait PanelProvider {
+    fn create(...)
+    fn destroy(...)
+    fn focus(...)
+    fn resize(...)
+    fn snapshot(...)
+    fn serialize_state(...)
+}
+
+WebView provider 再自己实现：
+Windows
+
+WebView2
+
+macOS
+
+WKWebView
+
+Linux
+
+WebKitGTK / WPE WebKit
+
+或者以后提供：
+
+bitty-webview-chromium
+
+基于 CEF/Chromium。
+
+这样核心就不会变成：
+
+bitty-terminal
+depends on Chromium
+
+否则一个原本可能只有几十 MB 的 native terminal，瞬间变成 200~500 MB 级别的 Browser Runtime。
+九、甚至我建议 Web Panel 是 optional capability
+
+例如：
+
+[plugins.web]
+enabled = true
+backend = "system"
+
+甚至安装：
+
+bitty plugins add webview
+
+然后才出现：
+
+bitty web https://github.com
+
+这样：
+极简用户
+
+Bitty
+≈ foot / Alacritty
+
+普通用户
+
+Bitty
+≈ kitty / WezTerm
+
+重度用户
+
+Bitty
+≈ Emacs / WaveTerm / mini desktop workspace
+
+这其实非常符合 Bitty 现在的设计哲学。
+十、WaveTerm 还有一个 Bitty 应该重点学的东西：CLI ↔ GUI Bridge
+
+Wave 的 wsh 不是普通 shell integration。
+
+它实际上在建立：
+
+CLI world
+   ↕
+RPC
+   ↕
+GUI world
+
+比如：
+
+git diff | wsh ai -
+
+或者：
+
+wsh web open localhost:3000
+
+或者远端：
+
+SSH Server
+  │
+ wsh
+  │
+ RPC
+  │
+Local Wave
+  │
+GUI Block
+
+Wave 甚至给终端注入：
+
+WAVETERM_BLOCKID
+WAVETERM_TABID
+WAVETERM_WORKSPACEID
+WAVETERM_CLIENTID
+
+这一点和你给 Bitty 设计的 稳定 ID + IPC object model 几乎是同一路思想。
+
+Bitty 可以比它进一步：
+
+BITTY_PANEL_ID
+BITTY_WORKSPACE_ID
+BITTY_SESSION_ID
+BITTY_INSTANCE_ID
+BITTY_PROJECT_ID
+
+然后任何程序都能知道：
+
+    “我当前运行在哪个 Bitty Panel 里。”
+
+这对于未来 Agent 极其有价值。
+十一、现在我会这样评价整个终端生态
+
+可以用两个坐标：
+
+                         Application Platform
+                                ↑
+                                │
+                       Bitty?   │
+                   WaveTerm ●   │
+                       Warp ●   │
+                          Horizon ●
+                                │
+                  Tabby ●       │
+                                │
+            WezTerm ●           │
+              kitty ●           │
+                     iTerm2 ●   │
+                                │
+             Ghostty ●          │
+      Konsole ●                 │
+Windows Terminal ●             │
+                                │
+ GNOME Terminal ●               │
+       foot ●                   │
+  Alacritty ●                   │
+────────────────────────────────────────→ Programmability
+
+当然这只是概念图，不是性能排名。
+十二、如果按照“Bitty 最值得研究”排序
+
+我现在会给出这样的优先级：
+优先级	项目	Bitty 应该研究什么
+S	WaveTerm	generic Block、Web/File/Editor/AI、wsh GUI bridge
+S	WezTerm	Lua runtime、Mux object model、workspace/domain
+S	kitty	remote control、protocol、kittens、layout
+S	Horizon	Panel-first workspace、session visualization、Agent panels
+A+	iTerm2	shell integration、semantic command boundaries、browser pane
+A+	Warp	agent/session/task orchestration
+A	Ghostty	terminal core、native platform integration
+A	Kaku	excellent defaults、AI CLI integration
+A	Tabby	plugin manager、SSH/serial/remote workflow
+B+	foot	daemon/client、Wayland、minimalism
+B+	Alacritty	core minimalism、composition philosophy
+B	Konsole	mature desktop UX/layout
+B	Windows Terminal	profiles/actions/OS integration
+B	Hyper	JS plugin ecosystem 的经验和教训
+实验参考	Ratty	rich graphics / non-text surfaces
+十三、最终 Bitty 最有意思的差异可能恰恰是这一层
+
+WaveTerm 当前的思路大体是：
+
+Block
+├── predefined terminal
+├── predefined web
+├── predefined editor
+├── predefined preview
+└── predefined AI
+
+Horizon 更接近：
+
+Canvas
+└── Terminal Panels
+
+WezTerm：
+
+Lua
+└── Terminal Mux Objects
+
+kitty：
+
+Remote Control
+└── Terminal Windows
+
+Warp：
+
+Agents
+└── Development Workflows
+
+而 Bitty 如果继续当前方向，可以变成：
+
+                 Bitty
+                   │
+          ┌────────┴────────┐
+          │   Object Model   │
+          │                 │
+ Workspace / Panel / Task / Session
+          │
+    ┌─────┼─────────┬───────────┐
+    │     │         │           │
+ Terminal Web      File       Agent
+ Panel    Panel    Panel      Panel
+    │
+ Plugin Providers
+    │
+ Lua / IPC / CLI / external process
+
+这里最大的区别是：
+Panel 本身就是公共 primitive。
+
+不是“Terminal 加一个浏览器功能”。
+
+而是：
+
+    Terminal 和 Browser 从一开始就是 Panel 的两个实现。
+
+这其实比 WaveTerm 更接近 Emacs 的 Buffer/Window 思想 + Hyprland 的 Workspace/Window 思想 + Waybar 的 Provider 思想 + terminal 的 PTY/session model。
+
+所以经过这轮对比以后，我反而更加认为：WaveTerm 是目前最值得 Bitty 深入逆向研究的产品级 reference；WezTerm 和 kitty 是最值得研究的架构级 reference；Horizon 是最值得关注的新型 UI reference。
+
+尤其是 WaveTerm 的 Block + wsh + WebView，和 Bitty 现在的 Panel + IPC + Plugin 已经出现了非常明显的“趋同进化”，但 Bitty 有机会把这套抽象做得更底层、更通用，也更适合 native / Linux / Agent automation。
+

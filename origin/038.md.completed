@@ -1,0 +1,1470 @@
+Panel History 这个部分适合做成 Lua 插件吗？如果做到 Core 的话是不是需要引入 sqlite 的依赖呢？
+可以，而且我觉得 **Panel History 很适合采用“Core 提供能力，Lua 插件提供持久化策略”**，而不是把完整 History 系统硬塞进 Core。
+
+关键是把两件事分开：
+
+> **Core 必须知道 Panel 发生了什么；Core 不一定负责永久保存这些东西。**
+
+## 1. Core 里必须存在的部分
+
+Bitty Core 本身无论有没有 History 插件，都已经天然知道：
+
+```text
+PTY output
+PTY input
+cwd
+process lifecycle
+exit code
+Panel ID
+Workspace ID
+timestamp
+terminal scrollback
+```
+
+所以 Core 可以提供标准事件：
+
+```rust
+enum PanelEvent {
+    Input { data: Bytes },
+    Output { data: Bytes },
+
+    CommandStarted {
+        command: String,
+        cwd: PathBuf,
+    },
+
+    CommandFinished {
+        exit_code: Option<i32>,
+        duration: Duration,
+    },
+
+    CwdChanged(PathBuf),
+
+    ProcessStarted { ... },
+    ProcessExited { ... },
+
+    PanelCreated,
+    PanelClosed,
+}
+```
+
+然后暴露给 Lua：
+
+```lua
+bitty.panel.on("command_finished", function(event)
+    ...
+end)
+
+bitty.panel.on("output", function(event)
+    ...
+end)
+```
+
+或者更加通用：
+
+```lua
+bitty.events.subscribe("panel:*", handler)
+```
+
+Core 做的是：
+
+```text
+PTY
+ ↓
+Terminal Parser
+ ↓
+Panel State
+ ↓
+Event Bus
+ ├── UI
+ ├── bitty-ai
+ ├── Lua Plugin
+ └── History Plugin
+```
+
+这部分必须属于 Core，因为 Lua 插件不应该自己 hook PTY、解析 shell integration、猜测什么时候一条命令结束。
+
+---
+
+# 2. Core 的 Scrollback 和 Panel History 要区分
+
+这一点很重要。
+
+### Scrollback
+
+这是 Terminal Emulator 的核心功能。
+
+例如：
+
+```text
+Panel
+ ├── current screen
+ └── scrollback buffer
+```
+
+用户：
+
+```text
+PageUp
+mouse wheel
+search visible terminal
+```
+
+都需要它。
+
+所以：
+
+> **volatile scrollback 属于 Core。**
+
+它一般是内存结构：
+
+```rust
+VecDeque<Row>
+```
+
+或者更适合终端的数据结构，而不是 SQLite。
+
+关闭 Panel 后可以直接消失。
+
+---
+
+### Persistent Panel History
+
+例如用户希望：
+
+> “昨天这个 Panel 执行过什么？”
+>
+> “把这个 Panel 完整导出来。”
+>
+> “让 Agent 查看 3 小时前的 cargo build 输出。”
+
+这才是：
+
+```text
+persistent history
+```
+
+它完全可以是插件：
+
+```text
+bitty-history
+```
+
+甚至默认官方插件：
+
+```text
+Bitty Core
++
+Official Lua plugin:
+    history
+```
+
+我比较推荐这个方案。
+
+---
+
+# 3. 因此 Core 完全不需要因为 History 引入 SQLite
+
+这其实正好符合你 Bitty 一直以来的设计哲学：
+
+> **Core 极简，复杂功能通过 Plugin 扩展。**
+
+Core 没必要：
+
+```text
+bitty-core
+    ↓
+rusqlite
+    ↓
+libsqlite3
+```
+
+单纯为了记录 terminal history。
+
+完全可以：
+
+```text
+bitty-core
+    ↓
+event API
+    ↓
+storage API
+```
+
+然后：
+
+```text
+history.lua
+    ↓
+append / query / export
+```
+
+甚至 History 第一版连 SQLite 都不需要。
+
+---
+
+# 4. Panel History 其实特别适合 append-only storage
+
+Terminal History 最大的特点：
+
+> 几乎永远都是追加，很少修改过去的数据。
+
+例如：
+
+```text
+10:00 cargo build
+10:00 output...
+10:01 exit 1
+
+10:03 vim src/lib.rs
+
+10:15 cargo test
+10:15 output...
+10:16 exit 0
+```
+
+这天然适合：
+
+```text
+append-only log
+```
+
+比如：
+
+```text
+~/.local/state/bitty/panels/
+└── 01K5ABCD/
+    ├── meta.json
+    └── segments/
+        ├── 000001.zst
+        ├── 000002.zst
+        └── 000003.zst
+```
+
+每个 segment 比如 4MB：
+
+```text
+segment
+├── header
+├── event
+├── event
+├── output
+├── event
+└── ...
+```
+
+达到：
+
+```text
+4 MiB
+```
+
+以后：
+
+```text
+compress
+seal
+new segment
+```
+
+这比：
+
+```text
+panel-history.sqlite
+```
+
+甚至更加自然。
+
+而且非常容易清理：
+
+```text
+keep last 30 days
+keep max 2GB
+keep pinned panels forever
+```
+
+直接删 segment 即可。
+
+---
+
+# 5. SQLite 更适合作为“索引”，而不是 History 本体
+
+如果未来确实需要：
+
+```text
+搜索所有命令
+
+cargo test
+
+查询：
+exit_code != 0
+
+查询：
+cwd = ~/Projects/bitty
+
+查询：
+某个月运行过哪些 cargo 命令
+```
+
+这时候 SQLite 很有价值。
+
+但可以设计成：
+
+```text
+             canonical history
+                    │
+                    ▼
+             *.zst segments
+                    │
+              indexing
+                    ▼
+             history.sqlite
+```
+
+也就是说：
+
+> **History log 是 Source of Truth，SQLite 是可重建 index。**
+
+SQLite 甚至可以放：
+
+```text
+~/.cache/bitty/history/index.sqlite
+```
+
+因为：
+
+```bash
+bitty history reindex
+```
+
+就可以重新生成。
+
+这会比：
+
+```text
+所有历史内容全部 TEXT/BLOB 塞 SQLite
+```
+
+漂亮很多。
+
+---
+
+# 6. Lua 插件不要直接操作 SQLite
+
+这里我仍然不建议：
+
+```lua
+local sqlite = require("sqlite")
+sqlite.open(...)
+```
+
+尤其 Bitty 用的是 Piccolo，你本身就在建立自己的受控 Lua Runtime。
+
+如果允许 Lua：
+
+```text
+直接动态链接 SQLite
+直接访问任意数据库
+直接操作 native library
+```
+
+会破坏插件 sandbox。
+
+更好的设计是 Core 暴露：
+
+```lua
+bitty.storage
+```
+
+例如：
+
+```lua
+local store = bitty.storage.open("history")
+
+store:append("events", event)
+store:put(...)
+store:get(...)
+store:read(...)
+```
+
+但是底层到底：
+
+```text
+SQLite
+JSONL
+CBOR
+MessagePack
+zstd segment
+RocksDB
+redb
+```
+
+插件完全不知道。
+
+---
+
+# 7. 不过我甚至建议再低一层
+
+因为 History 插件需要的真正能力其实很简单：
+
+```lua
+bitty.fs.open(...)
+bitty.fs.append(...)
+bitty.fs.read(...)
+bitty.fs.list(...)
+```
+
+但路径受到 capability sandbox：
+
+```text
+$XDG_STATE_HOME/bitty/plugins/history/
+```
+
+插件不能：
+
+```text
+../../../../etc/passwd
+```
+
+例如：
+
+```lua
+local file = bitty.storage.state("history/segment-001")
+file:append(data)
+```
+
+宿主自动映射成：
+
+```text
+~/.local/state/bitty/plugins/history/segment-001
+```
+
+插件根本不需要知道真实路径。
+
+以后可以再增加：
+
+```lua
+bitty.storage.kv()
+bitty.storage.blob()
+```
+
+---
+
+# 8. History 插件可以分两个等级
+
+甚至我觉得以后做这个配置会很好：
+
+```lua
+require("bitty.history").setup({
+    mode = "commands",
+})
+```
+
+### `commands`
+
+只保存：
+
+```text
+command
+cwd
+start time
+end time
+exit code
+duration
+```
+
+非常小。
+
+可能几年都只有几十 MB。
+
+---
+
+### `output`
+
+保存：
+
+```text
+Command
++
+完整 Terminal Output
+```
+
+数据增长会非常快。
+
+可以设置：
+
+```lua
+history = {
+    commands = true,
+
+    output = {
+        enabled = true,
+        max_age = "30d",
+        max_size = "5GiB",
+        compress = true,
+    },
+}
+```
+
+---
+
+### `full`
+
+再进一步：
+
+```text
+PTY byte stream
+resize event
+input
+output
+terminal modes
+```
+
+理论上甚至能做到：
+
+```text
+Terminal Replay
+```
+
+类似：
+
+```bash
+asciinema
+```
+
+但这个数据量会明显增加。
+
+可以作为高级功能：
+
+```lua
+history.mode = "replay"
+```
+
+而不是默认。
+
+---
+
+# 9. bitty-ai 可以消费 History，但不拥有 History
+
+这是整个架构里很重要的一层。
+
+不要变成：
+
+```text
+bitty-ai
+└── panel_history
+```
+
+应该：
+
+```text
+                Panel Core
+                    │
+               Panel Events
+                    │
+          ┌─────────┴─────────┐
+          ▼                   ▼
+   History Plugin          bitty-ai
+          │                   │
+          │                   │
+          └──── History API ──┘
+```
+
+于是 AI 可以：
+
+```text
+history.list_commands(panel)
+history.get_command_output(command_id)
+history.search("error[E0382]")
+history.tail(panel, 100)
+```
+
+但 AI 不关心历史到底怎么保存。
+
+这也正好适合你之前说的：
+
+> Agent 可以进入用户已有的 headed Panel，查看之前的命令和日志来分析错误。
+
+Agent 实际调用：
+
+```text
+panel.history({
+    panel_id,
+    since_command = ...
+})
+```
+
+而不是：
+
+```text
+SELECT * FROM history.sqlite
+```
+
+---
+
+# 10. `/export panel` 同样可以建立在这个 API 上
+
+例如：
+
+```text
+/export panel
+```
+
+Lua Plugin：
+
+```text
+Export Plugin
+     │
+     ▼
+Panel History API
+     │
+     ├── metadata
+     ├── commands
+     ├── outputs
+     └── timeline
+```
+
+然后导出：
+
+```text
+panel-xxx/
+├── manifest.json
+├── commands.jsonl
+└── output.txt
+```
+
+或者：
+
+```text
+panel.bitty
+```
+
+因此：
+
+> `/export` 是插件，但 `history snapshot/query` 是稳定的 Host API。
+
+这个边界会非常合理。
+
+---
+
+# 11. 我会这样给 Bitty 分层
+
+最终可以是：
+
+```text
+bitty-core
+│
+├── terminal
+│   ├── VT parser
+│   ├── screen
+│   └── volatile scrollback
+│
+├── panel
+│   ├── lifecycle
+│   └── event generation
+│
+├── event-bus
+│
+└── plugin-host
+    └── storage capability
+```
+
+然后：
+
+```text
+Official Plugins
+│
+├── history
+│   ├── command history
+│   ├── persistent output
+│   ├── compression
+│   └── retention
+│
+├── export
+│
+├── search
+│
+└── ...
+```
+
+bitty-ai：
+
+```text
+bitty-ai
+├── agent
+├── context
+├── session DB
+└── consume Panel History API
+```
+
+所以我会明确建议：**不要因为 Panel History 给 `bitty-core` 引入 SQLite。** Core 只负责 volatile scrollback、Panel lifecycle、结构化事件以及插件可用的 Storage/Event API。持久化 History 做成官方 Lua 插件最合适；大量输出用 append-only + zstd segment，真正需要高级查询时，再加一个可重建的 SQLite index。
+
+这样甚至比“History Plugin 使用 SQLite”还更符合 Bitty：**SQLite 是 bitty-ai Session/Memory 这种关系数据的好工具，但 Terminal History 本质上是一条持续增长的 event stream，并不是典型关系数据库问题。**
+你知道 Atuin 这个工具吗？因为我就一直在用这个，说不定有灵感？而且是不是支持 Atuin 跟 Bitty 之间导入和导出这种的呢？
+知道，而且我刚看了下 Atuin 现在的设计，它和我们前面讨论的 Bitty Panel History **非常值得互相借鉴**。甚至 Atuin 最近已经往“Terminal History → AI Context”这个方向走了：它不仅记录 `command/cwd/time/duration/exit code/host/session`，现在还支持记录 Claude Code、Codex、OpenCode、Pi 等 Agent 执行的命令，并提供 MCP 给 AI 查询历史。([Atuin Documentation][1])
+
+但我会把结论定成：
+
+> **Bitty 不应该重新造一个 Atuin。**
+>
+> Bitty 应该设计自己的 richer Panel History，同时把 Atuin 当作一个一等公民的 `History Provider / Sink`。
+
+这会比单纯“Bitty 自己再做一个 shell history SQLite”漂亮很多。
+
+## Atuin 最值得 Bitty 借鉴的地方
+
+Atuin 本质上已经证明了一套结构非常实用：
+
+```text
+command
+cwd
+timestamp
+duration
+exit_code
+host
+session
+```
+
+这些都属于 **Structured Command History**。Atuin 使用 shell 的 `preexec/precmd` 生命周期，在命令开始时创建记录，在命令结束时补充 exit code 和 duration。([Atuin Documentation][2])
+
+这跟 Bitty 前面设计的：
+
+```text
+PanelEvent::CommandStarted
+PanelEvent::CommandFinished
+```
+
+几乎完全一致。
+
+所以 Bitty Core 可以直接设计一个比 Atuin 稍微更通用的结构：
+
+```rust
+CommandRecord {
+    id,
+    panel_id,
+    workspace_id,
+
+    command,
+    cwd,
+
+    started_at,
+    duration,
+    exit_code,
+
+    shell,
+
+    actor,
+}
+```
+
+其中 `actor` 很重要：
+
+```text
+actor =
+    User
+    Agent(agent_id)
+    Plugin(plugin_id)
+```
+
+这其实比 Atuin现在的 `author = user / claude-code / codex / opencode / pi` 更适合 Bitty，因为 Bitty 本身就知道具体是哪一个 Agent。Atuin 现在也已经支持按 AI agent author 过滤历史了。([Atuin Documentation][1])
+
+---
+
+## 但 Atuin 的 Command Output 设计反而说明 Bitty 可以走得更远
+
+Atuin 现在确实支持 command output capture，不过设计得非常克制：
+
+```text
+Terminal
+   ↓
+pty-proxy
+   ↓
+OSC 133
+   ↓
+Atuin daemon
+   ↓
+memory
+```
+
+目前默认每个命令最多保留约 `1 MB` 输出，每个 shell session 最近 `128` 条，最大约 `32 MB`；而且 daemon 停掉后这些 output 就消失，并不是永久写进 `history.db`。([Atuin Documentation][3])
+
+这恰恰印证了我们前面说的：
+
+> **Command History 和 Raw Output 不应该是同一种存储。**
+
+Atuin：
+
+```text
+Structured History
+        ↓
+SQLite
+        ↓
+长期保存
+
+Command Output
+        ↓
+bounded memory
+        ↓
+临时保存
+```
+
+Bitty 可以扩展成：
+
+```text
+Structured History
+        ↓
+Atuin / Bitty History Plugin
+        ↓
+长期保存
+
+
+Panel Output
+        ↓
+Core Scrollback
+        ↓
+memory
+
+        ↓ optional
+
+Persistent History Plugin
+        ↓
+zstd segments
+        ↓
+长期保存
+```
+
+所以 Atuin 的出现反而让我更确定：
+
+**不要为了 Panel History 给 Bitty Core 引入 SQLite。**
+
+---
+
+# 更有意思的是：Bitty 可以直接把 Atuin 做成 History Backend
+
+比如：
+
+```lua
+history = {
+    provider = "atuin"
+}
+```
+
+那么整个结构变成：
+
+```text
+                    Bitty Core
+                        │
+                Command Events
+                        │
+          ┌─────────────┴─────────────┐
+          │                           │
+          ▼                           ▼
+     Bitty History                Atuin Adapter
+     optional                         │
+                                     ▼
+                              atuin history start
+                              atuin history end
+                                     │
+                                     ▼
+                              Atuin history.db
+```
+
+如果用户像你一样本身就在用 Atuin：
+
+> **完全没有必要让 Bitty 再复制一份 command history。**
+
+Bitty 只保存它自己独有的信息：
+
+```text
+panel_id
+workspace_id
+agent_id
+Panel output
+Panel lifecycle
+Terminal replay
+```
+
+而这些通用数据：
+
+```text
+command
+cwd
+duration
+exit_code
+timestamp
+```
+
+完全可以交给 Atuin。
+
+---
+
+## 实际上最简单的情况甚至什么都不用做
+
+因为如果你在：
+
+```bash
+.zshrc
+```
+
+里已经：
+
+```bash
+eval "$(atuin init zsh)"
+```
+
+那么你从：
+
+```text
+Kitty
+Ghostty
+Bitty
+WezTerm
+```
+
+启动 zsh，Atuin 都会工作。
+
+也就是说：
+
+```text
+Bitty
+ ↓
+PTY
+ ↓
+zsh
+ ↓
+Atuin shell integration
+ ↓
+history.db
+```
+
+因此**用户在 Bitty Panel 里亲手输入的命令，本来就会自动进入 Atuin**。
+
+Bitty 不需要感知 Atuin。
+
+---
+
+# Bitty 真正应该做的是更深层的可选 integration
+
+我觉得可以以后提供一个官方插件：
+
+```text
+bitty-atuin
+```
+
+或者：
+
+```text
+plugins/atuin
+```
+
+它可以做三个方向。
+
+| 模式       | 作用                     |
+| -------- | ---------------------- |
+| Provider | Bitty 查询 Atuin History |
+| Importer | Atuin → Bitty          |
+| Sink     | Bitty/Agent → Atuin    |
+
+这样就很完整。
+
+---
+
+# 1. Atuin → Bitty Import
+
+这个完全可以做。
+
+例如：
+
+```bash
+bitty history import atuin
+```
+
+或者 Lua Command：
+
+```text
+/history import atuin
+```
+
+导入：
+
+```text
+Atuin
+
+command
+cwd
+timestamp
+duration
+exit_code
+host
+session
+author
+        ↓
+Bitty CommandRecord
+```
+
+映射可以是：
+
+```text
+Atuin              Bitty
+────────────────────────────
+command       →     command
+cwd           →     cwd
+time          →     started_at
+duration      →     duration
+exit          →     exit_code
+host          →     host
+session       →     external_session
+author        →     actor
+```
+
+但这里我**不建议直接读取**：
+
+```text
+~/.local/share/atuin/history.db
+```
+
+虽然 Atuin 默认确实把 SQLite DB 放在 `~/.local/share/atuin/history.db`，配置则放在 `~/.config/atuin`。([GitHub][4])
+
+原因就是：
+
+```text
+Atuin internal DB schema
+```
+
+不是 Bitty 应该依赖的 public API。
+
+Atuin 一升级 schema，插件就可能坏。
+
+最好走：
+
+```text
+atuin CLI
+```
+
+目前 Atuin 的 `history list/search` 支持自定义 `--format`，字段包括 command、directory、duration、user、host、time、exit 等。([Atuin Documentation][5])
+
+于是 Adapter 可以调用类似：
+
+```text
+atuin
+  ↓
+structured output
+  ↓
+Bitty Adapter
+  ↓
+CommandRecord
+```
+
+如果以后 Atuin 提供更稳定的 JSON/API，则切过去。
+
+---
+
+# 2. Bitty → Atuin
+
+这个其实更有价值。
+
+特别是：
+
+> **bitty-ai Agent 执行的命令。**
+
+如果 Agent 使用 Bitty Core 的执行工具：
+
+```text
+Agent
+ ↓
+execute("cargo test")
+ ↓
+Headless Panel
+```
+
+它不一定经过用户的 interactive shell hook。
+
+因此普通 Atuin shell integration 未必能自动记录。
+
+但 Atuin 已经提供：
+
+```bash
+atuin history start -- "cargo test"
+```
+
+执行结束：
+
+```bash
+atuin history end \
+    --exit 0 \
+    --duration ... \
+    -- <history-id>
+```
+
+Atuin 自己给 OpenCode、Pi、Claude Code、Codex 做 Agent integration 时就是采用这一套生命周期。([Atuin Documentation][1])
+
+所以 Bitty 可以非常自然：
+
+```text
+bitty-ai Agent
+     │
+     │ command_started
+     ▼
+Atuin Plugin
+     │
+     ├── atuin history start
+     │
+     │
+     │ command_finished
+     ▼
+atuin history end
+```
+
+最后你在 Atuin 中：
+
+```text
+$all-user
+
+bitty-ai
+claude-code
+codex
+opencode
+pi
+```
+
+全部历史都能搜。
+
+这非常适合你这种本来就在用 Atuin 的用户。
+
+---
+
+# 3. 不建议把 Bitty Raw Panel Output 导进 Atuin
+
+边界应该明确。
+
+Atuin 擅长：
+
+```text
+“我运行过什么命令？”
+```
+
+Bitty Panel History 擅长：
+
+```text
+“这个 Panel 当时发生了什么？”
+```
+
+两者不一样。
+
+比如一个：
+
+```bash
+cargo test
+```
+
+Atuin 记录：
+
+```text
+command = cargo test
+cwd = ~/bitty
+exit = 101
+duration = 8.2s
+```
+
+Bitty 可以额外知道：
+
+```text
+panel = 019...
+workspace = dev
+agent = agent-3
+
+output:
+    Compiling ...
+    error[E0382] ...
+    ...
+
+terminal size changes
+scrollback
+shell marks
+related agent tool-call
+session
+```
+
+所以边界最好是：
+
+```text
+Atuin
+└── Command History
+
+Bitty
+├── Panel History
+├── Output
+├── Agent relation
+├── Session relation
+└── Terminal state
+```
+
+两者通过：
+
+```text
+external_history_id
+```
+
+关联。
+
+例如：
+
+```rust
+CommandRecord {
+    id: BittyId,
+
+    external: Some(ExternalHistoryRef {
+        provider: "atuin",
+        id: "...",
+    }),
+}
+```
+
+这个设计很干净。
+
+---
+
+# 甚至可以完全不“导入”，而是直接 Query Atuin
+
+这可能才是我最喜欢的方案。
+
+例如 Bitty 的 History UI：
+
+```text
+Mod + H
+```
+
+出现：
+
+```text
+History
+
+Provider:
+  ● All
+  ○ Bitty
+  ○ Atuin
+
+Scope:
+  ● Workspace
+  ○ Directory
+  ○ Panel
+  ○ Global
+```
+
+用户输入：
+
+```text
+cargo test
+```
+
+Bitty：
+
+```text
+                Search
+                  │
+          ┌───────┴───────┐
+          ▼               ▼
+   Bitty History       Atuin
+          │               │
+          └──────┬────────┘
+                 ▼
+            merged result
+```
+
+这样根本不需要复制数据。
+
+而 Atuin 本身已经支持：
+
+```text
+global
+host
+session
+directory
+workspace
+```
+
+这些 scope。([Atuin Documentation][6])
+
+跟 Bitty：
+
+```text
+Panel
+Workspace
+Project
+Session
+```
+
+天然很接近。
+
+---
+
+# Atuin MCP 对 bitty-ai 也很有启发
+
+Atuin 现在已经提供：
+
+```bash
+atuin mcp
+```
+
+Agent 可以调用：
+
+```text
+atuin_history
+atuin_output
+```
+
+例如：
+
+> “我上次解决这个 Rust 编译错误用了什么命令？”
+
+Agent 可以直接查 Atuin。([Atuin Documentation][7])
+
+对于 Bitty 来说甚至不一定需要 MCP 绕一圈，因为 Bitty Plugin 可以提供：
+
+```text
+history.search
+history.get
+history.output
+```
+
+然后有：
+
+```text
+AtuinHistoryProvider
+BittyHistoryProvider
+```
+
+所以 bitty-ai 最后看到的是统一接口：
+
+```rust
+trait HistoryProvider {
+    search(...)
+    get(...)
+    output(...)
+}
+```
+
+而不知道底下到底：
+
+```text
+Atuin
+Bitty local
+SSH host
+...
+```
+
+这会非常漂亮。
+
+---
+
+## 我会因此稍微调整我们刚才的 Panel History 架构
+
+原本：
+
+```text
+Bitty Core
+    ↓
+History Plugin
+    ↓
+Bitty storage
+```
+
+现在我更倾向于：
+
+```text
+                   Bitty Core
+                       │
+                Command Events
+                       │
+                       ▼
+                 History API
+                       │
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+  Atuin Provider   Local Provider   Custom Provider
+        │              │
+        ▼              ▼
+    Atuin DB        zstd / SQLite
+
+
+                 Panel Output
+                       │
+                       ▼
+                Scrollback Core
+                       │
+                  optional
+                       ▼
+             Persistent Output Plugin
+```
+
+这样 **Command History 和 Panel Output 彻底解耦**。
+
+对于你这种已经长期使用 Atuin 的用户，甚至可以默认：
+
+```lua
+history = {
+    provider = "atuin",
+
+    panel_output = {
+        persist = false,
+    }
+}
+```
+
+Bitty 就不重复保存 command history。
+
+而别的用户没有 Atuin：
+
+```lua
+history = {
+    provider = "local"
+}
+```
+
+Bitty 官方 `history` Lua Plugin 自己保存即可。
+
+---
+
+还有一个很值得注意的点：Atuin 现在的 shell integration 已经开始使用 **OSC 133 semantic prompt markers** 来区分 command/output，pty-proxy 也是靠它判断一条命令的输出边界。([GitHub][8])
+
+这跟 Bitty 的设计关系非常大。因为 Bitty 自己就是 Terminal Emulator，完全可以原生理解 OSC 133：
+
+```text
+OSC 133 A → Prompt Start
+OSC 133 B → Prompt End
+OSC 133 C → Command Executed
+OSC 133 D → Command Finished
+```
+
+因此 Bitty 根本不需要像 Atuin 那样额外套一层 `pty-proxy` 去猜终端发生了什么。
+
+这会让 Bitty 的：
+
+```text
+Command Block
+Output folding
+Panel History
+Agent log reading
+/export panel
+Flash-style command navigation
+```
+
+全部建立在同一个 semantic command model 上。
+
+所以 **Atuin 值得作为 Bitty History RFC 的主要参考项目之一**，但最理想的关系不是竞争，而是：
+
+> **Atuin 管“跨终端、跨机器的 shell command history”；Bitty 管“Panel/Agent/Session 的 terminal execution history”。**
+>
+> 二者通过 Provider/Adapter 相互导入、查询和写入。
+
+这样你现有几十万条甚至更多 Atuin 历史完全可以继续用，不需要因为换到 Bitty 就从零开始。
+
+[1]: https://docs.atuin.sh/main/guide/agent-hooks/?utm_source=chatgpt.com "AI Agent Hooks - Atuin Docs"
+[2]: https://docs.atuin.sh/18.17/guide/shell-integration/?utm_source=chatgpt.com "Shell Integration - Atuin Docs"
+[3]: https://docs.atuin.sh/main/ai/command-output/?utm_source=chatgpt.com "Reading Command Output - Atuin Docs"
+[4]: https://github.com/atuinsh/atuin/blob/main/docs/docs/configuration/config.md?utm_source=chatgpt.com "atuin/docs/docs/configuration/config.md at main · atuinsh/atuin · GitHub"
+[5]: https://docs.atuin.sh/main/reference/search/?utm_source=chatgpt.com "search - Atuin Docs"
+[6]: https://docs.atuin.sh/main/guide/advanced-usage/?utm_source=chatgpt.com "Advanced usage - Atuin Docs"
+[7]: https://docs.atuin.sh/main/ai/mcp/?utm_source=chatgpt.com "MCP Server - Atuin Docs"
+[8]: https://github.com/atuinsh/atuin/blob/main/crates/atuin/src/shell/atuin.zsh?utm_source=chatgpt.com "atuin/crates/atuin/src/shell/atuin.zsh at main · atuinsh/atuin · GitHub"
+

@@ -1,0 +1,529 @@
+## 总体判断
+
+截至 **2026-09-13**，我会把 Bitty 当前阶段描述成：
+
+> **“终端主体已经从原型期进入可用性 + 正确性 hardening，Workspace/Panel 开始真正成型；Plugin Runtime 已越过纯设计阶段；AI/Agent 则进入大规模架构设计期，但明显领先于实现。”**
+
+`bitty-docs` 自己仍把项目定义为 **Pre-alpha / Engineering Milestones M1–M8**，而且明确区分 `Implemented → Verified → Compatible → Release-ready`，这点是正确的：现在代码很多了，但离“稳定终端”还有一个专门的验证阶段。
+
+我现在会这样评估：
+
+| Milestone                   | 当前判断                             | 相比 9 月初           |
+| --------------------------- | -------------------------------- | ----------------- |
+| **M1 Terminal Truth**       | 🟢 主体完成，进入 correctness hardening | 明显推进              |
+| **M2 Correct Terminal**     | 🟡→🟢 正在快速补协议与兼容性                | 推进很大              |
+| **M3 Usable Terminal**      | 🟡 已经开始“像一个真正终端”                 | **最近提升最大**        |
+| **M4 Workspace / Panel**    | 🟡 Early implementation，但已经是实际系统 | **快速成型**          |
+| **M5 Plugin Ecosystem**     | 🟡 基础设施已经落地                      | 从“实验”开始走向 Runtime |
+| **M6 Rich / IPC / Agent**   | 🟠 Rich/IPC 有实现，AI/Agent 设计远领先实现 | 设计爆发期             |
+| **M7 Stable Compatibility** | ⚪ 尚未真正进入                         | —                 |
+| **M8 Public Beta**          | ⚪ 尚未开始                           | —                 |
+
+所以如果以前我会说 Bitty 是 **“architecture-first 的 terminal prototype”**，现在已经可以改成：
+
+> **“一个拥有真实终端能力、真实 compositor/workspace、正在构建 plugin platform 的 pre-alpha terminal platform。”**
+
+---
+
+# `bitty-docs` 最近最大的变化
+
+我觉得这次看下来，最值得注意的甚至不是多了多少功能，而是 **bitty-docs 本身的性质发生了变化**。
+
+目前已经形成了相当完整的体系：
+
+```text
+Vision
+  ↓
+Architecture
+  ↓
+ADR / RFC
+  ↓
+Open Questions
+  ↓
+Acceptance
+  ↓
+Implementation
+  ↓
+Evidence / Risk / Review
+  ↓
+Verified
+  ↓
+Compatible
+  ↓
+Release-ready
+```
+
+里面现在已经有 Architecture、ADR、RFC、Specifications、Product、Project State、Roadmap、Security Evidence Matrix、Risk Register、Review Checklist、Findings 等多个层次；甚至架构图同时维护 D2、Mermaid、SVG 和 interactive HTML。
+
+这意味着 `bitty-docs` 已经不太像传统意义上的“项目文档仓库”，而更像：
+
+> **Bitty 的 architecture/governance repository。**
+
+这其实非常适合 Bitty，因为 Plugin / Panel / IPC / AI / Security 这些东西如果没有明确 contract，很容易开发到后期互相侵入。
+
+---
+
+## 一个非常好的现象：设计 → 实现闭环已经跑起来了
+
+最近尤其明显。
+
+例如 `OQ-041` 定义了 per-View appearance override；随后主仓库已经实现：
+
+```lua
+views["*"]
+views["terminal"]
+views["ws:1"]
+views["view:3"]
+```
+
+并且有明确 precedence、fail-closed validation、contrast checking、safe mode 等语义。
+
+`OQ-042` 刚刚把 per-panel background image 的格式、root trust、decode bound、cache、fit mode 等 contract 固定下来，现在主仓库已经完整实现 PNG/JPEG/static WebP、`fill/fit/center/tile/stretch`、per-View override、bounded decode/cache，而且 `--safe` 不打开图片。
+
+这说明 Bitty 已经出现一个很健康的循环：
+
+```text
+research
+   ↓
+OQ
+   ↓
+RFC
+   ↓
+Accepted
+   ↓
+bitty implementation
+   ↓
+tests / evidence
+   ↓
+bitty-docs sync
+```
+
+这一点比“功能多”更重要。
+
+---
+
+# M1 / M2：终端基础现在已经比较扎实
+
+这两天主仓库还在继续补很底层的 Terminal compatibility。
+
+今天刚加入的一批包括：
+
+```text
+DECSET 2026 synchronized output
+OSC 10/11 dynamic foreground/background
+OSC 0/2 window title
+```
+
+同时 compat-lab 已经在跑 differential dump。
+
+再结合最近：
+
+```text
+IME / fcitx5 CJK
+glyph fallback
+missing glyph tofu
+OSC 52
+DA replies
+scrollback / viewport
+selection
+bracketed paste
+mouse protocol
+Kitty graphics
+tmux rendering
+```
+
+我认为 **“Bitty 能不能成为一个正确的 terminal emulator”已经不再是最大的未知数**。
+
+现在最大的工作已经从：
+
+> “终端能不能跑？”
+
+变成：
+
+> “各种 edge case、protocol、shell/tmux/nvim/application compatibility 能不能系统性证明正确？”
+
+这正是 M2 → M7 之间真正需要做的事情。
+
+Roadmap 自己也是这么定义的：M1 是 implemented/hardening，M2 是 hardening + compat-lab，而不是重新做架构。
+
+---
+
+# M3：我认为这是目前进度变化最大的部分
+
+Bitty 最近已经开始出现大量“用户每天会真正感知”的功能：
+
+`bitty init` wizard、30 个 built-in themes、theme palette 真正作用于 terminal interior、focused/idle border、panel animation、scrollbar 默认 auto overlay、新 pane 继承 cwd、IME、running-job close confirmation、selection 默认不 auto-copy、Mod/Leader、padding/gaps/content inset、per-View appearance、background image。
+
+而且这些不是单纯 UI cosmetic，例如 running-job close confirmation、paste protection、IME、cwd inheritance、selection behavior 都属于 **日常 terminal UX**。
+
+主仓库当前 `CHANGELOG` 已经能明显看出 Bitty 开始从：
+
+```text
+terminal engine
+```
+
+变成：
+
+```text
+terminal product
+```
+
+了。
+
+所以我觉得 M3 的状态虽然文档还写着 `In progress`，但已经比 9 月 8 日那个 snapshot 前进很多。
+
+---
+
+# M4 Workspace / Panel：现在是最关键的工程主线
+
+这个部分我尤其建议你关注。
+
+这两天的 bug 和改动非常有代表性：
+
+```text
+ViewId 必须 runtime-global unique
+workspace shell ownership
+split pane 真正 spawn shell
+new pane focus
+new pane cwd inheritance
+primary grid owner
+decorated content frame sizing
+per-pane damage tracking
+```
+
+这些问题说明一件事情：
+
+> **Workspace / Panel 已经不是抽象架构了，它开始真正承受复杂状态组合。**
+
+这其实是好事。
+
+尤其今天那个 per-pane damage tracking：
+
+```text
+two-pane, one pane updating
+
+cells examined:
+1629 → 815
+
+glyphs emitted:
+85 → 5
+```
+
+说明 Bitty 的 compositor 已经进入真实优化阶段，而不是简单“把多个 terminal rectangle 画出来”。
+
+但这里也正是我认为目前 **最需要 hardening 的地方**。
+
+因为最近频繁出现：
+
+```text
+ViewId collision
+wrong session ownership
+split without shell
+grid/content-frame mismatch
+focus transition
+workspace lifecycle
+```
+
+这些全都是 **ownership / identity / lifecycle invariant** 问题。
+
+所以 M4 目前最准确的描述不是“功能少”，而是：
+
+> **核心模型已经成立，但 invariant 还在通过真实使用不断被发现和收紧。**
+
+---
+
+## 有一个有意思的不一致
+
+`panel-runtime-pre-study.md` 目前依然明确标记：
+
+> `draft research pre-study — not Accepted, not Verified, not normative`
+
+并且里面的 `PanelId / PanelRuntime / Event Bus` 仍然是 candidate contract。
+
+但代码实际上已经有：
+
+```text
+PanelId
+ViewId
+TerminalId
+PanelRuntime::mount
+async panel workers
+ViewContent::Panel
+panel decoration
+panel animations
+per-panel configuration
+```
+
+所以这里现在出现了：
+
+```text
+implementation reality
+        ↑
+        │
+panel runtime pre-study
+```
+
+也就是说 **code 已经部分超过这份 pre-study 的状态描述**。
+
+我建议接下来把它正式升级成：
+
+```text
+Panel Runtime RFC
+```
+
+而不是继续叫 `pre-study`。
+
+M4 已经到了应该冻结一批核心 invariant 的时候。
+
+---
+
+# M5 Plugin Ecosystem：已经突破一个重要节点
+
+这次 `bitty-docs` 最近还有一个很关键的同步：
+
+Plugin Host Runtime 的 host bridge、VM lifecycle、services，以及 XDG plugin store + integrity verification 已经进入主仓库。
+
+所以 M5 已经不能再简单描述为：
+
+> “有 Plugin API 设计。”
+
+而是开始拥有：
+
+```text
+Plugin API
+    ↓
+Lua VM
+    ↓
+Host bridge
+    ↓
+Service boundary
+    ↓
+Plugin store
+    ↓
+Integrity validation
+```
+
+这条链。
+
+目前真正还欠的是：
+
+```text
+reload / update lifecycle
+third-party SDK verification
+real independent plugins
+compatibility contract
+package UX
+```
+
+`OQ-072` 也正好在讨论 plugin reload/update triggers。
+
+因此我会把 M5 从原本的：
+
+> infrastructure-only
+
+稍微调整成：
+
+> **runtime infrastructure landed, ecosystem still immature**
+
+两者区别挺大的。
+
+---
+
+# M6：AI / Agent 最近膨胀得非常快
+
+这里是我看 `bitty-docs` 时最明显的变化。
+
+`ai-architecture.md` 现在已经到了 **12 万字节级别**，而且不仅是“接一个 LLM API”。
+
+它现在已经覆盖：
+
+```text
+ModelProvider
+ContextProvider
+Stable ID
+Context Budget
+Semantic Zone
+Agent Workspace
+Tool Bus
+Rich Streaming
+MCP
+multi-agent
+role / model / capability separation
+task / run / execution identity
+repository index
+LSP integration
+transactional edit
+workspace overlay
+evidence / provenance
+semantic compression
+CarryCtx backend boundary
+agent growth
+tool-call batching
+credential references
+```
+
+而且文档非常明确：Bitty 是：
+
+> **agent-friendly, not agent-centric terminal**
+
+AI/Agent 默认应该位于 Plugin/optional integration，而不是进入 terminal core。
+
+我非常赞成这个边界。
+
+最近又进一步形成：
+
+```text
+Bitty Core
+    │
+generic primitive
+    ▼
+bitty-ai
+    │
+AI plugins / agents
+    ▼
+providers
+OpenAI-compatible / Anthropic / Ollama / ...
+```
+
+并明确提出：
+
+> 如果 `bitty-ai` 为了实现 AI 功能必须要求 Core 增加一个 AI-specific API，首先应该怀疑是不是 Plugin API 缺少一个更通用的 abstraction。
+
+这个 **pressure-test gate** 是很好的架构原则。
+
+---
+
+# 但 `bitty-docs` 现在也开始有一个风险
+
+最近 Open Question 编号已经一路扩展到了：
+
+```text
+OQ-089
+```
+
+其中 OQ-057 之后大量是 AI / multi-agent / semantic terminal / compositor / accessibility / compatibility 相关问题。
+
+例如目前明确 Open 的包括：
+
+```text
+multi-agent role contract
+spatial orchestration
+semantic output compression
+CarryCtx boundary
+AgentId/TaskId/RunId/ExecutionId
+repository index
+LSP integration
+transactional edits
+evidence/provenance
+context budgets
+agent native services
+model routing
+agent growth
+tool batching
+ligature
+search UX
+keyboard selection
+notification
+Kitty extensions
+accessibility
+...
+```
+
+文档也明确写着其中大量内容“no implementation claim”。
+
+所以现在最值得防范的是：
+
+> **Bitty 从 architecture-first 进一步变成 architecture-expansion-first。**
+
+设计本身没有问题，但如果继续按照这两天这个速度增加 OQ，很容易出现：
+
+```text
+实现 30%
+验证 15%
+设计 200%
+```
+
+这对长期项目不是好事。
+
+---
+
+# 我现在最建议做的事情
+
+目前已经不是继续疯狂补想法的时候了，我会把接下来一段时间的优先级收敛到下面这几个方向：
+
+1. **把 `project-state.json` 更新机制自动化。** 它现在还是 **2026-09-08 / `29772a3`**，但主仓库已经在 9 月 13 日前进了非常多；它作为 canonical snapshot 已经明显滞后。Roadmap、TODO 也仍大量引用这份旧 snapshot。
+
+2. **M1/M2 不再扩 feature，重点做 Verification。** 建议围绕 shell、nvim、tmux、SSH、TUI、Unicode/CJK、mouse、clipboard、Kitty protocol 建一个真正的 compatibility matrix。
+
+3. **M4 作为当前最高优先级主线。** 把 `Workspace / View / Panel / Terminal / Focus / Session` 的 ownership 和 lifecycle invariant 固定下来，并对 split/move/close/zoom/workspace-switch/reload 做 state-machine/property testing。
+
+4. **把 Panel Runtime Pre-Study 升级成正式 RFC。** 实际代码已经走到前面了，再继续让它停留在 pre-study 会产生 documentation drift。
+
+5. **M5 完成 Plugin Runtime → Plugin Ecosystem 的跨越。** Plugin reload/update、SDK compatibility、一个真正独立安装的插件，是比继续增加 Plugin API surface 更重要的验证。
+
+6. **AI 架构可以继续研究，但暂时不要继续大量进入 Core。** `bitty-ai` 独立 plugin/sub-platform 的方向非常合理；先拿 Bitty 的 Panel + IPC + Tool Bus + Rich primitives 做一个 vertical slice，反过来验证 abstraction 是否够用。
+
+7. **给 Open Question 设置 admission rule。** 例如新的 OQ 必须是“阻塞当前 milestone”或者“解决现有 implementation evidence 暴露的问题”；纯未来想法先进入 `research-notes`，不要立刻进入 canonical OQ register。
+
+---
+
+# 我对当前 Bitty 的阶段判断
+
+如果把 Bitty 的演化画成：
+
+```text
+Idea
+ │
+Architecture
+ │
+Terminal Prototype
+ │
+Correct Terminal
+ │
+Usable Terminal
+ │
+Terminal Platform
+ │
+Plugin Platform
+ │
+Programmable Workspace
+ │
+Agent Workspace
+```
+
+那么目前大概已经从：
+
+```text
+Terminal Prototype
+```
+
+真正走到了：
+
+```text
+       Correct Terminal
+              ↓
+       Usable Terminal
+              ↓
+     ┌─ Terminal Platform ─┐
+     │                     │
+ Workspace/Panel      Plugin Runtime
+```
+
+而：
+
+```text
+Programmable Workspace
+Agent Workspace
+```
+
+已经在文档中被设计得相当深入，但还不能算项目真实成熟度的一部分。
+
+所以现在 Bitty 最大的变化不是“又多了几个功能”，而是 **它的核心形态已经开始确定**：
+
+> **Terminal Truth 是底座，Workspace/View/Panel 是空间模型，Plugin 是扩展模型，IPC 是跨进程模型，Rich 是表现模型，而 AI/Agent 只是建立在这些 generic primitives 上的一种高级 application。**
+
+这个架构现在越来越清晰。
+
+我认为接下来 **1 个阶段最重要的关键词应该从 `Design` 切换成 `Verification + Dogfooding + Invariant Hardening`**。如果这一轮做扎实，Bitty 才算真正从“设计非常先进的 pre-alpha”进入“已经可以长期自用的 terminal”。
+
+这个项目最近提交非常密集；如果你愿意，我也可以给你做成每天或每周一次的 **Bitty / bitty-docs 进度摘要**，专门跟踪 milestone、OQ、RFC 和实现之间的变化。

@@ -1,0 +1,619 @@
+你可以查一查现在主流的各个 AI Harness 的 Core Prompt 分别是多少 Token 呢？比如 Claude Code, Codex, OpenCode, Pi Agent, Kiro 这些呢？然后 Bitty 大概是多少呢
+
+可以。这里最重要的是先统一口径：**“Core Prompt 有多少 Token”不能直接等于“Agent 第一次请求占多少 Token”**。
+
+通常一次 Coding Agent 请求实际上是：
+
+$$
+\text{Base/Core Prompt}
++\text{Tool Schemas}
++\text{Runtime Context}
++\text{Project Instructions}
++\text{Skills/MCP}
++\text{Conversation}
+$$
+
+所以我查下来，当前几个 Harness 的差异其实很有意思。
+
+## 当前大致对比
+
+| Harness         |    Core / Base Prompt |     默认启动后的实际固定开销 | 特点                                      |
+| --------------- | --------------------: | ---------------: | --------------------------------------- |
+| **Pi**          | **约 500–1000 tokens** |        通常约 1–3K+ | 极简主义                                    |
+| **OpenCode**    |            **约 2–3K** |       通常约 4–10K+ | Provider-specific                       |
+| **Codex**       |        **约 2.5–4.5K** |        通常约 4–8K+ | 不同模型有不同 Base                            |
+| **Claude Code** |       **约 3–5K core** |   **常见约 10–15K** | 很多 conditional prompt/tool instructions |
+| **Kiro CLI**    |         **官方未公开可靠数字** | 数 K 级较合理，但无法精确确认 | hardcoded + layered context             |
+| **Bitty（我建议）**  |          **700–1500** |       **2.5–5K** | Core 小，能力按需加载                           |
+
+这里“实际固定开销”只是量级，不包含项目特别巨大的 `AGENTS.md`、`.bitty`、几十个 MCP、几十个 Skills 等。
+
+而且 tokenizer 不同，所以跨模型比较只能看数量级。Claude 的 token 不能直接用 OpenAI tokenizer 精确计算；Claude Code prompt 收集项目也特别提醒，`tiktoken` 对 Claude 常会低估。([GitHub][1])
+
+---
+
+# 1. Pi：真的非常小
+
+Pi 是这里最有意思的。
+
+它当前的默认 System Prompt 构造器是公开的，核心内容实际上就这些：
+
+```text
+You are an expert coding assistant operating inside pi,
+a coding agent harness.
+
+Available tools:
+...
+
+Guidelines:
+- ...
+- Be concise in your responses
+- Show file paths clearly when working with files
+
+Pi documentation:
+...
+```
+
+然后最后追加：
+
+```text
+Project Context
+Skills
+Current working directory
+```
+
+源码里默认只有：
+
+```text
+read
+bash
+edit
+write
+```
+
+四个工具，而且 Tool Prompt 只放一行摘要，详细 schema 走 tool API。
+
+Pi 官方也明确把 **minimal system prompt** 当作 Context Engineering 的设计特点，而且允许 `SYSTEM.md` 整体替换、`APPEND_SYSTEM.md` 追加。([Pi][2])
+
+所以 Pi 的纯 Core：
+
+$$
+\boxed{\approx 500\sim1000\ tokens}
+$$
+
+甚至在最基础配置下可以更低。
+
+这和 Pi 的哲学完全一致：
+
+> Harness 本身尽量什么都不教模型，能力通过 Tool / Extension / Skill 构建。
+
+第三方实际分析也把 Pi 默认 system prompt 描述为 **under 1,000 tokens**。([数据力][3])
+
+---
+
+# 2. OpenCode：大约 2K 左右起步
+
+OpenCode 就明显比 Pi 大一档。
+
+它现在不是一个 Prompt，而是针对模型选择不同模板：
+
+```text
+anthropic.txt
+default.txt
+beast.txt
+gemini.txt
+gpt.txt
+kimi.txt
+meta.txt
+codex.txt
+trinity.txt
+...
+```
+
+选择逻辑就在 `SystemPrompt.provider()`。([GitHub][4])
+
+当前 `dev`：
+
+* `default.txt`：**8.33 KB**
+* `anthropic.txt`：**8.02 KB**
+* `meta.txt`：**8.94 KB**
+* `copilot-gpt-5.txt`：**13.9 KB**
+
+([GitHub][5])
+
+英文 Prompt 粗略换算后：
+
+$$
+8KB \approx 2K\ tokens
+$$
+
+所以 OpenCode 的普通 Core Prompt 可以认为：
+
+$$
+\boxed{\approx2,000\sim3,000\ tokens}
+$$
+
+某些模型专用 Prompt 会到：
+
+$$
+3,000\sim4,000+
+$$
+
+而且它还会追加：
+
+```text
+Environment
+Skills
+MCP
+Project instructions
+```
+
+所以实际请求肯定比这个大。
+
+---
+
+## OpenCode 有一个值得 Bitty 注意的问题
+
+OpenCode 曾经有用户报告：
+
+> 新 Session 在还没发第一句话之前就有约 **68K tokens**。
+
+但这不是 OpenCode 原生 Core 有 68K。
+
+那个环境是：
+
+```text
+~100 Skills
++
+50+ Tools
++
+Agent orchestration instructions
++
+Superpowers
+...
+```
+
+导致 Tool Schema 和 Skill Catalog 把 Context 撑爆。([GitHub][6])
+
+这正好说明：
+
+$$
+\boxed{\text{Core Prompt 小} \neq \text{实际 Harness Context 小}}
+$$
+
+对于 Bitty 这是一个很值得避免的问题。
+
+---
+
+# 3. Codex：现在可以拿到非常具体的数据
+
+Codex 现在做得更细：
+
+> **不同 Model 可以有不同的 `base_instructions`。**
+
+OpenAI Codex 当前源码的 Model Registry 就直接携带这些 instructions。([GitHub][7])
+
+最近的 Codex Prompt 跟踪项目把它们实际算成：
+
+| Model         | Base Instructions |
+| ------------- | ----------------: |
+| GPT-5.3-Codex |  **2,551 tokens** |
+| GPT-5.4-mini  |  **2,639 tokens** |
+| GPT-5.4       |  **2,991 tokens** |
+| GPT-5.5       |  **4,429 tokens** |
+| GPT-5.2       |  **4,570 tokens** |
+| Fallback      |  **4,371 tokens** |
+
+([GitHub][8])
+
+所以 Codex 可以非常合理地概括成：
+
+$$
+\boxed{2.5K\sim4.5K}
+$$
+
+而不是一个固定数字。
+
+这也说明一个很有意思的方向：
+
+> **Harness Prompt 不一定应该 model-agnostic。**
+
+例如模型已经针对 Agent / Tool Use 做过专门训练，就没有必要重复解释大量行为。
+
+---
+
+# 4. Claude Code：Core 不一定夸张，但完整 Harness 很重
+
+Claude Code 是最容易出现“到底算什么”的。
+
+截至 **2026 年 9 月**，Claude Code 已经不是：
+
+```text
+system_prompt = "..."
+```
+
+这种结构。
+
+逆向跟踪项目已经找出了 **500+ 个 Prompt fragments**，包括：
+
+```text
+System Prompt
+Tool Description
+System Reminder
+Plan
+Explore
+Agent
+Compact
+Memory
+Hooks
+Skills
+Workflow
+...
+```
+
+而且很多都是 conditional。该项目持续跟踪 Claude Code 2.1.x 系列，在 9 月版本仍在快速更新。([GitHub][9])
+
+比如当前能看到：
+
+```text
+Harness instructions       374 tokens
+Communication style        297
+Executing actions          1105
+Memory instructions        487
+Subagent guidance          ...
+...
+```
+
+([GitHub][10])
+
+所以如果只把普通交互所需的 Core pieces 拼起来，大约：
+
+$$
+\boxed{3K\sim5K}
+$$
+
+是比较合理的量级。
+
+---
+
+## 但是 Claude Code 的 Tool Prompt 很大
+
+比如它的一些 Tool Description 本身就是：
+
+```text
+Agent usage notes       1602 tokens
+Background Monitor      2082
+Bash Git/PR rules       2357
+Workflow                1118
+Read                    586
+WebSearch               319
+Write                   266
+...
+```
+
+([GitHub][10])
+
+所以普通 Claude Code 第一次完整请求：
+
+$$
+Core
++
+Tool\ Descriptions
++
+Environment
++
+CLAUDE.md
++\dots
+$$
+
+达到：
+
+$$
+\boxed{10K\sim15K}
+$$
+
+并不奇怪。
+
+有 OpenCode 的性能讨论也拿 Claude Code 的首次 system overhead 作参照，给出的数量级就是约 `10–15K`。([GitHub][6])
+
+因此：
+
+> Claude Code 不是“一个 15K 的 Core Prompt”，而是 **Core + 大量工具/条件指令组合后很容易达到 10–15K**。
+
+这个区别很重要。
+
+---
+
+# 5. Kiro：目前不能负责任地给一个精确值
+
+Kiro 是这里比较麻烦的，因为它不像：
+
+```text
+Pi
+OpenCode
+Codex
+```
+
+那样可以直接从完整开源源码看到 Prompt assembler。
+
+现在可以确认的是，Kiro CLI 有自己的 hardcoded system layer。
+
+例如有人已经发现其中包含：
+
+```text
+<default_to_action>
+...
+</default_to_action>
+```
+
+而 Custom Agent 的 `prompt` 在某些版本里作为更低优先级 Context Entry 注入，因此甚至可能和 Kiro 自己的 System Prompt 冲突。([GitHub][11])
+
+Kiro 当前官方文档也明确区分：
+
+```text
+built-in runtime
+custom agent prompt
+steering
+skills
+resources
+MCP
+tools
+permissions
+```
+
+现在 CLI 3.0 的 Custom Agent 已经可以使用 Markdown body 作为自定义 prompt。([Kiro][12])
+
+但：
+
+> **我没有找到 Kiro 官方公开的当前 Core Prompt token count。**
+
+有第三方 Kiro Provider 曾经专门把 system prompt **cap 到 4096 tokens**，但这个 `4096` 是 adapter 的限制，**不能反推出 Kiro Core 就是 4096**。([GitHub][13])
+
+所以我宁愿把它写成：
+
+$$
+\boxed{\text{Unknown / not reliably measurable publicly}}
+$$
+
+而不是编一个 3K/4K 数字。
+
+---
+
+# 6. 那么 Bitty 应该是多少？
+
+结合我们前面已经讨论的 Bitty Runtime，我反而认为：
+
+> **Bitty 不应该向 Claude Code 的 3–5K Core 靠拢，而应该更接近 Pi。**
+
+但比 Pi 稍微多一点。
+
+因为 Pi 几乎只有：
+
+```text
+filesystem
+bash
+edit
+write
+```
+
+Bitty 本身还有独特 Runtime Concept：
+
+```text
+Workspace
+Panel
+Headed Panel
+Headless Panel
+Agent
+Session
+Task
+Process
+Plugin
+Skill
+```
+
+而且需要告诉模型非常重要的 invariant，例如：
+
+```text
+Agent lifetime != Panel lifetime
+
+Panel lifetime != Process lifetime
+
+A headed panel may belong primarily to the user.
+
+An agent may inspect an existing panel.
+
+A headless panel may be used as an agent workspace.
+
+Do not assume runtime state; inspect it through tools.
+```
+
+这些确实应该属于 Core Runtime Contract。
+
+因此我建议：
+
+$$
+\boxed{
+Bitty\ Core\ Prompt
+\approx700\sim1500\ tokens
+}
+$$
+
+我个人会把目标定在：
+
+$$
+\boxed{\approx1000\ tokens}
+$$
+
+上下。
+
+---
+
+# 7. Bitty 的预算可以这样定
+
+我会把它当成一个正式的 **Context Budget**：
+
+| 部分                                  |       建议 Token |
+| ----------------------------------- | -------------: |
+| Bitty identity + Runtime Contract   |        300–500 |
+| Agent / Panel / Workspace semantics |        250–400 |
+| Tool usage generic rules            |        150–250 |
+| Safety / permission / state rules   |        150–250 |
+| Output / interaction rules          |        100–200 |
+| **Core 合计**                         | **~800–1,300** |
+| Tool schemas                        |    1,000–2,500 |
+| Runtime environment                 |        100–300 |
+| `.bitty` project instructions       |       Variable |
+| Active Skills                       |       Variable |
+
+于是一个刚启动的普通 Bitty Coding Agent，可以争取：
+
+$$
+\boxed{2.5K\sim5K\ tokens}
+$$
+
+就进入第一次 User Prompt。
+
+这已经很舒服了。
+
+---
+
+# 8. Bitty 最好不要把 Panel 文档全部塞进 Core
+
+比如绝对不要：
+
+```text
+# Panel API
+
+panel.create(...)
+panel.close(...)
+panel.resize(...)
+panel.move(...)
+panel.focus(...)
+panel.history(...)
+panel.capture(...)
+panel.attach(...)
+...
+```
+
+全部写 3000 tokens。
+
+Core 只说：
+
+```text
+Panels are persistent terminal execution contexts.
+They may be headed or headless.
+Agents and panels have independent lifetimes.
+
+Use panel inspection tools when panel state is needed.
+```
+
+大约几十 tokens。
+
+然后 Tool Schema 自己告诉模型：
+
+```text
+panel.inspect
+panel.history
+panel.create
+```
+
+如果模型真的需要深入了解：
+
+```text
+runtime.describe("panel")
+```
+
+或者：
+
+```text
+skill://bitty/panel
+```
+
+再动态加载。
+
+所以应该是：
+
+```text
+                         Bitty Core
+                         ~1000 tk
+                             │
+          ┌──────────────────┼──────────────────┐
+          │                  │                  │
+       Tools              Skills          Runtime Docs
+     lazy/schema          lazy-load          on-demand
+          │                  │                  │
+          └──────────────────┴──────────────────┘
+```
+
+而不是：
+
+```text
+Bitty Core
+   │
+   └── EVERYTHING
+       10,000+ tokens
+```
+
+---
+
+# 9. 我反而觉得 Pi 是 Bitty 最值得参考的对象
+
+不是说 Bitty 要像 Pi 那么极端，而是这个理念：
+
+$$
+\boxed{
+Core\ teaches\ semantics,
+Tools\ expose\ capabilities,
+Skills\ teach\ workflows
+}
+$$
+
+我觉得特别适合 Bitty。
+
+Claude Code 更像：
+
+> Harness 很聪明，大量行为直接通过 Prompt 精细调教。
+
+Pi 更像：
+
+> Harness Core 很薄，把 Agent 能力交给 Extension/Skill/Tool。
+
+而 Bitty 可以处于两者之间：
+
+```text
+Pi
+~0.5–1K
+      \
+       \
+        Bitty
+        ~1K
+           \
+            \
+          OpenCode
+           ~2–3K
+                \
+                 Codex
+                ~2.5–4.5K
+                     \
+                   Claude Code
+                   ~3–5K Core
+                   ~10–15K assembled
+```
+
+我认为 **Bitty Core 控制在 ~1K tokens 是一个很漂亮的目标**。
+
+而且这还能和我们刚才说的 KV/Prefix Cache 设计自然统一：这约 1K 的 **Bitty Runtime Contract 可以做到版本内完全 immutable**，放在整个 Context 最前面，后面依次是 User → `.bitty` → Agent profile → append-only history → runtime delta。这样不仅 Prompt 干净，也天然是一个非常 cache-friendly 的 Harness。
+
+[1]: https://github.com/Piebald-AI/claude-code-system-prompts/blob/main/system-prompts/data-token-counting-reference.md?utm_source=chatgpt.com "claude-code-system-prompts/system-prompts/data-token-counting-reference.md at main · Piebald-AI/claude-code-system-prompts · GitHub"
+[2]: https://pi.dev/?utm_source=chatgpt.com "Pi Coding Agent"
+[3]: https://dataforcee.us/2026/07/16/working-with-pi-coding-agents/?utm_source=chatgpt.com "Working with Pi Coding Agents - Dataforcee Digital"
+[4]: https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/session/system.ts?utm_source=chatgpt.com "opencode/packages/opencode/src/session/system.ts at dev · anomalyco/opencode · GitHub"
+[5]: https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/session/prompt/default.txt?utm_source=chatgpt.com "opencode/packages/opencode/src/session/prompt/default.txt at dev · anomalyco/opencode · GitHub"
+[6]: https://github.com/anomalyco/opencode/issues/26661?utm_source=chatgpt.com "[FEATURE] Reduce initial system prompt token overhead (~68k tokens before first user message) · Issue #26661 · anomalyco/opencode · GitHub"
+[7]: https://github.com/openai/codex/blob/main/codex-rs/core/models.json?utm_source=chatgpt.com "codex/codex-rs/core/models.json at main · openai/codex · GitHub"
+[8]: https://github.com/kekmodel/codex-system-prompts "GitHub - kekmodel/codex-system-prompts: Unofficial mirror of OpenAI Codex prompt strings — version-tracked, fragment-level. Modeled on Piebald's claude-code-system-prompts. · GitHub"
+[9]: https://github.com/piebald-ai/claude-code-system-prompts?ref=www.awesomepython.org&utm_source=chatgpt.com "GitHub - Piebald-AI/claude-code-system-prompts at www.awesomepython.org · GitHub"
+[10]: https://github.com/piebald-ai/claude-code-system-prompts?ref=www.awesomepython.org "GitHub - Piebald-AI/claude-code-system-prompts at www.awesomepython.org · GitHub"
+[11]: https://github.com/kirodotdev/Kiro/issues/7792?utm_source=chatgpt.com "[CLI] System prompt <default_to_action> directive overrides agent prompt constraints - no precedence hierarchy between prompt layers · Issue #7792 · kirodotdev/Kiro · GitHub"
+[12]: https://kiro.dev/docs/custom-agents/configuration-reference/?utm_source=chatgpt.com "Configuration reference - Custom agents - Features - Docs - Kiro"
+[13]: https://github.com/mikeyobrien/pi-provider-kiro/blob/main/CHANGELOG.md?utm_source=chatgpt.com "pi-provider-kiro/CHANGELOG.md at main · mikeyobrien/pi-provider-kiro · GitHub"
