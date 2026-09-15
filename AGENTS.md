@@ -36,7 +36,7 @@
 
 - English-only for everything except `origin/` (originals keep their source
   language).
-- No host-specific absolute paths (`/home/…`, `/mnt/…`), usernames, or
+- No host-specific absolute paths (user home directories, checkout paths), usernames, or
   machine layout anywhere durable.
 - `origin/` is excluded from lint; everything else must pass `markdownlint-cli2`.
 
