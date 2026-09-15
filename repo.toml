@@ -1,0 +1,8 @@
+# research: workspace identity descriptor (kind/lang/role mirror workspace.toml).
+[repo]
+name = "research"
+kind = "archive"
+lang = "md"
+role = "research archive: discussions + reviews (mirrored to org)"
+owner = "TBD"
+docs = "self"
