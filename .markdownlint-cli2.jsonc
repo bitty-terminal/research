@@ -7,5 +7,5 @@
     "MD041": false,
   },
   "globs": ["**/*.md"],
-  "ignores": ["origin/**"],
+  "ignores": ["origin/**", ".carryctx"],
 }
