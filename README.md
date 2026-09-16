@@ -42,59 +42,62 @@ To add new research:
 
 ## Index — discussion records
 
-| NNN | Status   | One-liner                                                                           |
-| --- | -------- | ----------------------------------------------------------------------------------- |
-| 001 | Captured | Mechanisms in Core, policy and UX in Plugins                                        |
-| 002 | Captured | Panels as app containers, IPC as extension protocol                                 |
-| 003 | Captured | Minimal core plus infinite composition for terminals                                |
-| 004 | Captured | Warp sessions plus Hermes growth runtime for agents                                 |
-| 005 | Captured | Five terminal routes; Bitty aims programmable shell                                 |
-| 006 | Captured | Prove terminal foundation before plugin ecosystem                                   |
-| 007 | Captured | Code outran docs; global alignment needed                                           |
-| 008 | Captured | Commands as objects; keyboard addresses everything                                  |
-| 009 | Captured | Layered complexity defines composable workspace identity                            |
-| 010 | Captured | Spatial multi-agent with minimal-sufficient context                                 |
-| 011 | Captured | Native agent services with Lua policy, Rust enforcement                             |
-| 012 | Captured | Batch tool calls, parallel rounds, reuse LSP                                        |
-| 013 | Captured | Programmable terminal workspace panorama with multi-agent support                   |
-| 014 | Captured | Calibrate panorama, freeze core ontology and invariants                             |
-| 015 | Captured | Echo-off password detection with graded agent safety                                |
-| 016 | Captured | Alt modifier with spatial badges for one-handed actions                             |
-| 017 | Captured | Harden terminal, validate workspace, tighten invariants                             |
-| 018 | Captured | Standalone AI runtime owning context, permissions, events                           |
-| 019 | Captured | Submodule composition with isolated ownership, integrated workspace                 |
-| 020 | Captured | Pixel mascot with modern graphics, per-panel scaling                                |
-| 021 | Captured | Shared toolchain, organized collaboration, compilable context                       |
-| 022 | Captured | Mechanisms in core, workflows in plugins, compressed views                          |
-| 023 | Captured | Docs are good enough; move into runtime implementation                              |
-| 024 | Captured | Stop design inflation; reconcile, extract, harden                                   |
-| 025 | Captured | Stable content first, appends last, hit rate first                                  |
-| 026 | Captured | Built-ins teach semantics, runtime owns capabilities                                |
-| 027 | Captured | Core around a thousand words, capabilities on demand                                |
-| 028 | Captured | Remove empty shells, deduplicate, fix identity ownership                            |
-| 029 | Captured | Core stays offline, extensions cross controlled boundaries                          |
-| 030 | Captured | Keep kernel minimal, third parties in adapters                                      |
-| 031 | Captured | Terminal snapshot and tool gateway block AI integration                             |
-| 032 | Captured | Core defines models, plugins handle vendors and subscriptions                       |
-| 033 | Captured | Unify multimodal lifecycles, keep per-modality request shapes                       |
-| 034 | Captured | Fix existing packaging chain before adding distribution formats                     |
-| 035 | Captured | Separate image protocols from appearance and compositing system                     |
-| 036 | Captured | Inherit pane environment via prompt sync, masked for agents                         |
-| 037 | Captured | Split config/data/state/cache, shard storage per session                            |
-| 038 | Captured | Core emits events, history plugins reuse external shell history                     |
-| 039 | Captured | Panel is a workspace container; activity keeps sessions alive                       |
-| 040 | Captured | Plugins form dependency, service, and extension graphs                              |
-| 041 | Captured | IPC is a second plugin boundary sharing one capability model                        |
-| 042 | Captured | Separate dependency kinds; firewall Core; own release compatibility                 |
-| 043 | Captured | Native, VM, and physical test tiers with QEMU/libvirt VMs                           |
-| 044 | Partial  | Job/Execution first-class under a supervisor; bitty mechanisms captured, ai pending |
+| NNN | Status   | One-liner                                                                                |
+| --- | -------- | ---------------------------------------------------------------------------------------- |
+| 001 | Captured | Mechanisms in Core, policy and UX in Plugins                                             |
+| 002 | Captured | Panels as app containers, IPC as extension protocol                                      |
+| 003 | Captured | Minimal core plus infinite composition for terminals                                     |
+| 004 | Captured | Warp sessions plus Hermes growth runtime for agents                                      |
+| 005 | Captured | Five terminal routes; Bitty aims programmable shell                                      |
+| 006 | Captured | Prove terminal foundation before plugin ecosystem                                        |
+| 007 | Captured | Code outran docs; global alignment needed                                                |
+| 008 | Captured | Commands as objects; keyboard addresses everything                                       |
+| 009 | Captured | Layered complexity defines composable workspace identity                                 |
+| 010 | Captured | Spatial multi-agent with minimal-sufficient context                                      |
+| 011 | Captured | Native agent services with Lua policy, Rust enforcement                                  |
+| 012 | Captured | Batch tool calls, parallel rounds, reuse LSP                                             |
+| 013 | Captured | Programmable terminal workspace panorama with multi-agent support                        |
+| 014 | Captured | Calibrate panorama, freeze core ontology and invariants                                  |
+| 015 | Captured | Echo-off password detection with graded agent safety                                     |
+| 016 | Captured | Alt modifier with spatial badges for one-handed actions                                  |
+| 017 | Captured | Harden terminal, validate workspace, tighten invariants                                  |
+| 018 | Captured | Standalone AI runtime owning context, permissions, events                                |
+| 019 | Captured | Submodule composition with isolated ownership, integrated workspace                      |
+| 020 | Captured | Pixel mascot with modern graphics, per-panel scaling                                     |
+| 021 | Captured | Shared toolchain, organized collaboration, compilable context                            |
+| 022 | Captured | Mechanisms in core, workflows in plugins, compressed views                               |
+| 023 | Captured | Docs are good enough; move into runtime implementation                                   |
+| 024 | Captured | Stop design inflation; reconcile, extract, harden                                        |
+| 025 | Captured | Stable content first, appends last, hit rate first                                       |
+| 026 | Captured | Built-ins teach semantics, runtime owns capabilities                                     |
+| 027 | Captured | Core around a thousand words, capabilities on demand                                     |
+| 028 | Captured | Remove empty shells, deduplicate, fix identity ownership                                 |
+| 029 | Captured | Core stays offline, extensions cross controlled boundaries                               |
+| 030 | Captured | Keep kernel minimal, third parties in adapters                                           |
+| 031 | Captured | Terminal snapshot and tool gateway block AI integration                                  |
+| 032 | Captured | Core defines models, plugins handle vendors and subscriptions                            |
+| 033 | Captured | Unify multimodal lifecycles, keep per-modality request shapes                            |
+| 034 | Captured | Fix existing packaging chain before adding distribution formats                          |
+| 035 | Captured | Separate image protocols from appearance and compositing system                          |
+| 036 | Captured | Inherit pane environment via prompt sync, masked for agents                              |
+| 037 | Captured | Split config/data/state/cache, shard storage per session                                 |
+| 038 | Captured | Core emits events, history plugins reuse external shell history                          |
+| 039 | Captured | Panel is a workspace container; activity keeps sessions alive                            |
+| 040 | Captured | Plugins form dependency, service, and extension graphs                                   |
+| 041 | Captured | IPC is a second plugin boundary sharing one capability model                             |
+| 042 | Captured | Separate dependency kinds; firewall Core; own release compatibility                      |
+| 043 | Captured | Native, VM, and physical test tiers with QEMU/libvirt VMs                                |
+| 044 | Partial  | Job/Execution first-class under a supervisor; bitty mechanisms captured, ai pending      |
+| 045 | Partial  | Lua composes workflows; Core enforces capability, resource, lease, and secret boundaries |
 
-All records are captured except 044, which is **Partial**: its bitty-owned
-mechanisms are captured as a draft page in `bitty-docs`
+All records are captured except 044 and 045, which are **Partial**: 044's
+bitty-owned mechanisms are captured as a draft page in `bitty-docs`
 (`development/execution-host-boundary.md`, DIR-026) through PR bitty-docs#321
-(open, not merged), while the record's bitty-ai-owned semantics remain
-owner-pending in `bitty-ai-docs` — `origin/044.md` therefore stays unrenamed.
-024 is captured in `bitty-docs` (documentation workflow,
+(open, not merged), and 045's bitty-upstream mechanisms as a draft page in
+`bitty-docs` (`development/agent-authority-boundary.md`, DIR-027) through PR
+bitty-docs#323 (open, not merged), while both records' bitty-ai-owned semantics remain
+owner-pending in `bitty-ai-docs` — `origin/044.md` and `origin/045.md`
+therefore stay unrenamed. 024 is captured in `bitty-docs` (documentation workflow,
 DIR-015, project state snapshot, Phase A reconciliation) and 030 in
 `bitty-ai-docs` (`specifications/dependency-strategy.md`). Records 039-041 are
 captured for the plugin direction in `bitty-plugins-docs` (CTX-0019, CTX-0020)
