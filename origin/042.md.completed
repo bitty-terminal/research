@@ -1,0 +1,4266 @@
+## 核心要先区分：源码依赖、构建依赖、运行时依赖
+
+对于 Bitty 这种 Rust 项目，可以把依赖理解成一张 **Dependency Graph（依赖图）**。
+
+比如未来：
+
+```text
+bitty
+├── bitty-core
+│   ├── winit
+│   └── ...
+├── bitty-plugin-host
+│   └── piccolo
+├── bitty-ai
+│   ├── bitty-ipc
+│   ├── reqwest
+│   ├── serde
+│   └── tokio
+├── bitty-ipc
+│   ├── serde
+│   └── tokio
+└── bitty-sync
+    ├── reqwest
+    ├── serde
+    └── tokio
+```
+
+这里虽然：
+
+* `bitty-ai` → `reqwest`
+* `bitty-sync` → `reqwest`
+* `bitty-ai` → `tokio`
+* `bitty-ipc` → `tokio`
+* `bitty-sync` → `tokio`
+
+**并不意味着最终程序里面真的会塞三份 `reqwest` 和三份 `tokio`。**
+
+Cargo 会负责解析整个 dependency graph。
+
+---
+
+# 1. Rust / Cargo 是怎么处理重复依赖的？
+
+假设：
+
+```toml
+# bitty-ai/Cargo.toml
+[dependencies]
+reqwest = "0.13"
+serde = "1"
+```
+
+另一个：
+
+```toml
+# bitty-sync/Cargo.toml
+[dependencies]
+reqwest = "0.13"
+serde = "1"
+```
+
+最终：
+
+```text
+bitty
+├─ bitty-ai
+│  ├─ reqwest 0.13
+│  └─ serde 1.x
+│
+└─ bitty-sync
+   ├─ reqwest 0.13
+   └─ serde 1.x
+```
+
+Cargo resolver 会尽量得到：
+
+```text
+                  ┌── bitty-ai
+reqwest 0.13.x ───┤
+                  └── bitty-sync
+
+                  ┌── bitty-ai
+serde 1.x ────────┤
+                  └── bitty-sync
+```
+
+也就是**共享同一个解析出来的 crate version**。
+
+所以一般不需要你自己做：
+
+```text
+bitty-common-network
+    ↓
+统一包装 reqwest
+```
+
+仅仅为了“避免重复依赖”而创建这种 abstraction，通常没有必要。
+
+---
+
+# 2. 但 Cargo 不保证永远只有一个版本
+
+这是 Rust dependency management 一个非常重要的地方。
+
+比如：
+
+```text
+bitty-ai
+└── foo
+    └── some-lib 1.x
+
+bitty-plugin
+└── bar
+    └── some-lib 2.x
+```
+
+那么 Cargo 完全允许：
+
+```text
+some-lib v1.x
+some-lib v2.x
+```
+
+同时存在。
+
+你可以运行：
+
+```bash
+cargo tree
+```
+
+看到完整依赖树。
+
+例如：
+
+```text
+bitty v0.5.0
+├── winit v0.x
+├── piccolo v0.x
+├── bitty-ai
+│   ├── reqwest v0.x
+│   ├── serde v1.x
+│   └── tokio v1.x
+└── bitty-ipc
+    ├── serde v1.x
+    └── tokio v1.x
+```
+
+检查重复版本尤其可以用：
+
+```bash
+cargo tree --duplicates
+```
+
+这个对以后 Bitty 非常有用。
+
+---
+
+# 3. Workspace 可以统一 Bitty 的依赖版本
+
+如果未来你把 Bitty 做成 Cargo workspace，我会很建议采用：
+
+```text
+bitty/
+├── Cargo.toml
+├── crates/
+│   ├── bitty-core/
+│   ├── bitty-terminal/
+│   ├── bitty-ipc/
+│   ├── bitty-plugin/
+│   ├── bitty-config/
+│   └── bitty-ai/
+└── src/
+```
+
+根目录：
+
+```toml
+[workspace]
+resolver = "3"
+members = [
+    "crates/bitty-core",
+    "crates/bitty-terminal",
+    "crates/bitty-ipc",
+    "crates/bitty-plugin",
+    "crates/bitty-config",
+    "crates/bitty-ai",
+]
+
+[workspace.dependencies]
+serde = "1"
+tokio = "1"
+reqwest = "0.13"
+tracing = "0.1"
+```
+
+然后：
+
+```toml
+# crates/bitty-ai/Cargo.toml
+
+[dependencies]
+serde.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+```
+
+另一个：
+
+```toml
+# crates/bitty-ipc/Cargo.toml
+
+[dependencies]
+serde.workspace = true
+tokio.workspace = true
+```
+
+这样最大的意义不是“Cargo 原本不会复用”，而是：
+
+> **Bitty 项目自己统一声明 dependency policy。**
+
+以后升级：
+
+```toml
+tokio = "1"
+```
+
+只需要在 workspace root 管理。
+
+这很适合 Bitty 这种未来可能发展成十几个 crates 的项目。
+
+---
+
+# 4. Cargo.lock 又负责什么？
+
+可以理解成两层：
+
+```text
+Cargo.toml
+    ↓
+“我接受哪些版本”
+
+Cargo resolver
+    ↓
+计算完整 Dependency Graph
+
+Cargo.lock
+    ↓
+“这次项目最终确定使用哪些具体版本”
+```
+
+例如你写：
+
+```toml
+serde = "1"
+```
+
+最后 lock file 可能锁定：
+
+```text
+serde 1.0.228
+```
+
+所以对于 Bitty 这种 application，通常应该把：
+
+```text
+Cargo.lock
+```
+
+提交到 Git。
+
+这样开发机、CI、release build 使用的依赖解析结果更加稳定。
+
+---
+
+# 5. “复用依赖”其实有三种完全不同的含义
+
+你刚才的问题里面，这个区别很重要。
+
+### 第一层：源码/下载复用
+
+Cargo 有全局 cache。
+
+假设：
+
+```text
+bitty
+carryctx
+another-rust-project
+```
+
+全部使用：
+
+```text
+serde 1.0.228
+```
+
+Cargo 不需要每个项目都重新下载完整的一份 crate source。
+
+---
+
+### 第二层：编译产物复用
+
+Cargo 会利用：
+
+```text
+target/
+```
+
+保存编译 artifacts。
+
+但不同：
+
+```text
+features
+target triple
+rustflags
+profile
+compiler version
+```
+
+可能导致重新编译。
+
+所以“同一个 crate”并不意味着任何情况下都能共享同一个编译 artifact。
+
+---
+
+### 第三层：最终 binary
+
+这是你对 Bitty 最关心的。
+
+假设：
+
+```text
+bitty-ai ────────┐
+                 ├── serde
+bitty-ipc ───────┘
+```
+
+如果解析成兼容的同一个 `serde` package/version，最终不会因为两个 Bitty crate 都声明了它，就简单地复制两份完全相同的 Rust crate implementation。
+
+但如果出现：
+
+```text
+foo → some-lib 1.x
+bar → some-lib 2.x
+```
+
+则最终 binary **可能同时包含两个版本的代码**。
+
+另外，编译器和 linker 还有：
+
+* monomorphization
+* dead code elimination
+* LTO
+* symbol optimization
+
+等机制，所以最终 binary 的组成不能简单等同于 `Cargo.toml` 依赖数量。
+
+---
+
+# 6. Feature 才是 Bitty 以后更应该关注的问题
+
+例如未来：
+
+```toml
+reqwest = {
+    version = "0.13",
+    default-features = false,
+    features = ["rustls"]
+}
+```
+
+而某个 crate 又写：
+
+```toml
+reqwest = {
+    version = "0.13",
+    features = ["json"]
+}
+```
+
+Cargo 对同一 package version 的 feature 通常会进行统一：
+
+```text
+reqwest
+├── rustls
+└── json
+```
+
+因此：
+
+> 一个 crate 开启的 feature，可能影响整个 dependency graph 中这个 package version 的构建。
+
+这也是为什么大型 Rust 项目经常写：
+
+```toml
+default-features = false
+```
+
+然后精确选择真正需要的 feature。
+
+对于 Bitty 这种很在乎：
+
+* binary size
+* startup
+* dependencies
+* portability
+* attack surface
+
+的程序，这比“Cargo.toml 看起来有几个 dependency”更加值得关注。
+
+---
+
+# 7. 所以未来 bitty-ai 有网络依赖，不代表 Bitty Core 必须有网络依赖
+
+我反而建议你继续保持现在这个原则。
+
+比如：
+
+```text
+                  bitty
+                    │
+        ┌───────────┼────────────┐
+        ↓           ↓            ↓
+ bitty-terminal  bitty-ipc   bitty-plugin
+                                  │
+                               piccolo
+
+
+               optional
+                  │
+                  ↓
+              bitty-ai
+                  │
+        ┌─────────┼─────────┐
+        ↓         ↓         ↓
+      HTTP      serde     provider
+```
+
+也就是说：
+
+```text
+bitty-core
+```
+
+仍然可以保持：
+
+> **network-free**
+
+而：
+
+```text
+bitty-ai
+```
+
+可以拥有：
+
+```text
+HTTP
+TLS
+SSE
+WebSocket
+JSON
+OAuth
+Provider SDK
+```
+
+之类的网络相关依赖。
+
+如果以后：
+
+```text
+bitty-cloud
+bitty-sync
+```
+
+也需要 HTTP，它们自己声明相同的 HTTP crate 即可。
+
+Cargo 自然会负责 dependency resolution。
+
+**不要为了“复用 reqwest”而把网络层塞进 bitty-core。**
+
+---
+
+# 8. 但是“共享网络能力”是另一个架构问题
+
+假如以后出现：
+
+```text
+bitty-ai
+bitty-sync
+bitty-update
+bitty-plugin-registry
+```
+
+全部都开始自己写：
+
+```rust
+reqwest::Client::new()
+```
+
+这时候可能值得抽象：
+
+```text
+bitty-net
+```
+
+但原因不是：
+
+> 防止 reqwest 被编译四次。
+
+Cargo 已经解决 dependency sharing。
+
+真正的原因应该是：
+
+```text
+                    bitty-net
+                        │
+        ┌───────────────┼────────────────┐
+        ↓               ↓                ↓
+    bitty-ai        bitty-sync      bitty-registry
+
+                 unified:
+                 ├── proxy
+                 ├── TLS policy
+                 ├── timeout
+                 ├── User-Agent
+                 ├── retry
+                 ├── auth
+                 ├── offline mode
+                 └── telemetry policy
+```
+
+这是**代码和策略复用**，而不是 dependency deduplication。
+
+这两个一定不要混淆。
+
+---
+
+# 9. 其他语言基本也是类似思想
+
+不同 ecosystem 具体策略不同：
+
+| 生态     | 管理工具                  | 典型依赖描述                      |
+| ------ | --------------------- | --------------------------- |
+| Rust   | Cargo                 | `Cargo.toml` / `Cargo.lock` |
+| Java   | Maven / Gradle        | `pom.xml` / `build.gradle`  |
+| Python | uv / pip / Poetry     | `pyproject.toml` / lock     |
+| JS/TS  | npm / pnpm / Bun      | `package.json` / lockfile   |
+| Go     | Go Modules            | `go.mod` / `go.sum`         |
+| C/C++  | CMake + Conan/vcpkg 等 | 相对分散                        |
+
+不过具体的 deduplication 规则差异很大。
+
+例如 Node.js 的：
+
+```text
+node_modules/
+```
+
+历史上就很容易出现：
+
+```text
+A
+└── lodash v3
+
+B
+└── lodash v4
+```
+
+pnpm 又通过 content-addressable store、hard link/symlink 等机制降低磁盘重复。
+
+Rust Cargo 的 dependency graph 和最终静态链接又是另一套机制。
+
+---
+
+# 10. 对 Bitty，我会建议建立三个原则
+
+你现在其实已经自然形成了一个很好的方向：
+
+```text
+                 Bitty
+                   │
+       ┌───────────┼───────────┐
+       ↓           ↓           ↓
+     Core       Platform     Extensions
+       │           │           │
+    minimal       IPC         AI
+    winit         PTY         plugins
+    render        config      network
+                  ...
+```
+
+其中可以坚持：
+
+**Core dependency budget**
+
+```text
+能不引入就不引入
+```
+
+特别是 terminal/render/event loop/PTY 这些基础路径。
+
+**Feature locality**
+
+```text
+AI dependency     → bitty-ai
+Lua dependency    → plugin-host
+network dependency→真正需要网络的 crate
+image dependency  → image/protocol crate
+```
+
+不要因为顶层 `bitty` 最后都会链接它们，就把依赖全部提升到 root/core。
+
+**Workspace dependency policy**
+
+以后 crates 多起来后：
+
+```toml
+[workspace.dependencies]
+```
+
+统一管理公共依赖版本和一些 feature policy。
+
+---
+
+因此，你说的 **“bitty-ai 和其他 bitty-xxx 都有网络依赖，能不能复用？”**，答案是：
+
+> **可以，而且 Cargo 本来就在做 dependency graph resolution；你不需要为了避免重复而人为创建共享 crate。**
+
+真正需要创建 `bitty-net` 的时机，是 Bitty 开始需要**共享网络策略和网络基础设施**的时候，而不是第二个 crate 写下 `reqwest = ...` 的时候。
+
+对于 Bitty，我甚至会把 **“Core 永远不因为 AI / Cloud / Plugin Registry 而获得网络依赖”** 当作一个 architecture invariant。这样未来即使 `bitty-ai` 变得非常庞大，Bitty 的 terminal core 仍然能维持现在这种很干净的依赖边界。
+我刚看了当前 `bitty-terminal/bitty` 的 `main` 分支，包括根 `Cargo.toml`、各主要 crate 的 `Cargo.toml` 和 `Cargo.lock`。结论是：**现在没有明显的 dependency-management 问题，反而依赖边界已经设计得相当明确；但随着 `bitty-ai` 加入，现在正好到了值得把“依赖策略”正式制度化的节点。**
+
+## 1. 现在的实际情况比“只有 winit / piccolo”复杂一些
+
+目前 workspace 已经有 **19 个 crates**：
+
+```text
+bitty
+├── bitty-agent
+├── bitty-app
+├── bitty-compat-lab
+├── bitty-config
+├── bitty-core
+├── bitty-ipc
+├── bitty-lua
+├── bitty-package
+├── bitty-perf
+├── bitty-platform
+├── bitty-plugin-host
+├── bitty-pty
+├── bitty-render
+├── bitty-rich
+├── bitty-runtime
+├── bitty-term-state
+├── bitty-test-support
+├── bitty-ui
+└── bitty-vt
+```
+
+而且已经用了：
+
+```toml
+resolver = "3"
+edition = "2024"
+rust-version = "1.85"
+```
+
+这部分很好。
+
+外部 direct dependencies 实际上包括：
+
+```text
+piccolo
+winit
+arboard
+raw-window-handle
+wgpu
+crossfont
+portable-pty
+vte
+png
+image
+getrandom
+pollster
+proptest (dev)
+```
+
+因此现在已经不是一个“几乎零依赖”的项目了，只不过你的设计很好地把它们**限制在对应 subsystem** 里面。例如：
+
+```text
+piccolo       → bitty-lua
+portable-pty  → bitty-pty
+vte           → bitty-vt
+winit/arboard → bitty-platform
+wgpu/crossfont→ bitty-render
+png/image     → bitty-rich
+```
+
+这其实比“依赖少”更加重要：**依赖有明确 owner。**
+
+---
+
+# 2. 我最认可的是你已经在做 Dependency Ownership
+
+例如 `bitty-render`：
+
+```text
+bitty-render
+├── bitty-term-state
+├── bitty-platform
+├── bitty-config
+├── wgpu
+└── crossfont
+```
+
+而且 `Cargo.toml` 里甚至已经明确写了：
+
+```text
+Neither upstream type may appear in this crate's public API.
+```
+
+这实际上已经形成一种很好的：
+
+> **WRAP external dependency**
+
+策略。
+
+类似：
+
+```text
+winit         → bitty-platform
+portable-pty  → bitty-pty
+piccolo       → bitty-lua
+wgpu          → bitty-render
+```
+
+上层 Bitty crate 尽量依赖：
+
+```text
+Bitty abstraction
+```
+
+而不是：
+
+```text
+third-party abstraction
+```
+
+例如：
+
+```text
+                bitty-runtime
+                     │
+        ┌────────────┼────────────┐
+        ↓            ↓            ↓
+ bitty-platform   bitty-lua    bitty-pty
+        │            │            │
+      winit       piccolo    portable-pty
+```
+
+这会让以后升级 `winit`、更换 Lua implementation、调整 PTY backend 都容易很多。
+
+**这个原则建议保持。**
+
+---
+
+# 3. 目前我最建议改的：引入 `[workspace.dependencies]`
+
+现在根 `Cargo.toml` 有：
+
+```toml
+[workspace]
+...
+
+[workspace.package]
+...
+
+[workspace.lints.rust]
+...
+```
+
+但是还没有：
+
+```toml
+[workspace.dependencies]
+```
+
+这在现在还不算问题，因为很多外部依赖只有一个 owner。
+
+但已经出现了一些重复声明。
+
+例如：
+
+```text
+bitty-platform
+└── winit = "0.30"
+
+bitty-perf
+└── winit = "0.30.13"
+```
+
+以及：
+
+```text
+bitty-app
+└── pollster = "1.0"
+
+bitty-perf
+└── pollster = "1.0"
+```
+
+Cargo 目前可以正常 resolve，所以**不是 bug**。
+
+但随着 `bitty-ai` 加入，未来很可能出现：
+
+```text
+serde
+serde_json
+tokio
+bytes
+tracing
+http
+...
+```
+
+被多个 crates 使用。
+
+我会开始改成：
+
+```toml
+[workspace.dependencies]
+winit = "0.30.13"
+pollster = "1.0"
+```
+
+然后：
+
+```toml
+# bitty-platform
+
+[dependencies]
+winit.workspace = true
+```
+
+```toml
+# bitty-perf
+
+[dependencies]
+winit.workspace = true
+pollster.workspace = true
+```
+
+不过**不要把所有 dependency 都扔进 `[workspace.dependencies]`**。
+
+例如：
+
+```toml
+piccolo = "0.3.3"
+```
+
+目前只有 `bitty-lua` 使用，那继续留在：
+
+```text
+bitty-lua/Cargo.toml
+```
+
+完全合理。
+
+我的规则会是：
+
+> **跨两个或更多 Bitty crates 的公共 external dependency，优先提升到 workspace dependency；单一 subsystem 私有 dependency 留在 owner crate。**
+
+---
+
+# 4. 有一个地方我会重点关注：`bitty-app → bitty-perf`
+
+目前：
+
+```text
+bitty-app
+├── bitty-config
+├── bitty-ipc
+├── bitty-perf        ←
+├── bitty-platform
+├── bitty-plugin-host
+├── bitty-runtime
+├── bitty-render
+├── bitty-term-state
+└── pollster
+```
+
+而 `bitty-perf` 自己：
+
+```text
+bitty-perf
+├── bitty-vt
+├── bitty-term-state
+├── bitty-render
+├── bitty-platform
+├── bitty-pty
+├── bitty-runtime
+├── bitty-config
+├── bitty-ui
+├── pollster
+└── winit
+```
+
+从 dependency topology 来看，这个边值得检查：
+
+```text
+bitty-app
+    ↓
+bitty-perf
+    ↓
+几乎整个 Bitty
+```
+
+如果 `bitty-perf` 真的是：
+
+> Performance baseline harness owner for benches
+
+那么 production binary 为什么依赖它？
+
+当然可能是因为你现在有 runtime performance instrumentation / startup metrics 等功能，所以未必错。
+
+但如果只是 benchmark harness，我会倾向：
+
+```text
+bitty-app ─X→ bitty-perf
+```
+
+让：
+
+```text
+bitty-perf
+```
+
+成为整个 workspace 的叶子 consumer：
+
+```text
+bitty-vt ─────────┐
+bitty-render ─────┤
+bitty-runtime ────┤
+bitty-platform ───┼→ bitty-perf
+bitty-pty ────────┤
+bitty-ui ─────────┘
+```
+
+而不是让 production application 反过来依赖 benchmark crate。
+
+**这是我现在看到最值得检查的一条 dependency edge。**
+
+---
+
+# 5. `bitty-term-state ↔ bitty-ui` 的 dev cycle 也值得以后清掉
+
+你这里其实已经自己发现了：
+
+```text
+bitty-term-state
+    │
+    └── bitty-vt
+
+dev:
+bitty-term-state
+    └── bitty-ui
+```
+
+而：
+
+```text
+bitty-ui
+├── bitty-term-state
+└── bitty-vt
+```
+
+所以测试图里形成：
+
+```text
+bitty-term-state
+      ↑       │
+      │       │ dev
+      │       ↓
+    bitty-ui
+```
+
+你已经明确标记为：
+
+```text
+Test-only dev-graph cycle exception
+```
+
+因此目前不是严重问题。
+
+不过我同意你 Cargo.toml 注释里自己写的候选方案：
+
+> 把这个 integration test 移到 `bitty-runtime` / integration-test owner。
+
+长期我还是会消除这个 cycle。
+
+原因不是 binary size，而是**dependency topology 更容易推理**。
+
+---
+
+# 6. `bitty-rich` 的依赖控制做得很好
+
+这里反而值得作为以后 `bitty-ai` 的参考。
+
+例如你没有直接：
+
+```toml
+image = "0.25"
+```
+
+而是：
+
+```toml
+image = {
+    version = "0.25",
+    default-features = false,
+    features = [
+        "png",
+        "jpeg",
+        "webp",
+    ]
+}
+```
+
+这就是前面我们讨论的：
+
+> 不使用 `full` / 默认全开，而是明确 dependency capability。
+
+而且 PNG 单独使用：
+
+```toml
+png = "0.18"
+```
+
+也是有明确理由的。
+
+这种模式以后非常适合：
+
+```text
+bitty-ai
+```
+
+尤其 AI 网络栈不要一开始：
+
+```toml
+tokio = { version = "1", features = ["full"] }
+```
+
+最好明确：
+
+```toml
+tokio = {
+    version = "1",
+    default-features = false,
+    features = [...]
+}
+```
+
+到底需要什么，再开什么。
+
+---
+
+# 7. 当前 `Cargo.lock` 的重复版本不用过度担心
+
+我看到现在 lockfile 里已经有例如：
+
+```text
+bitflags
+├── 1.3.2
+└── 2.13.1
+
+core-foundation
+├── 0.9.4
+└── 0.10.1
+
+core-graphics
+├── 0.23.2
+└── 0.24.0
+
+cfg_aliases
+├── 0.1.1
+└── 0.2.2
+
+windows-sys
+├── 0.52.0
+├── 0.59.0
+└── 0.61.2
+
+zune-core
+├── 0.4.12
+└── 0.5.3
+
+zune-jpeg
+├── 0.4.21
+└── 0.5.15
+```
+
+这正是我们上一条讨论的实际例子。
+
+不过这里大量都是：
+
+```text
+winit
+wgpu
+crossfont
+arboard
+image
+portable-pty
+```
+
+等大型跨平台依赖的 transitive dependencies。
+
+**不要为了把 `cargo tree --duplicates` 清成 0 而强行统一。**
+
+大型 GUI + GPU + cross-platform terminal 项目出现这种情况很正常。
+
+真正应该关注的是：
+
+```text
+我们自己的 direct dependencies
+       ↓
+为什么要求了不同版本？
+```
+
+而不是：
+
+```text
+某个 macOS backend 间接用了
+core-foundation 0.9 和 0.10
+```
+
+---
+
+# 8. `bitty-ai` 加入后，我建议明确划出新的 dependency island
+
+这是接下来最重要的。
+
+不要变成：
+
+```text
+                    bitty-runtime
+                         │
+                tokio / reqwest / TLS
+                         │
+               整个 Bitty 都看到 AI
+```
+
+而应该：
+
+```text
+                     Bitty Core
+                         │
+        ┌────────────────┼────────────────┐
+        │                │                │
+ Terminal Island    Plugin Island      AI Island
+        │                │                │
+      winit           piccolo          HTTP
+      wgpu                            TLS
+      PTY                             JSON
+      vte                             SSE
+                                      Provider
+```
+
+也就是尽量保证：
+
+```text
+bitty-vt        → network-free
+bitty-term-state→ network-free
+bitty-render    → network-free
+bitty-platform  → network-free
+bitty-pty       → network-free
+bitty-lua       → network-free
+```
+
+网络能力只允许进入：
+
+```text
+bitty-ai
+```
+
+以及未来确实需要的：
+
+```text
+bitty-net
+bitty-sync
+bitty-registry
+```
+
+而不是通过 `bitty-runtime` 向下污染整个 dependency graph。
+
+---
+
+# 9. 我甚至建议给 Bitty 做 Dependency Firewall
+
+你现在已经有 ADR 思维了，所以可以正式规定：
+
+```text
+Layer 0
+bitty-core
+bitty-vt
+bitty-ipc
+bitty-package
+        │
+        ↓
+不得依赖 GUI / GPU / Network / AI
+
+Layer 1
+bitty-term-state
+bitty-ui
+bitty-config
+        │
+        ↓
+允许 domain dependencies
+不允许 Network / AI
+
+Layer 2
+bitty-platform
+bitty-render
+bitty-pty
+bitty-lua
+        │
+        ↓
+拥有特定 external subsystem
+
+Layer 3
+bitty-runtime
+bitty-plugin-host
+bitty-rich
+        │
+        ↓
+Composition / orchestration
+
+Layer 4
+bitty-ai
+bitty-app
+        │
+        ↓
+High-level capabilities / composition root
+```
+
+这样以后一个 PR 如果出现：
+
+```diff
+crates/bitty-term-state/Cargo.toml
+
++ tokio = "1"
++ reqwest = "..."
+```
+
+review 时马上就知道：
+
+> **架构边界可能出问题了。**
+
+---
+
+## 我现在会做的 5 件事
+
+按优先级，我建议：
+
+1. **加入 `[workspace.dependencies]`**，先统一 `winit`、`pollster`，以后 `serde/tokio/tracing` 等公共依赖也从这里管理。
+2. **检查 `bitty-app → bitty-perf`** 是否真的属于 production dependency；如果只是 benchmark/instrumentation ownership 问题，拆掉这条边。
+3. **长期消除 `bitty-term-state ↔ bitty-ui` dev-cycle**，把 composition test 移到更高层。
+4. **给 bitty-ai 建立 dependency island**，明确 network/TLS/async runtime 不得向 terminal core 下沉。
+5. CI 增加 dependency governance：`cargo tree --duplicates` 用于观察而非要求为零，再配合你现在已有迹象表明在使用的 `cargo-deny` 做 license / advisories / bans 管理。
+
+整体上我不会建议你现在为了“优化依赖”大规模重构。**当前 Bitty 最大的优点恰恰是外部依赖已经有明确 owner，而且 `bitty-core`、`bitty-ipc` 等底层 crate 仍然非常干净。**
+
+真正的分水岭会是 `bitty-ai`：一旦 HTTP、TLS、async runtime、JSON、MCP、provider 等依赖进来，dependency graph 会突然扩大很多。因此现在把 **Dependency Ownership + Dependency Firewall + workspace dependency policy** 固化下来，会比以后依赖膨胀之后再治理容易得多。
+## 先给结论
+
+我看了 Bitty 当前 `main` 分支。现在的情况可以概括成：
+
+> **Bitty 自己的 Rust crates 基本是静态链接进 `bitty` 可执行文件；系统边界仍然会使用动态库/运行时加载。跨平台的“窗口 + 输入 + GPU API 差异”已经很大程度交给 `winit + wgpu`，但“发行版兼容、glibc/musl、系统字体库、GPU driver、最低 OS 版本”仍然是 Bitty 自己必须管理的。**
+
+而且我看到当前 release pipeline 里有 **两个比较值得尽快修的兼容性问题**。
+
+---
+
+# 1. Bitty 现在有没有用动态链接？
+
+有，但不是这种：
+
+```text
+bitty
+├── bitty-core.so
+├── bitty-render.so
+├── bitty-runtime.so
+└── piccolo.so
+```
+
+Bitty 没这么做。
+
+目前更接近：
+
+```text
+                         bitty executable
+                              │
+              ┌───────────────┼───────────────┐
+              │               │               │
+          Rust code       Rust crates      System boundary
+              │               │               │
+              ↓               ↓               ↓
+        bitty-core        winit/wgpu      libc / font /
+        bitty-runtime     piccolo/...     window / GPU
+              │               │               │
+              └──── static ───┘         dynamic/runtime
+```
+
+也就是说：
+
+### Bitty 自己的东西
+
+例如：
+
+```text
+bitty-vt
+bitty-term-state
+bitty-render
+bitty-runtime
+bitty-lua
+piccolo
+wgpu Rust implementation
+winit Rust implementation
+```
+
+绝大多数代码最终直接进入 `bitty` binary。
+
+### 系统自己的东西
+
+例如：
+
+```text
+glibc
+fontconfig
+FreeType
+Wayland / X11 runtime
+Vulkan loader / GPU driver
+Windows APIs
+Metal / macOS frameworks
+```
+
+则仍然依赖 OS。
+
+你的 Arch `PKGBUILD` 已经很明确地声明：
+
+```bash
+depends=('fontconfig' 'freetype2')
+```
+
+所以至少 Linux 字体栈目前明确属于系统依赖。
+
+---
+
+# 2. Bitty 没有自己搞一套 `.so` 插件机制
+
+我检查了当前仓库，没有看到 Bitty 自己使用：
+
+```text
+dlopen
+libloading
+LoadLibrary
+Rust dylib
+```
+
+来加载 native plugin。
+
+所以现在并不是：
+
+```text
+Bitty
+  ↓ dlopen()
+plugin.so
+```
+
+这种模型。
+
+这和前面我们讨论的设计是吻合的：Lua plugin / IPC 的兼容边界远比“Rust ABI 动态库插件”容易长期维护。
+
+---
+
+# 3. `winit` 已经帮 Bitty 解决了绝大部分窗口系统差异
+
+这个理解是对的。
+
+Bitty 当前：
+
+```toml
+winit = "0.30"
+```
+
+由 `bitty-platform` 独占，并且你还特意做了一层：
+
+```text
+Bitty
+    ↓
+bitty-platform
+    ↓
+winit
+    ↓
+┌─────────┬─────────┬──────────┬──────────┐
+│ Wayland │   X11   │ Windows  │  macOS   │
+└─────────┴─────────┴──────────┴──────────┘
+```
+
+`bitty-platform` 甚至明确把自己描述为：
+
+> `Window and event-loop adapter for Bitty (wraps winit)`
+
+而 Winit 官方当前支持：
+
+```text
+Desktop
+├── Windows
+├── macOS
+└── Unix
+    ├── Wayland
+    └── X11
+
+Mobile
+├── iOS
+└── Android
+
+Web
+└── WASM
+```
+
+它的目标本来就是把 window creation、event loop、keyboard/mouse/input 等公共能力做成统一 abstraction。([Docs.rs][1])
+
+所以 Bitty 不需要自己写：
+
+```rust
+#[cfg(windows)]
+CreateWindowExW(...)
+
+#[cfg(target_os = "linux")]
+wl_surface_create(...)
+
+#[cfg(target_os = "macos")]
+NSWindow(...)
+```
+
+这些基本都是 Winit 的工作。
+
+---
+
+# 4. 而且 Bitty 又在 Winit 上面包了一层，这一点非常好
+
+当前设计实际上是：
+
+```text
+OS
+ ↑
+winit
+ ↑
+bitty-platform
+ ↑
+Bitty
+```
+
+而不是：
+
+```text
+OS
+ ↑
+winit
+ ↑
+bitty-runtime
+bitty-ui
+bitty-render
+bitty-plugin
+...
+```
+
+你甚至把：
+
+```text
+raw-window-handle
+```
+
+限制在 GPU surface seam。
+
+当前 `surface.rs` 明确规定：
+
+> `SurfaceTarget` 是 Bitty-owned type，不让 `winit::Window` 泄漏进 Bitty 的 public API。
+
+这是非常重要的设计。
+
+以后哪怕：
+
+```text
+winit 0.30 → 0.31
+```
+
+出现比较大的 breaking change，影响主要集中在：
+
+```text
+bitty-platform
+```
+
+而不是整个 Bitty。
+
+---
+
+# 5. `wgpu` 同样已经替 Bitty 做掉大量 GPU 跨平台工作
+
+现在 `bitty-render`：
+
+```toml
+wgpu = "26.0"
+crossfont = "0.9"
+```
+
+而且一样不让 `wgpu` 类型跑到 public API 外面。
+
+所以结构是：
+
+```text
+                    Bitty renderer
+                          │
+                    bitty-render
+                          │
+                         wgpu
+                          │
+          ┌───────────────┼────────────────┐
+          ↓               ↓                ↓
+       Vulkan           Metal             DX12
+     Linux/etc.        macOS             Windows
+          │               │                │
+          ↓               ↓                ↓
+       GPU Driver       GPU Driver       GPU Driver
+```
+
+Wgpu 当前支持的主要 native backend 包括：
+
+* Vulkan：Windows / Linux / Android 等；
+* Metal：macOS / iOS；
+* Direct3D 12：Windows；
+* GL/GLES：作为 secondary backend；
+* WebGPU：Web。([Docs.rs][2])
+
+因此 Bitty 不需要自己实现：
+
+```text
+VulkanRenderer
+MetalRenderer
+D3D12Renderer
+OpenGLRenderer
+```
+
+这正是使用 `wgpu` 最大的价值之一。
+
+---
+
+# 6. 而且你现在确实已经让 wgpu 自动选择 backend
+
+我检查了 `bitty-render/src/gpu.rs`，初始化现在是：
+
+```rust
+let instance =
+    Instance::new(&InstanceDescriptor::from_env_or_default());
+```
+
+而且代码明确支持：
+
+```text
+Vulkan
+Metal
+DX12
+GL
+BrowserWebGpu
+Noop
+```
+
+并且遵循：
+
+```bash
+WGPU_BACKEND=...
+```
+
+环境变量。
+
+所以正常情况下：
+
+```text
+Linux
+ ↓
+Vulkan
+ ↓
+失败/环境选择
+ ↓
+可能 GL
+
+Windows
+ ↓
+DX12 / Vulkan 等
+
+macOS
+ ↓
+Metal
+```
+
+Bitty 本身不需要知道大量 backend-specific details。
+
+这一层现在设计是正确的。
+
+---
+
+# 7. Winit + Wgpu 的组合正好把两件最难的事情解决了
+
+可以非常直观地画：
+
+```text
+                  Bitty
+                    │
+          ┌─────────┴─────────┐
+          ↓                   ↓
+   bitty-platform        bitty-render
+          │                   │
+        winit                wgpu
+          │                   │
+   Window/Input/Event       Graphics
+          │                   │
+    ┌─────┼─────┐       ┌─────┼─────┐
+    ↓     ↓     ↓       ↓     ↓     ↓
+ Wayland X11 Windows  Vulkan Metal DX12
+              macOS
+```
+
+所以：
+
+> **从“跨平台源码架构”来看，Bitty 已经不用自己处理大多数窗口系统和 GPU backend 差异了。**
+
+这个选择非常适合 Bitty。
+
+---
+
+# 8. 但是 Winit/Wgpu 不能替 Bitty 解决“发行兼容性”
+
+这是最重要的区别。
+
+Winit 能做到：
+
+```text
+同一套 Rust API
+        ↓
+Windows/macOS/Linux
+```
+
+但它不能保证：
+
+```text
+你今天在 Ubuntu latest 编译的 binary
+        ↓
+Ubuntu 20.04
+        ↓
+一定能跑
+```
+
+Wgpu 也能做到：
+
+```text
+同一套 Graphics API
+     ↓
+Vulkan / Metal / DX12
+```
+
+但它不能保证：
+
+```text
+用户的 2014 年 Intel GPU
+老 Mesa
+老 Vulkan driver
+        ↓
+一定兼容
+```
+
+所以要分成：
+
+```text
+Source portability
+    ↓
+winit + wgpu 很大程度解决
+
+Binary portability
+    ↓
+Bitty release engineering 负责
+
+Runtime compatibility
+    ↓
+OS / driver / distro + Bitty support policy
+```
+
+---
+
+# 9. 当前 Bitty release matrix 已经在做跨平台 binary
+
+现在 release workflow 会构建：
+
+```text
+Linux
+└── x86_64-unknown-linux-gnu
+
+Windows
+├── x86_64-pc-windows-msvc
+└── aarch64-pc-windows-msvc
+
+macOS
+├── x86_64-apple-darwin
+└── aarch64-apple-darwin
+```
+
+这个方向是正确的。
+
+也就是说 GitHub Release 实际不是一个：
+
+```text
+bitty
+```
+
+到处跑，而是：
+
+```text
+bitty-x86_64-unknown-linux-gnu
+
+bitty-x86_64-pc-windows-msvc.exe
+bitty-aarch64-pc-windows-msvc.exe
+
+bitty-x86_64-apple-darwin
+bitty-aarch64-apple-darwin
+```
+
+这本身就是跨平台软件正确的 distribution 模型。
+
+---
+
+# 10. 不过我发现一个 Linux ARM64 配置问题
+
+你的 workflow 后面有大量：
+
+```yaml
+if: matrix.target == 'aarch64-unknown-linux-gnu'
+```
+
+包括：
+
+```text
+cross
+gcc-aarch64-linux-gnu
+libfontconfig1-dev:arm64
+libfreetype6-dev:arm64
+```
+
+显然你已经为：
+
+```text
+aarch64-unknown-linux-gnu
+```
+
+写好了很多东西。
+
+但**当前 matrix 里并没有这个 target**。
+
+也就是说目前实际上：
+
+```text
+Linux x86_64    ✓
+
+Linux aarch64   × matrix 没有 entry
+
+Windows x86_64  ✓
+Windows ARM64   ✓
+
+macOS x86_64    ✓
+macOS ARM64     ✓
+```
+
+那些：
+
+```yaml
+if: matrix.target == 'aarch64-unknown-linux-gnu'
+```
+
+现在实际上不会被触发。
+
+这个我建议直接补：
+
+```yaml
+- os: ubuntu-latest
+  target: aarch64-unknown-linux-gnu
+  arch: arm64
+  packagers: "deb,rpm,apk,archlinux"
+```
+
+当然 package 是否都适合 ARM64，还需要分别验证。
+
+---
+
+# 11. 当前还有一个更严重的问题：Alpine `.apk`
+
+你之前特意说过：
+
+> `.apk` 是 Alpine Linux。
+
+而现在 workflow 做的是：
+
+```text
+x86_64-unknown-linux-gnu
+        ↓
+Ubuntu runner
+        ↓
+生成 glibc binary
+        ↓
+nfpm
+        ↓
+bitty.apk
+```
+
+release workflow 确实就是拿：
+
+```text
+x86_64-unknown-linux-gnu
+```
+
+这个 binary 去打：
+
+```text
+deb
+rpm
+apk
+archlinux
+```
+
+四种 package。
+
+但 Alpine 默认：
+
+```text
+musl libc
+```
+
+而不是：
+
+```text
+glibc
+```
+
+因此：
+
+```text
+bitty-x86_64-unknown-linux-gnu
+```
+
+**不能因为被塞进 `.apk` 就自动变成 Alpine-compatible binary。**
+
+这是一处真正应该修的地方。
+
+---
+
+# 12. 正确的 Alpine 路线应该单独构建
+
+更合理：
+
+```text
+Debian / Ubuntu / Fedora / Arch
+              │
+              ↓
+x86_64-unknown-linux-gnu
+
+
+Alpine
+   │
+   ↓
+x86_64-unknown-linux-musl
+```
+
+或者直接在：
+
+```text
+Alpine container
+```
+
+里原生 build。
+
+但 Bitty 又依赖：
+
+```text
+fontconfig
+freetype
+```
+
+所以即便使用 musl，也不一定意味着“完全静态”。
+
+可能最终：
+
+```text
+Bitty musl binary
+       │
+       ├── musl
+       ├── fontconfig (Alpine/musl build)
+       ├── freetype
+       └── graphics runtime
+```
+
+这是没问题的。
+
+重要的是：
+
+> **整个 ABI ecosystem 必须是 musl 的。**
+
+而不是把 glibc binary 包进 Alpine package。
+
+---
+
+# 13. `nfpm.yaml` 目前也没有声明 Linux runtime dependencies
+
+还有一个问题。
+
+你的 source Arch `PKGBUILD` 明确有：
+
+```bash
+depends=('fontconfig' 'freetype2')
+```
+
+但是 `nfpm.yaml` 目前只是：
+
+```yaml
+name: bitty
+arch: amd64
+platform: linux
+
+contents:
+  - src: ./target/release/bitty
+    dst: /usr/bin/bitty
+```
+
+并没有看到相应的 dependency declarations。
+
+因此：
+
+```text
+.deb
+.rpm
+.apk
+```
+
+安装后是否自动保证：
+
+```text
+fontconfig
+freetype
+```
+
+存在，目前值得检查。
+
+这和“二进制动态依赖管理”直接相关。
+
+---
+
+# 14. 所以以后 Bitty 可以明确三层兼容性
+
+我很建议你在 docs 里直接定义成：
+
+```text
+Bitty Platform Compatibility
+│
+├── 1. Architecture
+│   ├── x86_64
+│   └── aarch64
+│
+├── 2. OS / ABI
+│   ├── Linux GNU
+│   ├── Linux musl
+│   ├── Windows MSVC
+│   └── macOS Darwin
+│
+└── 3. Runtime Backend
+    ├── Window
+    │   ├── Wayland
+    │   ├── X11
+    │   ├── Win32
+    │   └── AppKit
+    │
+    └── GPU
+        ├── Vulkan
+        ├── DX12
+        ├── Metal
+        └── GL fallback
+```
+
+其中：
+
+```text
+Architecture / OS ABI
+        ↓
+Bitty release CI 负责
+
+Window backend
+        ↓
+winit 负责
+
+GPU backend
+        ↓
+wgpu 负责
+```
+
+这个责任划分会非常清楚。
+
+---
+
+# 15. 对 Bitty 来说，真正不需要自己操心的是什么
+
+### 基本交给 Winit
+
+```text
+Wayland window creation
+X11 window creation
+Win32 Window
+AppKit Window
+mouse / keyboard
+DPI
+monitor
+event loop
+IME 的公共抽象
+```
+
+但非常 platform-specific 的 feature 仍然可能需要 Bitty 调 Winit 的 platform extension。Winit 官方也明确区分 common core API 和 platform-specific API。([Docs.rs][1])
+
+### 基本交给 Wgpu
+
+```text
+Vulkan
+Metal
+DX12
+GL
+adapter selection
+device creation
+surface formats
+present modes
+shader translation
+GPU abstraction
+```
+
+你现在甚至已经使用 Wgpu 自己的 environment backend selection 机制。
+
+---
+
+# 16. 仍然必须 Bitty 自己负责的部分
+
+这个不能交给两个 crate：
+
+```text
+minimum Windows version
+minimum macOS version
+minimum Linux kernel（如有）
+minimum glibc
+musl support
+
+GPU baseline
+driver compatibility
+software fallback policy
+
+fontconfig / FreeType packaging
+
+.deb dependencies
+.rpm dependencies
+.apk dependencies
+Arch dependencies
+
+x86_64 / ARM64 release matrix
+
+code signing
+macOS notarization
+Windows signing
+
+real-machine testing
+Wayland/X11 testing
+Vulkan/Metal/DX12 testing
+```
+
+尤其你当前 `gpu.rs` 自己就写得很清楚：
+
+```text
+CI 默认是 headless
+真实 GPU tests 需要显式环境变量
+CI never runs these
+```
+
+这意味着：
+
+> **“CI 编译 Windows/macOS/Linux 成功” ≠ “真实 DX12/Metal/Vulkan 渲染全部验证成功”。**
+
+以后 Bitty 稳定版前，最好有真实 GPU/platform test matrix。
+
+---
+
+## 我现在会怎么调整 Bitty
+
+如果保持你当前架构，我不会动：
+
+```text
+bitty-platform → winit
+bitty-render   → wgpu
+```
+
+这两个选择本身很合适。
+
+我反而会把工作集中到 release engineering：
+
+```text
+                        Bitty source
+                            │
+          ┌─────────────────┼─────────────────┐
+          ↓                 ↓                 ↓
+        Linux             Windows           macOS
+          │                 │                 │
+     ┌────┴────┐       ┌────┴────┐       ┌────┴────┐
+     ↓         ↓       ↓         ↓       ↓         ↓
+ GNU x64   GNU ARM64  x64       ARM64   Intel    Apple Silicon
+     │
+     └── Alpine 另开 musl pipeline
+```
+
+然后 Linux 再明确：
+
+```text
+GNU release
+├── minimum glibc baseline
+├── fontconfig
+├── freetype
+├── Wayland/X11
+└── Vulkan/GL runtime
+
+musl release
+├── Alpine-native build
+├── musl
+├── fontconfig
+├── freetype
+└── graphics runtime
+```
+
+所以回答你最开始的问题就是：
+
+> **是的，Bitty 的跨平台难题里，`winit` 已经解决了“窗口/输入系统 abstraction”，`wgpu` 已经解决了“GPU backend abstraction”，这两块你没必要自己重复造。Bitty 真正需要重点管理的是它们下面的“系统 ABI 与发行环境”。**
+
+而当前代码架构其实已经把这个边界划得很好；现在最需要补的是 **release compatibility layer**，尤其是 **Linux ARM64 matrix、GNU/musl 分离、package runtime dependency、最低 glibc baseline，以及真实 GPU 平台测试**。
+
+[1]: https://docs.rs/crate/winit/latest/source/FEATURES.md?utm_source=chatgpt.com "winit 0.30.13 - Docs.rs"
+[2]: https://docs.rs/wgpu/latest/wgpu/struct.Backends.html?utm_source=chatgpt.com "Backends in wgpu - Rust"
+有，而且 **Terminal Emulator 的跨平台差异比普通 GUI 软件还要明显**。不过 Bitty 现在的架构方向比较合适：把真正的平台差异压缩在少数几个 boundary crate 中，而不是让整个项目到处都是 `#[cfg(...)]`。
+
+## Bitty 面临的平台差异
+
+可以大致画成：
+
+```text
+                         Bitty Common Core
+                                │
+        ┌───────────────────────┼───────────────────────┐
+        ↓                       ↓                       ↓
+ bitty-platform             bitty-render            bitty-pty
+        │                       │                       │
+      winit                    wgpu                portable-pty
+        │                       │                       │
+ ┌──────┼──────┐         ┌──────┼──────┐         ┌──────┴──────┐
+ ↓      ↓      ↓         ↓      ↓      ↓         ↓             ↓
+Linux Windows macOS   Vulkan   DX12   Metal    Unix PTY       ConPTY
+```
+
+所以理想状态不是“Bitty 没有平台差异”，而是：
+
+> **Bitty Core 不知道平台差异，platform adapters 知道。**
+
+### 三个平台主要区别
+
+| 层面        | Linux                        | Windows               | macOS                   | Bitty 当前抽象                    |
+| --------- | ---------------------------- | --------------------- | ----------------------- | ----------------------------- |
+| Window    | Wayland / X11                | Win32                 | AppKit                  | `winit` / `bitty-platform`    |
+| GPU       | Vulkan，GL                    | DX12，Vulkan 等         | Metal                   | `wgpu` / `bitty-render`       |
+| PTY       | Unix PTY                     | ConPTY                | Unix PTY                | `portable-pty` / `bitty-pty`  |
+| 字体        | FreeType + Fontconfig        | DirectWrite           | CoreText                | `crossfont`                   |
+| Process   | PID / process group / signal | Windows process model | POSIX 类似 Linux          | `bitty-pty`                   |
+| Clipboard | Wayland/X11 差异明显             | Win32 clipboard       | NSPasteboard            | `arboard`                     |
+| IME       | Wayland/X11 IME              | Windows IME           | macOS NSTextInput       | `winit` + Bitty logic         |
+| 路径        | `/home/...`                  | `C:\Users\...`        | `/Users/...`            | Rust `Path` + platform config |
+| 配置目录      | XDG                          | AppData               | Application Support     | Bitty 应统一 abstraction         |
+| 发布        | `.deb/.rpm/.apk/pkg`         | `.exe/.msi/Scoop`     | `.app/.dmg/Homebrew`    | release pipeline              |
+| 安全发布      | distro policy                | SmartScreen/signing   | Gatekeeper/notarization | Bitty 自己负责                    |
+
+---
+
+## 1. Linux 其实是三个平台里最“分裂”的
+
+很多时候我们说：
+
+```text
+Windows
+macOS
+Linux
+```
+
+好像是三个平级平台。
+
+实际上 GUI 软件眼中的 Linux 更像：
+
+```text
+Linux
+├── Wayland
+│   ├── Hyprland
+│   ├── Sway
+│   ├── GNOME
+│   └── KDE
+│
+└── X11
+    ├── i3
+    ├── Xfce
+    ├── KDE
+    └── ...
+```
+
+Winit 自己也明确把：
+
+```text
+Linux X11
+Linux Wayland
+```
+
+作为不同 backend，而且很多能力并不是完全一样的；Winit 的目标也是抽象各平台的 common capabilities，而不是假装所有平台功能完全一致。([Docs.rs][1])
+
+比如 Wayland 一个非常典型的特点就是：
+
+```text
+Application
+    ↓
+Compositor owns policy
+```
+
+应用通常不能像 X11 那样随意：
+
+```text
+获取全局窗口坐标
+移动窗口到任意位置
+读取其他窗口
+全局抓取输入
+```
+
+这对 Bitty 将来的：
+
+```text
+floating Panel
+popup
+drag
+always-on-top
+窗口定位
+```
+
+可能都会产生平台差异。
+
+所以你使用 Hyprland 开发 Bitty时尤其要注意：
+
+> **“Hyprland + Wayland 上能实现”不等于 X11 / Windows / macOS 行为完全相同。**
+
+---
+
+# 2. Windows 最大的差异之一其实是 PTY
+
+这个对 Bitty 比普通 GUI 软件更重要。
+
+Linux/macOS 基本是 Unix PTY 模型：
+
+```text
+Bitty
+  │
+  ↓
+PTY master
+  ↕
+PTY slave
+  │
+  ↓
+shell / program
+```
+
+有：
+
+```text
+/dev/pts/...
+process group
+foreground process group
+SIGWINCH
+SIGTERM
+SIGKILL
+```
+
+Windows 则是：
+
+```text
+Bitty
+  │
+  ↓
+ConPTY
+  │
+  ↓
+PowerShell / cmd / program
+```
+
+这些语义并不完全相同。
+
+而且我刚看了 **当前 Bitty main**，现在已经明确分成：
+
+```text
+bitty-pty/src/platform/
+├── unix.rs
+└── windows.rs
+```
+
+你现在的 Windows backend 已经明确使用 **ConPTY**。同时代码里直接记录了几个关键差异：
+
+```text
+Windows:
+tty_name()              → None
+POSIX signal            → 没有
+SIGWINCH                 → 没有
+foreground process group→ 无法像 Unix 那样获取
+```
+
+而 Unix backend 可以获取 TTY 名称、foreground process group，并保留 signal exit status。
+
+这就是一个非常好的设计例子：
+
+```rust
+// 上层
+session.resize(...)
+session.kill(...)
+session.wait(...)
+```
+
+上层 Bitty 看的是统一 abstraction。
+
+下面：
+
+```text
+Unix     → Unix PTY semantics
+Windows  → ConPTY semantics
+```
+
+而无法统一的能力：
+
+```text
+process_group_leader()
+```
+
+就允许：
+
+```rust
+Option<u32>
+```
+
+Windows 返回：
+
+```rust
+None
+```
+
+而不是硬造一个假的语义。
+
+**这种设计非常值得继续保持。**
+
+---
+
+# 3. shell 也明显不同
+
+Linux：
+
+```text
+bash
+zsh
+fish
+nu
+```
+
+macOS：
+
+```text
+zsh
+bash
+fish
+```
+
+Windows：
+
+```text
+PowerShell
+cmd.exe
+nu
+WSL shells
+```
+
+因此：
+
+```text
+$SHELL
+HOME
+PATH
+USER
+```
+
+不能直接套到 Windows。
+
+Windows还有：
+
+```text
+USERPROFILE
+SystemRoot
+PATHEXT
+COMSPEC
+```
+
+并且：
+
+```text
+foo.exe
+foo.cmd
+foo.bat
+foo.ps1
+```
+
+启动规则也和 Unix executable 不一样。
+
+Bitty 现在 Windows PTY backend 已经明确处理了 `SystemRoot` 等 Windows 环境需求，并且 Unix/Windows 都选择 **direct exec，而不是先经过 shell**。
+
+这个决定很好。
+
+否则如果写：
+
+```text
+command string
+      ↓
+shell parse
+```
+
+马上就会遇到：
+
+```text
+bash quoting
+PowerShell quoting
+cmd.exe quoting
+```
+
+三套完全不同的 escaping nightmare。
+
+---
+
+# 4. GPU 差异反而已经被 wgpu 处理得很好
+
+这一层 Bitty 可以少操很多心。
+
+大致：
+
+```text
+Linux
+  ↓
+Vulkan
+GL
+
+Windows
+  ↓
+DX12
+Vulkan
+GL/ANGLE
+
+macOS
+  ↓
+Metal
+```
+
+Wgpu 官方现在的核心 backends 就包括 Vulkan、Metal、DX12，以及 secondary GL backend。([Docs.rs][2])
+
+所以：
+
+```rust
+device.create_buffer(...)
+encoder.begin_render_pass(...)
+queue.submit(...)
+```
+
+Bitty 可以写基本相同的代码。
+
+否则不用 wgpu 的话，你可能得维护：
+
+```text
+bitty-render-vulkan
+bitty-render-metal
+bitty-render-dx12
+```
+
+那整个项目复杂度会直接上一个数量级。
+
+---
+
+# 5. 但 GPU driver behavior 还是会不同
+
+Wgpu 能统一：
+
+```text
+API
+```
+
+不能统一：
+
+```text
+driver quality
+GPU capability
+VRAM
+supported texture formats
+present modes
+adapter quirks
+```
+
+比如：
+
+```text
+NVIDIA Linux
+AMD Linux
+Intel Linux
+Apple Silicon Metal
+Intel macOS
+NVIDIA Windows
+AMD Windows
+Intel Windows
+```
+
+实际行为仍然可能存在差异。
+
+所以你的 Bitty 代码里现在做：
+
+```text
+surface.get_capabilities()
+        ↓
+选择真正支持的 format
+        ↓
+选择真正支持的 present mode
+```
+
+而不是假设：
+
+```text
+所有设备都有 Mailbox
+所有设备都有某格式
+```
+
+就是正确方法。
+
+---
+
+# 6. 字体系统三个平台其实完全不同
+
+这是 terminal emulator 另一个大坑。
+
+Bitty 当前使用 `crossfont`，它本身就是一个 abstraction：
+
+```text
+                    crossfont
+                        │
+          ┌─────────────┼─────────────┐
+          ↓             ↓             ↓
+       Linux         Windows        macOS
+          │             │             │
+      FreeType      DirectWrite     CoreText
+          +
+      Fontconfig
+```
+
+Crossfont 官方就是这样定义 backend 的。([Docs.rs][3])
+
+因此你指定：
+
+```text
+JetBrains Mono
+```
+
+背后的“找字体 + rasterize glyph”在三个系统实际走的是三条不同路径。
+
+这会导致一些很典型的问题：
+
+```text
+glyph metrics
+hinting
+fallback font
+emoji
+CJK fallback
+bold synthesis
+italic synthesis
+subpixel rendering
+```
+
+可能不完全一致。
+
+所以终端这种 pixel-sensitive 软件一定要做真实平台测试。
+
+---
+
+# 7. 字体 fallback 尤其会不同
+
+假设用户终端显示：
+
+```text
+A
+中
+😀
+󰘧
+```
+
+可能分别来自：
+
+```text
+JetBrains Mono
+Noto Sans CJK
+Noto Color Emoji
+Nerd Font
+```
+
+Linux 用户可能安装：
+
+```text
+Noto Sans CJK SC
+```
+
+Windows 可能靠：
+
+```text
+Microsoft YaHei
+Segoe UI Emoji
+```
+
+macOS：
+
+```text
+PingFang SC
+Apple Color Emoji
+```
+
+所以即使 Bitty 自己完全跨平台：
+
+> **同一段文字在三台机器上使用的 fallback font 可能完全不同。**
+
+这也是 terminal rendering 很难做到像 Web font 那样像素级一致的原因。
+
+---
+
+# 8. 输入法 IME 也是巨大差异来源
+
+比如中文：
+
+```text
+nihao
+ ↓
+你好
+```
+
+在：
+
+```text
+Wayland
+X11
+Windows IME
+macOS IME
+```
+
+composition 生命周期都不完全一样。
+
+Winit 会提供统一的一部分：
+
+```text
+IME enabled
+preedit
+commit
+```
+
+但 platform-specific bug 仍然实际存在。Winit 最近版本的 changelog 甚至同时有：
+
+* macOS 拼音 IME 的修复；
+* Windows IME context 的修复。([Docs.rs][4])
+
+这正说明：
+
+> “有 Winit abstraction”并不等于“不需要跨平台 IME 测试”。
+
+终端尤其敏感，因为需要处理：
+
+```text
+keydown
+text input
+IME preedit
+Ctrl/Alt/Meta
+dead keys
+compose keys
+```
+
+之间的关系。
+
+---
+
+# 9. 键盘快捷键也不能完全统一
+
+Bitty 默认：
+
+```text
+Mod = Alt
+```
+
+那么三个平台仍然会有区别。
+
+例如：
+
+```text
+Linux
+Ctrl / Alt / Super
+
+Windows
+Ctrl / Alt / Win
+
+macOS
+Control / Option / Command
+```
+
+macOS 用户习惯：
+
+```text
+Cmd+C
+Cmd+V
+Cmd+W
+Cmd+,
+```
+
+Windows/Linux 用户一般：
+
+```text
+Ctrl+C
+Ctrl+V
+```
+
+但 Terminal 又有：
+
+```text
+Ctrl+C = SIGINT
+```
+
+所以终端应用会使用：
+
+```text
+Ctrl+Shift+C
+```
+
+之类。
+
+因此未来 Bitty shortcut layer 最好是：
+
+```text
+Logical Action
+      │
+      ├── Linux binding
+      ├── Windows binding
+      └── macOS binding
+```
+
+而不是所有平台硬编码相同 physical keys。
+
+---
+
+# 10. macOS 最大的额外复杂度之一是系统规范
+
+macOS 不只是：
+
+```text
+Unix + Metal
+```
+
+作为桌面应用，还会涉及：
+
+```text
+.app bundle
+Info.plist
+application menu
+Cmd shortcuts
+Retina
+code signing
+notarization
+Gatekeeper
+quarantine
+```
+
+如果 Bitty 最终只是一个：
+
+```text
+./bitty
+```
+
+虽然理论上可以运行，但用户体验不会像真正 macOS app。
+
+正式 release 更合理的是：
+
+```text
+Bitty.app/
+└── Contents/
+    ├── MacOS/
+    │   └── bitty
+    ├── Resources/
+    └── Info.plist
+```
+
+然后：
+
+```text
+sign
+notarize
+DMG/Homebrew
+```
+
+这些 `winit` 和 `wgpu` 都不会替你完成。
+
+---
+
+# 11. Windows 也有自己的发行生态
+
+Windows 会涉及：
+
+```text
+.exe
+DLL search
+icon/resource
+AppUserModelID
+code signing
+SmartScreen
+installer
+Scoop / winget
+```
+
+以及：
+
+```text
+x86_64
+ARM64
+```
+
+目前 Bitty release matrix 已经有 Windows x86_64 和 ARM64，这是比较好的起点。
+
+---
+
+# 12. Linux 的发行反而主要难在 distribution
+
+Linux 不是一个统一 userspace。
+
+你可能需要面对：
+
+```text
+Arch
+Ubuntu
+Debian
+Fedora
+openSUSE
+Alpine
+NixOS
+...
+```
+
+对应：
+
+```text
+glibc / musl
+package names
+library versions
+filesystem/package policies
+```
+
+所以：
+
+```text
+Linux source compatibility
+```
+
+很好做。
+
+但是：
+
+```text
+Linux binary distribution
+```
+
+反而经常比 Windows/macOS复杂。
+
+---
+
+# Bitty 最合理的架构应该是“平台差异漏斗”
+
+现在已经很接近这个形式：
+
+```text
+                  Bitty Features
+                       │
+                       ↓
+               platform-neutral API
+                       │
+       ┌───────────────┼────────────────┐
+       ↓               ↓                ↓
+bitty-platform    bitty-render      bitty-pty
+       │               │                │
+     winit            wgpu        portable-pty
+       │               │                │
+       └────────────── OS ───────────────┘
+```
+
+我会继续坚持一个原则：
+
+```text
+90%+ Bitty code
+        ↓
+完全不知道自己运行在 Linux/Windows/macOS
+```
+
+真正出现：
+
+```rust
+#[cfg(target_os = "windows")]
+#[cfg(target_os = "macos")]
+#[cfg(unix)]
+```
+
+的代码，尽量被压缩到：
+
+```text
+bitty-platform
+bitty-pty
+bitty-package
+少量 native integration
+```
+
+里面。
+
+---
+
+## 特别值得肯定的是你现在 `bitty-pty` 的做法
+
+你没有试图强迫：
+
+```text
+Unix PTY == ConPTY
+```
+
+而是定义：
+
+```text
+                 Common contract
+                       │
+          ┌────────────┴────────────┐
+          ↓                         ↓
+       unix.rs                  windows.rs
+          │                         │
+    Unix semantics              ConPTY semantics
+```
+
+而平台没有的概念就：
+
+```rust
+None
+```
+
+而不是伪造。
+
+这其实就是跨平台软件一个很重要的设计原则：
+
+> **抽象共同语义，而不是抹平所有差异。**
+
+Winit 自己也是这么设计的：common capabilities 放在 core API，不能合理统一的能力就放进 `platform::*` extension。([Docs.rs][1])
+
+对于 Bitty 来说，这个原则以后同样应该用于 **PTY、AI process control、clipboard、notifications、window effects、blur/opacity、global shortcuts、credential storage** 等系统能力。
+
+[1]: https://docs.rs/crate/winit/latest/source/FEATURES.md?utm_source=chatgpt.com "winit 0.30.13 - Docs.rs"
+[2]: https://docs.rs/wgpu/latest/wgpu/struct.Backends.html?utm_source=chatgpt.com "Backends in wgpu - Rust"
+[3]: https://docs.rs/crossfont?utm_source=chatgpt.com "crossfont - Rust"
+[4]: https://docs.rs/crate/winit/latest/source/src/changelog/v0.30.md?utm_source=chatgpt.com "winit 0.30.13 - Docs.rs"
+可以。WezTerm 很适合作为 Bitty 的参照，因为它已经长期同时维护 **Linux/X11、Linux/Wayland、Windows、macOS，以及 FreeBSD/NetBSD**，社区里也确实积累了大量“同一个 Terminal，在不同平台表现不一致”的真实案例。官方 feature 页面也明确列出了这些平台。([GitHub][1])
+
+一个很有意思的结论是：
+
+> **WezTerm 并没有试图把所有平台伪装成完全一样。它建立统一的上层语义，但在底层保留非常明确的平台 backend，并且为无法统一的地方提供 capability、fallback 和配置开关。**
+
+这和 Bitty 现在 `bitty-platform / bitty-render / bitty-pty` 的方向其实很接近。
+
+## WezTerm 比 Bitty 走得更“底层”
+
+首先有一点可能会让你比较感兴趣：**WezTerm 并没有像 Bitty 现在这样直接把 `winit` 当窗口 abstraction。**
+
+它自己有一个 `window` subsystem，源码直接分成：
+
+```text
+window/src/os/
+├── macos/
+├── wayland/
+├── windows/
+├── x11/
+├── x_and_wayland.rs
+└── xdg_desktop_portal.rs
+```
+
+也就是说它自己维护：
+
+```text
+                  WezTerm Window API
+                         │
+       ┌─────────────────┼─────────────────┐
+       ↓                 ↓                 ↓
+     macOS            Windows            Linux
+       │                 │             ┌───┴───┐
+    AppKit/...        Win32/...       X11    Wayland
+```
+
+而不是：
+
+```text
+WezTerm
+   ↓
+winit
+```
+
+这一点可以直接从当前仓库结构看到。
+
+这并不意味着 Bitty 应该现在放弃 Winit。相反，我觉得这是一个很好的“项目成熟度路线”：
+
+```text
+早期/中期 Bitty
+      ↓
+winit 提供稳定 common abstraction
+      ↓
+减少大量平台代码
+
+未来如果某些高级需求
+winit 无法表达
+      ↓
+在 bitty-platform 里做
+platform extension / native backend
+```
+
+WezTerm 因为已经做了很多年，而且需要 IME、native decorations、窗口行为、Wayland protocol、Windows native integration 等很深的功能，所以它最终拥有自己的 window abstraction 是合理的。
+
+---
+
+# 社区里最明显的平台差异：Linux Wayland vs X11
+
+WezTerm 到现在仍然明确提供：
+
+```lua
+config.enable_wayland = true / false
+```
+
+如果关掉，就可以在支持 X11/Wayland 的系统上退回 X11。源码配置里甚至明确写着，这个设置只对 X11/Wayland 系统有效，对 macOS/Windows 没作用。([GitHub][2])
+
+这其实说明 WezTerm 的理念不是：
+
+```text
+Wayland abstraction works
+→ 那就没有差异了
+```
+
+而是：
+
+```text
+           Linux
+             │
+      ┌──────┴──────┐
+      ↓             ↓
+   Wayland          X11
+      │             │
+   native path   fallback/path
+```
+
+社区里真实的问题很多。例如 2025 年 Hyprland 0.51 更新之后，有用户报告 WezTerm 的窗口布局、文本大小和渲染区域出现异常；切换 compositor/version 就可能改变行为。([GitHub][3])
+
+这对你特别有参考价值，因为你自己主要在 Hyprland 环境开发 Bitty。
+
+所以 Bitty 最好不要形成：
+
+> “我在 Hyprland 上测试通过 = Linux GUI 支持完成。”
+
+而应该长期形成：
+
+```text
+Linux
+├── Wayland
+│   ├── Hyprland
+│   ├── KDE/KWin
+│   ├── GNOME/Mutter
+│   └── Sway/wlroots
+└── X11
+    ├── Xorg + KDE
+    ├── Xorg + GNOME
+    └── lightweight WM
+```
+
+不需要 CI 全部覆盖，但稳定版前需要至少有真实环境 smoke tests。
+
+---
+
+# Windows 的差异则更多集中在 ConPTY
+
+WezTerm 自己维护的 `portable-pty` 就来自这个项目，现在 Bitty 也在用它。
+
+这里社区积累出来的问题非常有价值。
+
+POSIX PTY：
+
+```text
+application
+   ↕ bytes
+kernel PTY
+   ↕
+terminal
+```
+
+相对“透明”。
+
+Windows ConPTY 则不是完全等价的 POSIX PTY。
+
+例如 WezTerm 作者自己解释过：Unix PTY 基本是 kernel stream device，而 Windows ConPTY 会介入并处理一部分 terminal behavior，甚至可能往输出流里合成一些 escape sequence。([GitHub][4])
+
+另外还有实际的 capability mismatch。例如社区讨论里就提到了某些 terminal capability/graphics 在 ConPTY/WSL 路径下不能和真正 Unix PTY 一样使用。([GitHub][5])
+
+因此 WezTerm 的经验其实支持你现在 Bitty 的设计：
+
+```text
+                  Pty abstraction
+                        │
+            ┌───────────┴───────────┐
+            ↓                       ↓
+          Unix                   Windows
+            │                       │
+        POSIX PTY                 ConPTY
+
+tty_name        Some(...)          None
+signal          SIG...             None
+process group   available          limited
+resize          PTY semantics      ConPTY resize
+```
+
+**不要试图强行让 Windows 看起来完全像 Unix。**
+
+---
+
+# Windows 还有一个大坑：IME
+
+这甚至是 `winit` 也不可能百分之百替你消掉的问题。
+
+WezTerm 当前 Windows window implementation 有数千行平台代码；社区到 2026 年仍然有 Windows IME 相关的问题。例如有报告指出 WezTerm 的 Windows 路径使用 IMM32，而 Windows Voice Typing 走 TSF，因此 `Win+H` 的识别文字没有地方送入 terminal。([GitHub][6])
+
+另外 2026 年也还有 Windows IME interaction 引发 UI panic 的 bug 报告。([GitHub][7])
+
+这说明一个重要事实：
+
+```text
+cross-platform input abstraction
+             ≠
+所有 native text-input system 都完全一致
+```
+
+尤其中文输入：
+
+```text
+Windows
+├── IMM32
+└── TSF
+
+macOS
+└── NSTextInput...
+
+Linux
+├── Wayland text-input protocols
+├── IBus
+└── Fcitx
+```
+
+Terminal 对这一块特别敏感。
+
+所以 Bitty 以后 IME 最好也看成一个独立的 **capability boundary**，而不是普通 keyboard event 的附属功能。
+
+---
+
+# macOS 社区最常见的一个差异：字体渲染
+
+WezTerm issue 里有非常多这种：
+
+> 为什么同样的字体，在 iTerm2 / Kitty / WezTerm 看起来粗细不一样？
+
+例如 macOS 上就有用户报告相同字体配置下 WezTerm 的字形更细、spacing 不同；还有 ligature rendering inconsistent 的长期问题。([GitHub][8])
+
+Windows 同样有人对比 Windows Terminal 和 WezTerm，发现相同字体 family/weight 下粗细和 line metrics 不一致。([GitHub][9])
+
+这也是为什么 WezTerm 没有简单依赖一个统一系统字体 API，而是自己有：
+
+```text
+wezterm-font
+├── HarfBuzz
+├── FreeType
+│
+├── Linux → fontconfig
+├── Windows → dwrote / DirectWrite
+└── macOS → CoreText / CoreFoundation
+```
+
+它当前 `wezterm-font/Cargo.toml` 就是通过 target-specific dependencies 管理这些差异。([GitHub][10])
+
+这和 Bitty 现在的：
+
+```text
+crossfont
+```
+
+思路基本相同。
+
+---
+
+# WezTerm 一个非常值得 Bitty学习的地方：渲染 fallback
+
+WezTerm 并没有赌：
+
+> “选一个 GPU backend，只要正确实现就够了。”
+
+它现在提供三种 frontend：
+
+```text
+OpenGL
+Software
+WebGpu
+```
+
+官方文档目前说明默认又回到了 `OpenGL`；如果 GPU/OpenGL driver 有问题，可以使用 `Software`；WebGPU 则通过 WGPU 提供 Metal、Vulkan、DX12 等 backend。([GitHub][11])
+
+所以实际架构接近：
+
+```text
+                     WezTerm Renderer
+                            │
+          ┌─────────────────┼────────────────┐
+          ↓                 ↓                ↓
+       OpenGL            WebGPU          Software
+                            │
+              ┌─────────────┼─────────────┐
+              ↓             ↓             ↓
+           Vulkan          Metal          DX12
+```
+
+为什么要这么复杂？
+
+因为真实世界 GPU driver 会出问题。
+
+社区有：
+
+* Windows WebGPU input lag；
+* Windows 某些 GPU/backend 启动失败；
+* Wayland + NVIDIA/WebGPU CPU usage 异常；
+* macOS OpenGL 与 WebGPU font/color rendering 不一样。([GitHub][12])
+
+也就是说：
+
+> WGPU 抽象掉了 API 差异，但没有抽象掉 driver bug。
+
+---
+
+# WezTerm 对这个问题的解决方法非常务实
+
+它不是要求：
+
+```text
+所有平台
+所有 driver
+所有 backend
+
+→ 必须走同一路径
+```
+
+而是提供大量 escape hatch。
+
+例如：
+
+```lua
+front_end = "OpenGL"
+front_end = "WebGpu"
+front_end = "Software"
+
+enable_wayland = false
+
+webgpu_preferred_adapter = ...
+webgpu_power_preference = ...
+```
+
+以及 Windows/OpenGL 路径还有 EGL/WGL 选择相关策略。当前配置源码甚至直接注明：
+
+> Windows 上 EGL resize 更容易出现 jank，但 EGL 对 graphics driver update 更有韧性；WGL 则在某些情况下体验更好。([GitHub][2])
+
+这其实是成熟跨平台软件很典型的一种思路：
+
+> **不要假设存在一个所有机器上都最好的 backend。**
+
+---
+
+# Windows ARM64 又是另一个很好玩的真实例子
+
+2026 年社区有人做 Windows ARM64 build，就遇到了：
+
+```text
+WezTerm executable        ARM64 ✓
+
+OpenGL frontend           ×
+WebGPU/DX12               ✓
+
+bundled ANGLE libEGL.dll  x64 ×
+libGLESv2.dll             x64 ×
+```
+
+最后不仅 executable 要 ARM64：
+
+```text
+wezterm.exe
+wezterm-gui.exe
+wezterm-mux-server.exe
+```
+
+**所有随包附带的 native DLL 也必须 ARM64。**
+
+而且那个环境下 WebGPU/DX12 可以运行，默认 OpenGL 反而失败。([GitHub][13])
+
+这个例子对 Bitty 的 Windows ARM64 release 很有参考意义：
+
+```text
+Target architecture
+       │
+       ├── bitty.exe
+       ├── bundled DLL
+       ├── renderer backend
+       ├── native dependencies
+       └── installer
+```
+
+必须全部一致。
+
+---
+
+# WezTerm 其实采用的是“多层平台抽象”
+
+把整个架构压缩一下，大概是：
+
+```text
+                  Terminal / Mux / Tabs / Config
+                            │
+                 platform-neutral logic
+                            │
+      ┌─────────────────────┼─────────────────────┐
+      │                     │                     │
+ Window abstraction     PTY abstraction       Font abstraction
+      │                     │                     │
+ ┌────┼────┐            ┌───┴────┐        ┌───────┼───────┐
+Win  mac  X11/WL       Unix    ConPTY    Linux    Win    macOS
+      │
+ Renderer abstraction
+      │
+ OpenGL / WebGPU / Software
+                │
+       Vulkan / Metal / DX12
+```
+
+这个结构最值得 Bitty 学。
+
+---
+
+## WezTerm 的社区问题也说明了一件事
+
+一个项目做到 WezTerm 这么成熟，**跨平台 bug 仍然不会消失**。
+
+而且它们通常已经不是：
+
+```text
+Windows API 和 Linux API 名字不一样
+```
+
+这种简单问题。
+
+而是：
+
+```text
+Hyprland 更新后 surface behavior 变化
+
+NVIDIA + Wayland + Vulkan
+出现特殊问题
+
+Apple Silicon + Metal
+font rasterization 有差别
+
+Windows IME
+TSF / IMM32 不同
+
+ConPTY
+terminal semantics 不完整等价于 Unix PTY
+
+Windows ARM64
+ANGLE DLL architecture 不匹配
+```
+
+这种二阶甚至三阶 interaction。
+
+所以真正成熟的跨平台软件追求的不是：
+
+> **“平台差异不存在。”**
+
+而是：
+
+> **“平台差异被限制在清晰的边界里，并且出问题时能够 fallback。”**
+
+---
+
+# 这对 Bitty 有一个很直接的启示
+
+我觉得 Bitty **现在没有必要照抄 WezTerm 自己实现 Windows/X11/Wayland/macOS window backend**。
+
+你现在：
+
+```text
+bitty-platform → winit
+bitty-render   → wgpu
+bitty-pty      → portable-pty
+```
+
+已经相当于：
+
+```text
+WezTerm 自己多年积累的平台 abstraction
+        ↓
+Bitty 借成熟 crate 获得大部分能力
+```
+
+Bitty 当前最应该学的是 WezTerm 的**上层策略**：
+
+| WezTerm 的经验                          | Bitty 可以采用                                       |
+| ------------------------------------ | ------------------------------------------------ |
+| Windows/Wayland/X11/macOS backend 隔离 | 保持 `bitty-platform`                              |
+| POSIX PTY / ConPTY 不强求完全相同           | 保持 `bitty-pty::platform`                         |
+| 多 renderer fallback                  | `wgpu` + `sw-fallback`                           |
+| Wayland 出问题可以 X11 fallback           | 保留 backend override                              |
+| GPU backend 可选择                      | 暴露 Vulkan/DX12/Metal/GL diagnostics/config       |
+| 平台不支持的 capability 明确表示               | `Option` / `Unsupported`                         |
+| 用户可输出 GPU/platform diagnostics       | 以后做 `bitty doctor`                               |
+| 社区 issue 必须记录 OS/compositor/GPU      | Bitty issue template 也这么设计                       |
+| 真机测试不可替代 compile CI                  | Linux Wayland/X11 + Windows + macOS smoke matrix |
+
+其中我尤其建议 Bitty 学一个 WezTerm 很成熟的东西：**diagnostics**。
+
+以后用户报：
+
+> Bitty 在我这里窗口黑屏。
+
+最好让：
+
+```bash
+bitty doctor
+```
+
+直接输出：
+
+```text
+Bitty 0.x
+
+Platform
+  OS: Linux
+  Kernel: ...
+  Arch: x86_64
+  Session: Wayland
+  Compositor: Hyprland
+
+Window
+  backend: Wayland
+
+Renderer
+  wgpu backend: Vulkan
+  adapter: AMD Radeon ...
+  driver: Mesa ...
+  surface format: ...
+  present mode: ...
+
+PTY
+  backend: Unix PTY
+
+Fonts
+  primary: JetBrains Mono
+  backend: FreeType/fontconfig
+
+Features
+  kitty-graphics: yes
+  sixel: yes
+  software-renderer: available
+```
+
+这类信息对于跨平台 bug 的价值非常高。WezTerm 自己就提供 `wezterm.gui.enumerate_gpus()` 之类的诊断接口，让用户能明确报告究竟使用了哪个 GPU/backend。([GitHub][14])
+
+所以如果把 WezTerm 的经验浓缩成一句对 Bitty 最有价值的话，我会认为是：
+
+> **不要让 Bitty Core 变得 platform-aware；让 Bitty 的 platform layer 变得 capability-aware。**
+
+例如不要在上层写：
+
+```rust
+if windows {
+    ...
+}
+```
+
+而尽量变成：
+
+```rust
+if platform.supports_foreground_process_group() {
+    ...
+}
+```
+
+或者：
+
+```rust
+match renderer.capabilities().software_fallback {
+    Available => ...
+    Unavailable => ...
+}
+```
+
+这样以后 Bitty 不只是能兼容 Windows/Linux/macOS，甚至以后加 BSD 等平台时，架构也不会被三个 OS 名字绑死。
+
+[1]: https://github.com/wezterm/wezterm/blob/main/docs/features.md?utm_source=chatgpt.com "wezterm/docs/features.md at main · wezterm/wezterm · GitHub"
+[2]: https://github.com/wezterm/wezterm/blob/main/config/src/config.rs?utm_source=chatgpt.com "wezterm/config/src/config.rs at main · wezterm/wezterm · GitHub"
+[3]: https://github.com/wezterm/wezterm/issues/7232?utm_source=chatgpt.com "window rendering is broken on wayland (hyprland v0.51) · Issue #7232 · wezterm/wezterm · GitHub"
+[4]: https://github.com/wezterm/wezterm/discussions/2459?utm_source=chatgpt.com "portable-pty escape example on Windows · wezterm wezterm · Discussion #2459 · GitHub"
+[5]: https://github.com/wez/wezterm/discussions/6588?utm_source=chatgpt.com "Correct configuration for wsl2. Ignoring ConPTY limitations · wezterm wezterm · Discussion #6588 · GitHub"
+[6]: https://github.com/wezterm/wezterm/issues/7791?utm_source=chatgpt.com "Windows: Win+H voice typing produces no input (no TSF text store) · Issue #7791 · wezterm/wezterm · GitHub"
+[7]: https://github.com/wezterm/wezterm/issues/7829?utm_source=chatgpt.com "[Windows] RefCell already borrowed panic on Windows during IME interaction · Issue #7829 · wezterm/wezterm · GitHub"
+[8]: https://github.com/wezterm/wezterm/issues/5075?utm_source=chatgpt.com "Font / Text rendering differences · Issue #5075 · wezterm/wezterm · GitHub"
+[9]: https://github.com/wezterm/wezterm/issues/2477?utm_source=chatgpt.com "side by side comparison with Windows Terminal shows text rendering differences · Issue #2477 · wezterm/wezterm · GitHub"
+[10]: https://github.com/wezterm/wezterm/blob/main/wezterm-font/Cargo.toml?utm_source=chatgpt.com "wezterm/wezterm-font/Cargo.toml at main · wezterm/wezterm · GitHub"
+[11]: https://github.com/wezterm/wezterm/blob/main/docs/config/lua/config/front_end.md?utm_source=chatgpt.com "wezterm/docs/config/lua/config/front_end.md at main · wezterm/wezterm · GitHub"
+[12]: https://github.com/wezterm/wezterm/issues/3425?utm_source=chatgpt.com "Unable to launch WezTerm with WebGPU front-end · Issue #3425 · wezterm/wezterm · GitHub"
+[13]: https://github.com/wezterm/wezterm/discussions/7575?utm_source=chatgpt.com "Compiling for Windows on ARM · wezterm wezterm · Discussion #7575 · GitHub"
+[14]: https://github.com/wezterm/wezterm/issues/2756?utm_source=chatgpt.com "WebGPU front_end · Issue #2756 · wezterm/wezterm · GitHub"
+可以，而且我认为这甚至可能成为 Bitty 后续比较有价值的一条技术路线：**Bitty 先作为真实复杂应用把跨平台问题踩一遍，再把稳定下来的平台抽象提炼成独立 crate。**
+
+不过我不建议一开始就以“我要做下一个 winit/wgpu”为目标。更合理的路线是：
+
+```text
+Bitty 内部需求
+    ↓
+bitty-platform 中建立抽象
+    ↓
+Linux / Windows / macOS 真机验证
+    ↓
+API 稳定
+    ↓
+发现其他项目也能复用
+    ↓
+抽成独立 crate
+    ↓
+Bitty 反过来依赖它
+```
+
+这其实比先造一个“万能 IME crate”成功率高很多。
+
+## IME 特别适合这样做
+
+你说的 Electron 在 Wayland 下输入法经常需要环境变量/启动参数，这个例子非常典型。问题并不只是“Electron IME 写得不好”，而是 Linux 输入法这层本身就比较碎：
+
+```text
+                    Application
+                         │
+        ┌────────────────┴────────────────┐
+        ↓                                 ↓
+       X11                            Wayland
+        │                                 │
+       XIM                       text-input protocol
+        │                                 │
+ Fcitx / IBus                     compositor
+                                          │
+                                      Fcitx / IBus
+```
+
+再叠加 GTK、Qt、Chromium/Electron 自己的 IM module/Ozone backend，才会出现：
+
+```text
+GTK_IM_MODULE
+QT_IM_MODULE
+XMODIFIERS
+
+--ozone-platform=wayland
+--enable-wayland-ime
+...
+```
+
+Fcitx 官方现在的 Wayland 文档仍然明确区分 GTK、Qt、Chromium/Electron、原生 Winit 程序等不同路径；原生 Winit 应用通常走 Wayland `text-input-v3`，而 Electron/Chromium 仍存在 backend/protocol 选择上的特殊处理。([Fcitx][1])
+
+所以这是一个非常真实的“缺少统一平台抽象”的领域。
+
+---
+
+## Winit 其实已经做了第一层，但没有解决全部问题
+
+现在 Winit 0.30 已经给你：
+
+```rust
+WindowEvent::Ime(...)
+```
+
+其中有：
+
+```text
+Enabled
+Disabled
+Preedit
+Commit
+```
+
+([Docs.rs][2])
+
+并且有：
+
+```rust
+window.set_ime_allowed(true);
+
+window.set_ime_cursor_area(...);
+```
+
+后者用于告诉系统：
+
+> “我的文本光标现在在这里，候选框请尽量显示在这里。”
+
+但 Winit 自己的文档就明确承认平台能力不完全相同，例如 X11 的 cursor area 只支持 position，不支持完整区域；某些平台干脆不支持。([Docs.rs][3])
+
+所以未来 Bitty 可能遇到：
+
+```text
+Bitty 的需求
+     ↓
+Winit IME abstraction
+     ↓
+80% 能做
+     ↓
+剩下 20%
+Windows TSF / Wayland protocol / macOS NSTextInput
+需要更深层控制
+```
+
+这时候就很适合逐步形成自己的 abstraction。
+
+---
+
+# 我会把 IME crate 设计成“语义层”，而不是“OS API 大杂烩”
+
+假设以后真的拆出一个独立 crate，我会希望上层看到的是这样的概念：
+
+```rust
+enum ImeEvent {
+    Started,
+    Preedit {
+        text: String,
+        selection: Option<Range<usize>>,
+    },
+    Commit(String),
+    Cancelled,
+    Ended,
+}
+```
+
+以及：
+
+```rust
+struct ImeContext {
+    cursor_rect: Rect,
+    surrounding_text: Option<String>,
+    selection: Option<Range<usize>>,
+    purpose: InputPurpose,
+}
+```
+
+再配：
+
+```rust
+struct ImeCapabilities {
+    preedit: bool,
+    cursor_rect: bool,
+    surrounding_text: bool,
+    candidate_positioning: bool,
+    text_purpose: bool,
+}
+```
+
+下面才是：
+
+```text
+                   Common IME API
+                         │
+      ┌──────────────────┼───────────────────┐
+      ↓                  ↓                   ↓
+    Linux              Windows              macOS
+      │                  │                   │
+ ┌────┴────┐            TSF            NSTextInputClient
+ ↓         ↓
+Wayland   X11
+ ↓         ↓
+text-     XIM /
+input-v3  platform integration
+```
+
+这样就和前面说的原则一样：
+
+> **不要以 OS 名字设计上层 API，要以 capability 设计。**
+
+---
+
+# Windows IME 如果以后深入，重点可能反而是 TSF
+
+这也是从 WezTerm 一类项目能看到的问题。
+
+Windows 有历史上的：
+
+```text
+IMM32
+```
+
+还有现代：
+
+```text
+TSF
+Text Services Framework
+```
+
+中文/日文/韩文 IME、语音输入、现代输入服务等并不完全等价。
+
+所以如果 Bitty 真想把 Windows text input 做得特别好，将来可能不是简单：
+
+```text
+winit ImeEvent
+```
+
+就结束，而是：
+
+```text
+bitty text-input abstraction
+             ↓
+           TSF
+```
+
+这时候如果你把这一层做得足够好，确实可能成为一个有价值的独立 Rust crate。
+
+---
+
+# Linux IME 则不要直接把 Fcitx 当成唯一 API
+
+这里特别需要谨慎。
+
+例如 Wayland 理想路径通常应该是：
+
+```text
+Bitty
+  ↓
+Wayland text-input protocol
+  ↓
+Compositor
+  ↓
+Fcitx / IBus
+```
+
+而不是：
+
+```text
+Bitty
+  ↓
+直接绑定 Fcitx
+```
+
+因为应用不应该知道用户到底使用：
+
+```text
+Fcitx
+IBus
+其他输入法
+```
+
+Wayland `text-input` protocol 本来就是为了把这层隔离开来的。其协议负责 composing text、preedit/commit 等语义。([Wayland][4])
+
+所以如果做跨平台 crate，边界最好是：
+
+```text
+IME semantic API
+      ↓
+platform text-input mechanism
+```
+
+而不是：
+
+```text
+IME semantic API
+      ↓
+具体某个输入法产品
+```
+
+---
+
+# 字体则是另一类问题
+
+字体实际上可以拆成至少四层：
+
+```text
+Font
+├── 1. Discovery
+│     “系统里有哪些字体？”
+│
+├── 2. Fallback
+│     “JetBrains Mono 没有这个汉字，用谁？”
+│
+├── 3. Shaping
+│     “这串 Unicode → 哪些 glyph？”
+│
+└── 4. Rasterization
+      “glyph → pixels”
+```
+
+现在 Rust 已经有不少不错的积木。
+
+比如当前 `cosmic-text 0.19` 已经覆盖：
+
+* font discovery；
+* fallback；
+* shaping；
+* layout；
+* optional rasterization。
+
+它目前使用 `fontdb`、`harfrust`，rasterization 可使用 `swash`。([Docs.rs][5])
+
+所以对 Bitty 来说，**字体不一定需要从零造整个轮子**。
+
+---
+
+# 但是字体 discovery 仍然很有提升空间
+
+例如 `fontdb` 很有意思。
+
+它支持：
+
+```text
+Windows
+Linux
+macOS
+```
+
+的系统字体扫描，但它自己明确说：
+
+> 不调用系统字体 API，而是扫描预定义目录。
+
+而且它也明确说：
+
+> font fallback 不是它负责的。
+
+([Docs.rs][6])
+
+这意味着如果你追求真正 native 的行为：
+
+```text
+Linux
+  ↓
+fontconfig
+
+Windows
+  ↓
+DirectWrite
+
+macOS
+  ↓
+CoreText
+```
+
+仍然有空间做一个更强的 abstraction。
+
+---
+
+# 对 terminal 来说甚至可以做一个专门的字体层
+
+普通 UI text library 的目标可能是：
+
+```text
+漂亮地排版一段文章
+```
+
+但 terminal 有非常特殊的 invariant：
+
+```text
+cell width 必须稳定
+monospace metrics 必须稳定
+
+ASCII
+CJK
+Emoji
+Powerline
+Nerd Font
+Ligature
+Combining mark
+
+都必须和 terminal grid 对齐
+```
+
+例如：
+
+```text
+┌───┬───┬───┬───┐
+│ A │ 中    │ 😀    │
+└───┴───┴───┴───┘
+```
+
+这里：
+
+```text
+A   → 1 cell
+中  → 2 cells
+😀  → 1 or 2 cells depending policy
+```
+
+还要处理：
+
+```text
+Unicode width
+grapheme
+font fallback
+glyph advance
+terminal cell width
+```
+
+这几个概念**并不是一回事**。
+
+这其实可能成为一个很有价值的 crate：
+
+```text
+Cross-platform terminal font engine
+```
+
+而不是普通：
+
+```text
+general-purpose text layout
+```
+
+---
+
+# 比如可以把字体架构设计成
+
+```text
+                    Terminal Font API
+                           │
+         ┌─────────────────┼─────────────────┐
+         ↓                 ↓                 ↓
+     Discovery          Shaping          Rasterizer
+         │                 │                 │
+    platform             harfrust          swash
+    backend              / etc.         / platform
+         │
+ ┌───────┼────────┐
+ ↓       ↓        ↓
+Linux  Windows   macOS
+ ↓       ↓        ↓
+font-   Direct   Core
+config  Write    Text
+```
+
+上面再加 Bitty 真正关心的：
+
+```text
+TerminalFallback
+TerminalMetrics
+CellMetrics
+EmojiPolicy
+LigaturePolicy
+FallbackChain
+GlyphCache
+```
+
+这就会比简单的 `crossfont` 更有意义。
+
+---
+
+# 但我强烈建议：先不要同时写两个“大型跨平台 crate”
+
+IME 和字体都属于：
+
+```text
+“看起来 API 很小，
+底下其实是十年级别平台坑”
+```
+
+的领域。
+
+如果现在直接：
+
+```text
+bitty-ime
+bitty-font
+```
+
+两个都从 OS API 重写，很容易把 Bitty 主项目拖慢。
+
+更好的路线是“四阶段”。
+
+## 第一阶段：Wrapper
+
+现在保持：
+
+```text
+bitty-platform
+    ↓
+winit IME
+
+bitty-render
+    ↓
+crossfont
+```
+
+Bitty 自己只定义：
+
+```text
+Bitty-owned types
+```
+
+这一点你目前已经做得很好。
+
+---
+
+## 第二阶段：Compatibility layer
+
+发现真实缺陷后：
+
+```text
+Winit IME
+    ↓
+bitty-platform::text_input
+    ↓
+补 platform-specific behavior
+```
+
+字体：
+
+```text
+crossfont
+    ↓
+bitty-font abstraction
+    ↓
+fallback/metrics/cache policy
+```
+
+先不发布 crate。
+
+---
+
+## 第三阶段：形成 conformance suite
+
+这个非常关键。
+
+例如 IME：
+
+```text
+Tests
+├── English dead keys
+├── Chinese Pinyin
+├── Japanese Kana/Kanji
+├── Korean Hangul
+├── compose
+├── candidate window
+├── cursor positioning
+├── selection
+└── focus loss
+```
+
+环境：
+
+```text
+Linux
+├── Wayland + Hyprland + Fcitx5
+├── Wayland + KDE + Fcitx5
+├── GNOME + IBus
+└── X11
+
+Windows
+├── Microsoft Pinyin
+├── Japanese IME
+└── TSF
+
+macOS
+├── Pinyin
+└── Japanese
+```
+
+这套测试资产其实比 crate API 本身更有价值。
+
+---
+
+# 第四阶段：再拆独立 crate
+
+当你发现：
+
+```text
+Bitty
+   ↓
+已经不再依赖 terminal-specific assumptions
+```
+
+就可以：
+
+```text
+bitty-platform::ime
+        ↓ extract
+cross-platform-ime crate
+        ↓
+Bitty 反向依赖
+```
+
+这时候这个 crate 才是真的产品，而不是：
+
+> “为了代码目录漂亮而拆出来的 crate。”
+
+---
+
+# 还有一个重要原则：能修 upstream 就先修 upstream
+
+例如问题明确是：
+
+```text
+winit Wayland text-input-v3 implementation bug
+```
+
+那么最好：
+
+```text
+Bitty reproducer
+      ↓
+fix winit upstream
+      ↓
+所有 Rust GUI app 获益
+```
+
+而不是：
+
+```text
+fork winit
+```
+
+或者自己重写整个 window stack。
+
+只有当：
+
+```text
+Winit 的 abstraction 本身表达不了 Bitty 需要的能力
+```
+
+才值得真正做下一层 abstraction。
+
+这也是生态贡献效率最高的方法。
+
+---
+
+## 你提到 Electron 的情况其实正说明了这件事的价值
+
+一个理想的 Bitty 用户体验应该是：
+
+```bash
+bitty
+```
+
+然后：
+
+```text
+Hyprland + Fcitx5    ✓
+KDE Wayland + Fcitx5 ✓
+GNOME + IBus         ✓
+X11 + Fcitx5         ✓
+Windows Pinyin       ✓
+macOS Pinyin         ✓
+```
+
+而不是用户先查 Wiki：
+
+```bash
+export GTK_IM_MODULE=...
+export QT_IM_MODULE=...
+export XMODIFIERS=...
+bitty --some-ime-flag
+```
+
+Electron/Chromium 的问题部分来自它们必须在 X11/XWayland、native Wayland、Ozone、GTK IM module 和不同 text-input protocol 之间做选择；Fcitx 当前文档依然专门给 Chromium/Electron 留了一大段说明。([Fcitx][1])
+
+如果 Bitty 能通过比较窄、原生的 Rust stack 把这些选择隐藏在：
+
+```text
+bitty-platform
+```
+
+下面，用户体验确实可以更干净。
+
+---
+
+## 我比较推荐 Bitty 最终形成这样的层次
+
+```text
+                         Bitty
+                           │
+             ┌─────────────┴──────────────┐
+             ↓                            ↓
+       Text Input API                Font API
+             │                            │
+     ┌───────┼────────┐          ┌────────┼─────────┐
+     ↓       ↓        ↓          ↓        ↓         ↓
+   Linux   Windows   macOS    Discovery Shaping Raster
+     │       │        │
+ Wayland   TSF     NSText
+   /X11
+```
+
+然后 Bitty Core 只认识：
+
+```text
+Preedit
+Commit
+CursorRect
+FontFace
+GlyphRun
+CellMetrics
+RasterizedGlyph
+Capabilities
+```
+
+完全不认识：
+
+```text
+Fcitx
+IBus
+TSF
+IMM32
+CoreText
+fontconfig
+Wayland text-input-v3
+```
+
+这些全部藏在 backend。
+
+**这其实就是 `winit/wgpu` 最值得学习的地方：不是“支持很多平台”本身，而是把平台差异变成一个稳定、能力导向的 Rust API。**
+
+如果 Bitty 在真实使用中先验证出这一套，再把其中 IME 或 terminal-font 部分独立出来，它完全有机会反过来成为别的 Rust GUI/terminal 项目会愿意依赖的基础设施。
+
+[1]: https://fcitx-im.org/wiki/Using_Fcitx_5_on_Wayland?utm_source=chatgpt.com "Using Fcitx 5 on Wayland - Fcitx"
+[2]: https://docs.rs/winit/latest/winit/event/enum.Ime.html?utm_source=chatgpt.com "Ime in winit::event - Rust"
+[3]: https://docs.rs/winit/latest/winit/window/struct.Window.html?utm_source=chatgpt.com "Window in winit::window - Rust"
+[4]: https://wayland.app/protocols/xx-text-input-v3?utm_source=chatgpt.com "Text input protocol | Wayland Explorer"
+[5]: https://docs.rs/cosmic-text/latest/cosmic_text/?utm_source=chatgpt.com "cosmic_text - Rust"
+[6]: https://docs.rs/fontdb/latest/fontdb/index.html?utm_source=chatgpt.com "fontdb - Rust"
+

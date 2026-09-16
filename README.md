@@ -65,13 +65,13 @@ To add new research:
 | 021 | Captured | Shared toolchain, organized collaboration, compilable context       |
 | 022 | Captured | Mechanisms in core, workflows in plugins, compressed views          |
 | 023 | Captured | Docs are good enough; move into runtime implementation              |
-| 024 | **Open** | Stop design inflation; reconcile, extract, harden                   |
+| 024 | Captured | Stop design inflation; reconcile, extract, harden                   |
 | 025 | Captured | Stable content first, appends last, hit rate first                  |
 | 026 | Captured | Built-ins teach semantics, runtime owns capabilities                |
 | 027 | Captured | Core around a thousand words, capabilities on demand                |
 | 028 | Captured | Remove empty shells, deduplicate, fix identity ownership            |
 | 029 | Captured | Core stays offline, extensions cross controlled boundaries          |
-| 030 | **Open** | Keep kernel minimal, third parties in adapters                      |
+| 030 | Captured | Keep kernel minimal, third parties in adapters                      |
 | 031 | Captured | Terminal snapshot and tool gateway block AI integration             |
 | 032 | Captured | Core defines models, plugins handle vendors and subscriptions       |
 | 033 | Captured | Unify multimodal lifecycles, keep per-modality request shapes       |
@@ -83,11 +83,19 @@ To add new research:
 | 039 | Captured | Panel is a workspace container; activity keeps sessions alive       |
 | 040 | Captured | Plugins form dependency, service, and extension graphs              |
 | 041 | Captured | IPC is a second plugin boundary sharing one capability model        |
+| 042 | Captured | Separate dependency kinds; firewall Core; own release compatibility |
+| 043 | Captured | Native, VM, and physical test tiers with QEMU/libvirt VMs           |
 
-Open items: **024, 030** — conclusions not yet recorded in `*-docs`. Records
-**039, 040, 041** are captured for the plugin direction only: their conclusions
-are recorded in `bitty-plugins-docs`, and the originals stay unrenamed because
-the terminal direction still needs them.
+All records are captured: 024 in `bitty-docs` (documentation workflow,
+DIR-015, project state snapshot, Phase A reconciliation) and 030 in
+`bitty-ai-docs` (`specifications/dependency-strategy.md`). Records 039-041 are
+captured for the plugin direction in `bitty-plugins-docs` (CTX-0019, CTX-0020)
+and the AI direction in `bitty-ai-docs`; 039's terminal direction is carried by
+the accepted Panel Runtime RFC in `bitty-terminal-docs`, while 040/041
+terminal-side items remain proposals there and their open items stay tracked in
+the summaries. Records 042 and 043 are captured as draft pages in `bitty-docs`
+(`development/platform-compatibility.md`, `development/testing-infrastructure.md`)
+through PR bitty-docs#315, which is open and not merged.
 
 ## Index — code reviews
 

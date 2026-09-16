@@ -1,0 +1,1618 @@
+你知道虚拟机的技术吗？目前创建虚拟机有哪些方式呢？如果只说在 Linux 下面创建，比如 VirtualBox, VMware Workstation, Qemu+KVM, Docker/Podman 等等。  
+然后这些如果要创建一个 Windows 11 的操作系统然后进行测试是否可以在宿主机通过 cli 或者编写脚本(不知道有没有 SDK)来进行自动化子测试呢？  
+是否可以模拟出各个不同的架构比如 ARM 架构呢?
+对。对于 **Bitty 这种跨平台终端模拟器**，我会把 Linux 上的主要 VM 测试基础设施定为：
+
+```text
+QEMU + KVM + libvirt
+```
+
+但更准确地说，Bitty 最终应该采用 **三层测试架构**，而不是“所有东西都放 VM”。
+
+## 1. 推荐的总体测试架构
+
+```text
+                 Bitty Test Infrastructure
+                          │
+        ┌─────────────────┼──────────────────┐
+        │                 │                  │
+   Native Tests       VM Tests        Physical Tests
+        │                 │                  │
+  unit / parser      OS integration      GPU / IME
+  PTY / layout       ConPTY / PTY        real hardware
+  ECS / config       Wayland / X11       macOS
+        │                 │
+        │          QEMU + libvirt
+        │                 │
+        │        ┌────────┼────────┐
+        │        │        │        │
+        │      Win11    Linux    ARM64
+        │       x64      x64      TCG
+        │        │        │
+        │       KVM      KVM
+        │
+     cargo test
+```
+
+其中：
+
+```text
+QEMU       = 虚拟硬件
+KVM        = 同架构硬件加速
+libvirt    = VM 生命周期 / API / snapshot / network 管理
+qcow2      = VM 镜像与 overlay
+SSH/WinRM  = Guest 内执行测试
+```
+
+libvirt 本身就支持 `kvm`、`qemu` 等 domain backend，并通过统一的 domain XML 管理 VM，因此它很适合成为你的自动化控制层。([Libvirt][1])
+
+---
+
+# 2. 为什么 Bitty 很适合用 VM 测试
+
+Bitty 和普通 Rust CLI 程序不一样。
+
+它依赖很多 **OS-specific behavior**：
+
+```text
+Linux
+├── PTY
+├── Wayland
+├── X11
+├── fontconfig / FreeType
+├── Mesa
+├── Vulkan / OpenGL
+├── IME
+└── shell
+    ├── bash
+    ├── zsh
+    └── fish
+
+Windows
+├── ConPTY
+├── Win32
+├── DirectWrite
+├── D3D12 / Vulkan
+├── IME
+├── PowerShell
+└── cmd.exe
+```
+
+尤其 Windows 的 ConPTY 本身就是专门提供给 Terminal Emulator 使用的 pseudoconsole API：Terminal 负责输入、输出和渲染，而 ConPTY 承担字符模式应用的 pseudo console。([Microsoft Learn][2])
+
+因此只做：
+
+```bash
+cargo test
+```
+
+远远不够。
+
+VM 非常适合测试：
+
+```text
+“Bitty 在真正的 Windows / Linux Kernel 和用户空间环境下是否工作”
+```
+
+---
+
+# 3. Bitty 第一阶段 VM Matrix
+
+一开始不用把矩阵铺得特别大。
+
+我会先建四个镜像：
+
+| Guest        | Arch   | Accelerator | 用途               |
+| ------------ | ------ | ----------- | ---------------- |
+| Arch Linux   | x86_64 | KVM         | 主 Linux          |
+| Ubuntu LTS   | x86_64 | KVM         | 通用 Linux         |
+| Windows 11   | x86_64 | KVM         | Windows / ConPTY |
+| Alpine Linux | x86_64 | KVM         | musl / 极简环境      |
+
+然后第二阶段：
+
+```text
+Fedora x86_64
+Debian x86_64
+
+Arch ARM64
+Ubuntu ARM64
+Windows 11 ARM64
+```
+
+其中 ARM64 如果你的宿主机是 x86_64：
+
+```text
+ARM64 Guest
+     │
+     ▼
+QEMU TCG
+     │
+     ▼
+x86_64 Host
+```
+
+可以测试，但**不建议每个 commit 都运行**。
+
+更合理：
+
+```text
+PR:
+    Linux x86_64 KVM
+    Windows x86_64 KVM
+
+main:
+    + Ubuntu
+    + Fedora
+    + Alpine
+
+nightly:
+    + Linux ARM64 TCG
+    + Windows ARM64 TCG
+```
+
+QEMU 的 ARM `virt` machine 支持多种 AArch64 CPU model，因此做 ARM system emulation 完全没问题。([QEMU][3])
+
+以后 Bitty CI 规模大起来，可以直接买一台 ARM64 Linux 主机：
+
+```text
+ARM64 Host
+   +
+KVM
+   ↓
+ARM64 VM
+```
+
+性能会比 TCG 高非常多。
+
+---
+
+# 4. VM 不应该每次重新安装系统
+
+这是整个测试平台非常重要的一点。
+
+不要：
+
+```text
+PR
+ ↓
+下载 Windows ISO
+ ↓
+安装 Windows
+ ↓
+安装驱动
+ ↓
+安装 Bitty
+ ↓
+测试
+```
+
+而应该做：
+
+```text
+                base image
+                     │
+          Windows 11 clean.qcow2
+                     │
+       ┌─────────────┴─────────────┐
+       ↓                           ↓
+ overlay-A.qcow2             overlay-B.qcow2
+       │                           │
+      PR #1                       PR #2
+```
+
+例如 base image 已经安装好：
+
+```text
+Windows 11
+├── VirtIO driver
+├── SSH
+├── Git
+├── PowerShell
+├── VC Runtime
+├── Test Agent
+└── Bitty testing dependency
+```
+
+测试时只创建：
+
+```text
+qcow2 overlay
+```
+
+测试结束：
+
+```text
+rm overlay.qcow2
+```
+
+环境立刻恢复。
+
+甚至比 snapshot 更适合 CI。
+
+---
+
+# 5. libvirt 在这里的作用非常重要
+
+如果只有：
+
+```text
+QEMU + KVM
+```
+
+当然也能：
+
+```bash
+qemu-system-x86_64 ...
+```
+
+但慢慢你会遇到：
+
+```text
+VM 生命周期
+网络
+IP 分配
+snapshot
+storage pool
+CPU topology
+TPM
+UEFI
+devices
+logging
+parallel VM
+```
+
+于是你自己会开始写一个“小 libvirt”。
+
+所以直接：
+
+```text
+Bitty Test Controller
+        │
+        ▼
+     libvirt
+        │
+        ▼
+      QEMU
+        │
+        ▼
+       KVM
+```
+
+更合理。
+
+libvirt 的 snapshot 可以捕获 disk 状态，支持 internal/external snapshot；对自动恢复干净测试环境很有价值。([Libvirt][4])
+
+---
+
+# 6. Bitty 可以做自己的测试控制器
+
+甚至我觉得不需要直接写大量 shell。
+
+以后可以在 Bitty workspace 里有一个：
+
+```text
+xtask/
+```
+
+或者：
+
+```text
+crates/
+└── bitty-test-runner
+```
+
+例如：
+
+```bash
+cargo xtask vm list
+cargo xtask vm start win11-x64
+cargo xtask vm test win11-x64
+cargo xtask vm test arch-x64
+cargo xtask vm test --all
+```
+
+内部：
+
+```text
+bitty-test-runner
+       │
+       ├── libvirt API
+       │
+       ├── SSH
+       │
+       ├── artifact upload
+       │
+       ├── test execution
+       │
+       └── result collection
+```
+
+最后做到：
+
+```bash
+cargo xtask vm test windows-11
+```
+
+自动执行：
+
+```text
+1. 创建 qcow2 overlay
+2. libvirt 创建 VM
+3. boot
+4. 等待 Guest ready
+5. 上传 bitty.exe
+6. 执行 tests
+7. 收集 stdout/stderr
+8. 收集 screenshot
+9. 收集 Bitty log
+10. shutdown
+11. 删除 overlay
+```
+
+这个架构会非常漂亮。
+
+---
+
+# 7. Guest 内不要只依赖 QEMU Guest Agent
+
+QEMU Guest Agent 很有用，它通过 VirtIO serial channel 与宿主通讯，可以协助 host 完成 guest OS 相关管理操作。([libvirt Wiki][5])
+
+但我建议：
+
+```text
+libvirt
+    │
+    ├── QEMU Guest Agent
+    │        管 VM
+    │
+    └── SSH / WinRM
+             跑测试
+```
+
+职责分开。
+
+例如：
+
+### libvirt
+
+负责：
+
+```text
+start
+shutdown
+snapshot
+CPU
+RAM
+network
+disk
+```
+
+### QEMU Guest Agent
+
+负责：
+
+```text
+guest state
+filesystem freeze
+guest shutdown
+IP information
+```
+
+### SSH
+
+负责：
+
+```text
+cargo test
+bitty.exe
+PowerShell
+bash
+collect logs
+copy artifacts
+```
+
+这样更简单。
+
+Windows 现在完全可以安装 OpenSSH Server，所以你的 Test Runner 可以基本统一成：
+
+```rust
+trait Guest {
+    async fn exec(&self, command: &str);
+    async fn upload(&self, path: &Path);
+    async fn download(&self, path: &Path);
+}
+```
+
+然后：
+
+```text
+LinuxGuest → SSH
+WindowsGuest → SSH
+```
+
+甚至不用专门引入 WinRM。
+
+---
+
+# 8. 但是 Bitty 有一个 VM 很难完全解决的问题：GPU
+
+这是最重要的限制。
+
+Bitty：
+
+```text
+winit
++
+wgpu
++
+text renderer
+```
+
+意味着 GPU 是非常重要的测试对象。
+
+QEMU 有：
+
+```text
+virtio-gpu
+```
+
+而且现在支持：
+
+```text
+2D
+virglrenderer
+Vulkan Venus
+rutabaga / gfxstream
+```
+
+等不同 backend。QEMU 官方文档目前也明确列出了 virtio-gpu 的 2D 和 accelerated backends，以及 Vulkan passthrough 等能力。([QEMU][6])
+
+所以 VM 可以测试：
+
+```text
+Wayland
+X11
+Mesa
+virtio-gpu
+Vulkan
+OpenGL
+```
+
+例如 Linux VM：
+
+```text
+Bitty
+ ↓
+wgpu
+ ↓
+Vulkan
+ ↓
+Mesa
+ ↓
+virtio-gpu
+ ↓
+virgl / Venus
+ ↓
+Host GPU
+```
+
+这已经非常适合：
+
+```text
+窗口能不能创建
+wgpu 初始化是否正常
+字体是否正常
+shader 是否正常
+resize 是否正常
+render loop 是否崩
+```
+
+---
+
+# 9. 但 VM 不能替代真实 GPU 测试
+
+比如以后出现：
+
+```text
+NVIDIA proprietary driver bug
+
+Intel Mesa bug
+
+AMD RADV bug
+
+Windows NVIDIA D3D12 bug
+
+macOS Metal bug
+```
+
+VM 就覆盖不了了。
+
+所以 Bitty 最终应该是：
+
+```text
+                 Bitty CI
+
+             ┌──── Native
+             │
+             ├──── QEMU/KVM
+             │
+             └──── Physical runners
+                      │
+                 ┌────┼─────┐
+                 AMD Intel NVIDIA
+```
+
+真实机器不用每个 PR 都跑。
+
+可以：
+
+```text
+PR
+    native + VM
+
+main
+    native + VM
+
+nightly
+    native
+    VM matrix
+    real GPU matrix
+```
+
+---
+
+# 10. 对 IME 也是同样的问题
+
+Bitty 以后 IME 很重要。
+
+例如：
+
+```text
+fcitx5
+ibus
+Windows IME
+macOS InputMethodKit
+```
+
+VM 可以测试很多：
+
+```text
+Windows Chinese IME
+Windows Japanese IME
+Linux fcitx5
+Linux ibus
+Wayland text-input
+XIM
+```
+
+但有些 bug 强依赖：
+
+```text
+Desktop Environment
+Compositor
+Display Server
+IME implementation
+```
+
+所以你以后甚至可以建：
+
+```text
+Arch + Hyprland + fcitx5
+Ubuntu + GNOME + IBus
+KDE Plasma + fcitx5
+X11 + i3
+```
+
+作为不同 VM image。
+
+对于 Bitty，这反而非常有价值。
+
+---
+
+# 11. 我甚至建议测试 compositor
+
+因为 Bitty 是 winit GUI 应用。
+
+Linux 最大的组合实际上是：
+
+```text
+Bitty
+
+├── Wayland
+│   ├── Hyprland
+│   ├── GNOME Mutter
+│   ├── KDE KWin
+│   └── Sway
+│
+└── X11
+    ├── i3
+    ├── KDE
+    └── XFCE
+```
+
+所以未来可以做：
+
+```yaml
+linux:
+  - arch-hyprland
+  - ubuntu-gnome-wayland
+  - fedora-kde-wayland
+  - debian-x11
+```
+
+这对你之前遇到的那种：
+
+> Electron / Wayland / fcitx 环境变量导致 IME 不工作
+
+这种问题尤其有帮助。
+
+---
+
+# 12. Bitty 可以设计专门的 E2E test protocol
+
+我认为这是很值得做的一件事。
+
+不要完全依赖：
+
+```text
+模拟鼠标
+模拟键盘
+截图
+```
+
+否则 GUI 自动化会非常脆弱。
+
+Bitty 自己可以在：
+
+```bash
+bitty --test-mode
+```
+
+下暴露 test IPC：
+
+```text
+test.sock
+```
+
+然后测试控制器：
+
+```text
+spawn terminal
+send keys
+create panel
+split panel
+resize
+open PTY
+query screen
+query cursor
+query render state
+take screenshot
+exit
+```
+
+例如：
+
+```json
+{
+  "command": "send_keys",
+  "panel": 3,
+  "keys": "echo hello\\n"
+}
+```
+
+然后：
+
+```json
+{
+  "command": "screen_dump",
+  "panel": 3
+}
+```
+
+返回：
+
+```text
+$ echo hello
+hello
+$
+```
+
+这会比 UI click automation 稳定太多。
+
+而且你 Bitty 本身已经有 IPC / Panel architecture，这套测试 infrastructure 可以天然利用已有能力。
+
+---
+
+# 13. 最后我会给 Bitty 做这样的测试金字塔
+
+```text
+                    ▲
+                    │
+              Physical HW
+             GPU / IME / Metal
+                 很少
+                    │
+           ──────────────────
+                    │
+               QEMU VM
+        OS / PTY / ConPTY / GUI
+                中等
+                    │
+           ──────────────────
+                    │
+              Integration
+        renderer / parser / IPC
+                 很多
+                    │
+           ──────────────────
+                    │
+               Unit Test
+       parser / grid / ECS / config
+                 最多
+```
+
+而不是：
+
+```text
+所有测试
+   ↓
+QEMU
+```
+
+---
+
+# 14. 我认为 Bitty 最合理的长期方案
+
+最终很可能变成：
+
+```text
+                     GitHub PR
+                         │
+                bitty-test-runner
+                         │
+       ┌─────────────────┼─────────────────┐
+       │                 │                 │
+ cargo test          QEMU/KVM          native runner
+                         │
+                      libvirt
+                         │
+       ┌─────────────────┼──────────────────┐
+       │                 │                  │
+Arch/Wayland       Ubuntu/GNOME        Windows 11
+   x64                 x64                 x64
+   KVM                 KVM                 KVM
+                                             │
+                                         ConPTY
+
+nightly
+   │
+   ├── ARM64 Linux / QEMU TCG
+   ├── Windows ARM64 / QEMU TCG
+   │
+   ├── AMD physical runner
+   ├── Intel physical runner
+   ├── NVIDIA physical runner
+   │
+   └── macOS physical/hosted runner
+          └── Metal
+```
+
+所以你刚才的判断基本正确：
+
+> **Bitty 的 VM 测试主干选择 QEMU + KVM + libvirt 是目前非常合适的。**
+
+但我会再加两个关键设计决策：
+
+**VM Image 用 `base qcow2 + disposable overlay`，Bitty 自己做一个 `bitty-test-runner / cargo xtask` 统一控制 VM 和 Guest 测试。**
+
+这样它以后就不是零散的 CI shell script，而会逐渐变成 Bitty 自己的一套 **cross-platform test lab**。
+
+[1]: https://www.libvirt.org/formatdomain?utm_source=chatgpt.com "libvirt: Domain XML format"
+[2]: https://learn.microsoft.com/en-us/windows/console/pseudoconsoles?utm_source=chatgpt.com "Pseudoconsoles – Windows Desktop - Windows Console | Microsoft Learn"
+[3]: https://www.qemu.org/docs/master/system/arm/virt?utm_source=chatgpt.com "‘virt’ generic virtual platform (virt) — QEMU documentation"
+[4]: https://libvirt.org/formatsnapshot.html?utm_source=chatgpt.com "libvirt: Snapshot XML format"
+[5]: https://wiki.libvirt.org/Qemu_guest_agent.html?utm_source=chatgpt.com "libvirt: QEMU Guest Agent"
+[6]: https://www.qemu.org/docs/master/system/devices/virtio/virtio-gpu.html?utm_source=chatgpt.com "VirtIO GPU — QEMU documentation"
+而且这样是不是可以进行指标测试呢，比如 RAM, GPU, 磁盘占用、首次启动对比等等指标呢，也就是跟 kitty, alacritty, ghostty, foot, wezterm 这些进行对比呢？因为我看在 kitty 的官网就有这种的对比。
+使用 VM 的话就可以避免在宿主机也安装这么多程序，而且我的宿主机是 CachyOS 是有编译优化的，所以不能统一指标
+
+可以，而且我觉得 **VM Benchmark Lab 会非常适合 Bitty**。你的理由也成立：在 CachyOS 这种做过较多优化的宿主机上直接安装并比较各终端，很容易把“终端自身性能”和“宿主发行版/依赖/编译参数差异”混在一起。
+
+但需要补一个关键点：
+
+> **VM 能显著提高环境一致性和可重复性，但不能让宿主机影响完全消失。**
+
+KVM 仍然使用宿主 CPU、Linux scheduler、QEMU/KVM、宿主 GPU 路径等。因此最好把 VM Benchmark 分成 **内部回归基准** 和 **公开性能对比基准** 两种用途。
+
+## 我建议 Bitty 建一个固定 Benchmark VM
+
+比如专门维护：
+
+```text
+bitty-bench-linux-x64.qcow2
+
+Ubuntu 26.04 / Fedora / Vanilla Arch
+固定 Kernel
+固定 Mesa
+固定字体
+固定 DE / compositor
+固定分辨率
+固定 DPI
+固定 shell
+固定 benchmark tools
+```
+
+里面同时装：
+
+```text
+Bitty
+kitty
+Alacritty
+Ghostty
+foot
+WezTerm
+```
+
+每次都是：
+
+```text
+base qcow2
+    ↓
+temporary overlay
+    ↓
+run benchmark
+    ↓
+collect JSON
+    ↓
+destroy overlay
+```
+
+这样不会污染宿主机，也不需要你的 CachyOS 安装一堆 terminal。
+
+---
+
+## 哪些指标特别适合 VM
+
+我会把它分成这样：
+
+| 指标                     | VM 是否适合 | 备注              |
+| ---------------------- | ------: | --------------- |
+| RAM / RSS / PSS        |   ✅ 很适合 | 在 Guest 内测      |
+| CPU usage              |       ✅ | 固定 vCPU         |
+| Idle CPU               |       ✅ | 很有意义            |
+| 启动时间                   |       ✅ | 注意 cold/warm 区分 |
+| Parser throughput      |      ✅✅ | 非常适合            |
+| CSI/Unicode throughput |      ✅✅ | 非常适合            |
+| Scrollback 性能          |       ✅ | 固定 workload     |
+| 大量文本吞吐                 |       ✅ | 很适合             |
+| 磁盘占用                   |       ✅ | 注意动态依赖          |
+| 二进制大小                  |      ✅✅ | 最简单             |
+| 内存增长/泄漏                |      ✅✅ | 长时间 benchmark   |
+| 多 Panel 性能             |       ✅ | Bitty 特有指标      |
+| GPU FPS                |      ⚠️ | virtio-gpu 会影响  |
+| GPU VRAM               |    ⚠️/❌ | 普通 VM 不可靠       |
+| Input latency          |      ⚠️ | 最好真实硬件          |
+| 功耗                     |       ❌ | VM 很难公平测        |
+| 真正用户感知延迟               |    ❌/⚠️ | 更适合物理机器         |
+
+因此 VM 特别适合：
+
+```text
+CPU
+RAM
+startup
+parser
+throughput
+memory growth
+resource scaling
+```
+
+真实机器负责：
+
+```text
+GPU
+latency
+power
+real compositor behavior
+```
+
+---
+
+# RAM 测试其实非常值得做
+
+例如固定：
+
+```text
+1920×1080
+JetBrains Mono 14px
+1 Panel
+bash
+empty scrollback
+```
+
+启动每个 terminal 10 次。
+
+但是**不要只测一个 PID 的 RSS**。
+
+因为不同 terminal 的 process model 不一样。
+
+应该统计：
+
+```text
+whole process tree
+```
+
+比如：
+
+```text
+Terminal
+├── main
+├── renderer?
+├── helper?
+└── shell
+```
+
+最好排除 shell：
+
+```text
+terminal-owned processes only
+```
+
+然后记录：
+
+```text
+RSS
+PSS
+USS
+Peak RSS
+```
+
+其中我最推荐：
+
+```text
+PSS
+```
+
+因为共享 GTK / libc / Mesa library 时，单纯 RSS 很容易误导。
+
+例如：
+
+```text
+Bitty      42 MiB PSS
+foot       24 MiB
+Alacritty  48 MiB
+kitty      61 MiB
+Ghostty    67 MiB
+WezTerm    95 MiB
+```
+
+这才比较有意义。
+
+而且还可以测：
+
+```text
+1 Panel
+2 Panels
+4 Panels
+8 Panels
+16 Panels
+32 Panels
+```
+
+画：
+
+```text
+Memory
+  ^
+  |                  WezTerm
+  |             /
+  |        Bitty
+  |       /
+  |   foot
+  +------------------------> Panels
+     1  2  4  8  16  32
+```
+
+这个对于 Bitty 特别有价值，因为 Bitty 本来就是 **Panel-oriented architecture**。
+
+---
+
+# 启动时间不要只测 `time bitty`
+
+GUI 软件的：
+
+```bash
+time bitty
+```
+
+基本没有意义，因为它测的是进程退出时间。
+
+真正应该定义多个 milestone：
+
+```text
+T0 fork/exec
+ │
+ ├─ T1 process initialized
+ │
+ ├─ T2 window created
+ │
+ ├─ T3 GPU ready
+ │
+ ├─ T4 first frame presented
+ │
+ └─ T5 shell prompt visible
+```
+
+然后：
+
+```text
+Startup-to-window
+Startup-to-first-frame
+Startup-to-shell-ready
+```
+
+尤其：
+
+> **首次启动最好测 `exec → first frame`。**
+
+Bitty 自己可以在：
+
+```bash
+bitty --benchmark
+```
+
+下输出：
+
+```json
+{
+  "process_start_us": 0,
+  "config_loaded_us": 482,
+  "window_created_us": 3291,
+  "gpu_initialized_us": 8127,
+  "pty_spawned_us": 9244,
+  "first_frame_us": 10782
+}
+```
+
+这样 Bitty 自己优化性能的时候会非常有用。
+
+---
+
+# Cold Start 和 Warm Start 一定要分开
+
+这是 benchmark 中经常搞错的。
+
+第一次：
+
+```text
+disk
+ ↓
+filesystem
+ ↓
+page cache
+ ↓
+dynamic linker
+ ↓
+font cache
+ ↓
+shader cache
+```
+
+第二次很多东西都缓存了。
+
+所以应该分别报告：
+
+```text
+Cold startup
+Warm startup
+```
+
+例如：
+
+```text
+Bitty
+
+Cold:
+  31.2 ms
+
+Warm:
+  12.8 ms
+```
+
+对于严格 cold benchmark，最干净的做法甚至是：
+
+```text
+restore VM
+↓
+boot
+↓
+run exactly once
+↓
+destroy
+```
+
+或者重新启动 Guest。
+
+这恰恰是 VM 的巨大优势。
+
+---
+
+# 磁盘占用也可以测，但要定义清楚
+
+至少区分三个概念：
+
+```text
+binary size
+package size
+installed footprint
+```
+
+例如：
+
+```text
+Bitty
+
+binary:
+    8.4 MiB
+
+.tar.zst:
+    3.1 MiB
+
+installed:
+    11.7 MiB
+```
+
+但动态链接软件会有问题：
+
+```text
+Ghostty
+ ↓
+GTK
+ ↓
+GLib
+ ↓
+Pango
+ ↓
+Cairo
+...
+```
+
+这些依赖到底算不算？
+
+所以最好同时提供：
+
+```text
+Application files
+
+Dependencies required on minimal system
+```
+
+例如启动一个极简 VM：
+
+```text
+fresh Linux
+```
+
+安装：
+
+```bash
+pacman -S bitty
+```
+
+记录：
+
+```text
+download size
+installed size
+new dependency footprint
+```
+
+再安装：
+
+```bash
+pacman -S ghostty
+```
+
+这样才能比较“从干净系统安装”的真实代价。
+
+---
+
+# Parser / Terminal throughput 是 VM 最适合测的
+
+kitty 官网现在就是把 terminal performance 分成几个不同维度，而不是简单说“快多少”：
+
+* energy / CPU usage
+* keyboard-to-screen latency
+* throughput
+
+kitty 自己提供了：
+
+```bash
+kitten __benchmark__
+```
+
+测试 ASCII、Unicode、CSI、image 等数据吞吐，并且它明确指出 terminal benchmark 很微妙；尤其渲染是异步的，单纯把渲染 throughput 数字拿来排名并不可靠。([Kovid Goyal's Software Projects][1])
+
+Ghostty 也明确把“fast”拆成了 startup、scrolling、I/O throughput、control sequence throughput、framerate 等不同维度，而不是一个单一数字。([Ghostty][2])
+
+所以 Bitty 以后可以直接建立：
+
+```text
+benchmarks/
+├── ascii
+├── unicode
+├── ansi
+├── csi
+├── sgr
+├── cursor
+├── scroll
+├── resize
+├── image-kitty
+├── image-sixel
+└── mixed-real-world
+```
+
+然后：
+
+```text
+MB/s
+CPU %
+Peak RAM
+frame time
+```
+
+一起记录。
+
+甚至可以直接使用 kitty 的 benchmark workload 去跑其他 terminal，kitty 官方本身就是这么比较的。([Kovid Goyal's Software Projects][1])
+
+---
+
+# 不过 Bitty 最值得做的是 Real-world Replay
+
+我觉得这个甚至比单纯：
+
+```bash
+cat huge.txt
+```
+
+重要。
+
+Ghostty 最近的性能优化就使用了大约 **4 GB asciinema 真实 terminal recording** 来分析 I/O performance，而不仅仅依赖 synthetic benchmark。([Ghostty][3])
+
+Bitty 也可以维护：
+
+```text
+bench-data/
+
+cargo-build.cast
+cargo-test.cast
+git-log.cast
+ripgrep.cast
+npm-install.cast
+neovim.cast
+htop.cast
+unicode.cast
+ansi-heavy.cast
+```
+
+然后：
+
+```text
+recorded terminal stream
+          ↓
+      Bitty parser
+          ↓
+kitty / foot / Ghostty / ...
+```
+
+这样你可以回答：
+
+> Bitty 处理“真实开发工作负载”到底怎么样？
+
+而不是：
+
+> Bitty `cat 1GB ASCII` 很快。
+
+---
+
+# GPU Benchmark 不建议主要依赖普通 VM
+
+这个一定要特别注意。
+
+假如：
+
+```text
+Bitty
+ ↓
+wgpu
+ ↓
+Vulkan
+ ↓
+Mesa
+ ↓
+virtio-gpu
+ ↓
+Venus/virgl
+ ↓
+Host GPU
+```
+
+你测出的：
+
+```text
+FPS
+GPU time
+VRAM
+```
+
+实际上夹杂了：
+
+```text
+Bitty
++ wgpu
++ Mesa
++ virtio-gpu
++ QEMU
++ virgl/Venus
++ host driver
+```
+
+所以可以用于：
+
+> **Bitty 自己版本 A vs B 的回归测试**
+
+例如：
+
+```text
+Bitty 0.4 → 0.5
+frame time:
+5.2 ms → 3.8 ms
+```
+
+很有意义。
+
+但不适合公开说：
+
+> Bitty GPU 比 kitty 快 27%。
+
+因为真实裸机结果可能完全不同。
+
+---
+
+# GPU 公平比较最好做 Physical Benchmark Runner
+
+最终我建议：
+
+```text
+Benchmark Infrastructure
+│
+├── VM Benchmark
+│   ├── CPU
+│   ├── RAM
+│   ├── parser
+│   ├── startup
+│   ├── disk
+│   └── regression
+│
+└── Physical Benchmark
+    ├── AMD
+    ├── Intel
+    ├── NVIDIA
+    └── Apple
+        ├── GPU frame time
+        ├── VRAM
+        ├── input latency
+        └── power
+```
+
+VM 和物理机器不是竞争关系，而是互补。
+
+---
+
+# CachyOS 的问题你理解得基本正确
+
+你的 CachyOS 本身存在：
+
+```text
+optimized kernel
+scheduler
+compiler flags
+packages
+Mesa
+glibc
+LTO/PGO
+CPU tuning
+```
+
+如果：
+
+```text
+CachyOS
+
+pacman -S kitty
+paru -S ghostty
+cargo build --release Bitty
+```
+
+很可能三个程序甚至不是同一种构建条件。
+
+这样比较：
+
+```text
+Bitty vs kitty vs Ghostty
+```
+
+确实容易混入很多 uncontrollable variables。
+
+放 VM 后：
+
+```text
+CachyOS Host
+     │
+     │ KVM
+     ▼
+Ubuntu Benchmark Image
+     │
+     ├─ Bitty
+     ├─ kitty
+     ├─ Ghostty
+     ├─ Alacritty
+     ├─ foot
+     └─ WezTerm
+```
+
+Guest 的：
+
+```text
+kernel
+glibc
+Mesa
+fontconfig
+font
+compositor
+resolution
+config
+```
+
+全部一致。
+
+这已经公平很多。
+
+不过 CachyOS 宿主仍然会影响：
+
+```text
+CPU scheduling
+KVM
+QEMU
+host load
+host power state
+CPU frequency
+GPU backend
+```
+
+所以 Benchmark Runner 最好再做：
+
+```text
+CPU pinning
+fixed vCPU count
+fixed RAM
+fixed VM XML
+fixed QEMU version
+fixed guest image
+host idle
+disable background jobs
+performance governor
+multiple iterations
+median/p95/stddev
+```
+
+而不是只跑一次。
+
+---
+
+# 我会让 Bitty Benchmark 最终输出这种报告
+
+例如：
+
+```text
+Environment
+────────────────────────────
+CPU       Ryzen 9 xxxx
+Host      CachyOS
+QEMU      10.x
+Guest     Ubuntu 26.04
+Kernel    6.x
+vCPU      4 pinned
+RAM       8 GiB
+Display   Wayland / 1920×1080
+Font      JetBrains Mono 14
+Runs      30
+
+
+Startup / first frame
+────────────────────────────
+Bitty        ...
+foot         ...
+kitty        ...
+Alacritty    ...
+Ghostty      ...
+WezTerm      ...
+
+
+Idle PSS
+────────────────────────────
+Bitty        ...
+foot         ...
+...
+
+
+ASCII throughput
+────────────────────────────
+Bitty        ... MB/s
+...
+
+
+Unicode throughput
+────────────────────────────
+...
+
+
+CSI throughput
+────────────────────────────
+...
+
+
+32 panels
+────────────────────────────
+RAM
+CPU
+frame time
+```
+
+而且保存机器可读数据：
+
+```json
+{
+  "environment": {},
+  "bitty": {},
+  "kitty": {},
+  "ghostty": {},
+  "alacritty": {},
+  "foot": {},
+  "wezterm": {}
+}
+```
+
+然后网站自动绘图。
+
+---
+
+所以我认为这可以进一步成为 Bitty 很正规的一个子项目：
+
+```text
+bitty-bench
+```
+
+或者放：
+
+```text
+bitty/
+├── crates/
+├── tests/
+└── benchmark/
+    ├── images/
+    ├── workloads/
+    ├── runner/
+    ├── vm/
+    └── results/
+```
+
+**QEMU/KVM VM 负责可重复、隔离的 CPU/RAM/startup/parser/resource benchmark；真实硬件 runner 负责 GPU/input-latency/power。**
+
+这样以后官网上的性能页面会比简单贴一个“Bitty 比其他终端快 X%”严谨得多，也更经得起别人复现。
+
+[1]: https://sw.kovidgoyal.net/kitty/performance/?utm_source=chatgpt.com "Performance - kitty"
+[2]: https://ghostty.org/docs/about?utm_source=chatgpt.com "About Ghostty"
+[3]: https://ghostty.org/docs/install/release-notes/1-3-0?utm_source=chatgpt.com "1.3.0 - Release Notes"
+
