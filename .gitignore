@@ -1,2 +1,4 @@
 .markdownlint-cli2-cache
 recording/
+.carryctx/config.local.toml
+.worktrees/
