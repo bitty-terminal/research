@@ -80,8 +80,14 @@ To add new research:
 | 036 | Captured | Inherit pane environment via prompt sync, masked for agents         |
 | 037 | Captured | Split config/data/state/cache, shard storage per session            |
 | 038 | Captured | Core emits events, history plugins reuse external shell history     |
+| 039 | Captured | Panel is a workspace container; activity keeps sessions alive       |
+| 040 | Captured | Plugins form dependency, service, and extension graphs              |
+| 041 | Captured | IPC is a second plugin boundary sharing one capability model        |
 
-Open items: **024, 030** — conclusions not yet recorded in `*-docs`.
+Open items: **024, 030** — conclusions not yet recorded in `*-docs`. Records
+**039, 040, 041** are captured for the plugin direction only: their conclusions
+are recorded in `bitty-plugins-docs`, and the originals stay unrenamed because
+the terminal direction still needs them.
 
 ## Index — code reviews
 
