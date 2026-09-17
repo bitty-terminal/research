@@ -91,15 +91,33 @@ To add new research:
 | 045 | Partial  | Lua composes workflows; Core enforces capability, resource, lease, and secret boundaries |
 | 046 | Open     | Wheel scoped to Coding Agent Harness; Personal/Office agents are separate future plugins |
 | 047 | Open     | Caller attribution for provider calls: OpenRouter Apps mechanism + TurnRequest identity  |
+| 048 | Partial  | Agent quality as Model x Harness x Context x Tools x Verification; bitty-ai distilled    |
+| 049 | Partial  | Context Compiler between Agent Runtime and provider over Cold/Warm/Hot layers            |
+| 050 | Partial  | Portable capabilities in `.agents`, harness behavior in `.wheel`; bitty-ai distilled     |
+| 051 | Partial  | Git-inspired context DAG with checkpoints, branches, merges, GC; bitty-ai distilled      |
+| 052 | Partial  | Minimal Wheel kernel with Lua-plugin composition; bitty-ai distilled                     |
+| 053 | Open     | [Plugin contracts and Lua frameworks](summary/053.md) ([origin](origin/053.md))          |
+| 054 | Open     | Bitty owns plugin lifecycle; Lux serves only the Lua dependency layer at build time      |
 
-All records are captured except 044 and 045, which are **Partial**: 044's
+Among the indexed records, 046, 047, 053, and 054 are **Open**; 044, 045, 048, 049, 050, 051, and 052 are **Partial**: 044's
 bitty-owned mechanisms are captured as a draft page in `bitty-docs`
 (`development/execution-host-boundary.md`, DIR-026) through PR bitty-docs#321
 (open, not merged), and 045's bitty-upstream mechanisms as a draft page in
 `bitty-docs` (`development/agent-authority-boundary.md`, DIR-027) through PR
 bitty-docs#323 (open, not merged), while both records' bitty-ai-owned semantics remain
 owner-pending in `bitty-ai-docs` — `origin/044.md` and `origin/045.md`
-therefore stay unrenamed. 024 is captured in `bitty-docs` (documentation workflow,
+therefore stay unrenamed. Records 048-052 are partially distilled as draft
+discussion syntheses in `bitty-ai-docs`
+(`specifications/research/research-distillation-048-049-bitty-ai.md` through
+PR bitty-ai#120, `research-distillation-050-051-bitty-ai.md` through PR
+bitty-ai#120, and `research-distillation-052-bitty-ai.md` through PR
+bitty-ai#122 — all merged; disposition and traceability in the companion
+`research-coverage-ledger.md`), with all other corpora' captures owner-pending —
+`origin/048.md`, `origin/049.md`, `origin/050.md`, `origin/051.md`, and
+`origin/052.md` therefore stay unrenamed, and the summaries' Status fields
+record this Partial disposition. Record 054 stays Open with no verified
+capture; its origin and summary were added by this dispatch for the first
+time. 024 is captured in `bitty-docs` (documentation workflow,
 DIR-015, project state snapshot, Phase A reconciliation) and 030 in
 `bitty-ai-docs` (`specifications/dependency-strategy.md`). Records 039-041 are
 captured for the plugin direction in `bitty-plugins-docs` (CTX-0019, CTX-0020)
