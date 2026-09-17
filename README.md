@@ -89,6 +89,8 @@ To add new research:
 | 043 | Captured | Native, VM, and physical test tiers with QEMU/libvirt VMs                                |
 | 044 | Partial  | Job/Execution first-class under a supervisor; bitty mechanisms captured, ai pending      |
 | 045 | Partial  | Lua composes workflows; Core enforces capability, resource, lease, and secret boundaries |
+| 046 | Open     | Wheel scoped to Coding Agent Harness; Personal/Office agents are separate future plugins |
+| 047 | Open     | Caller attribution for provider calls: OpenRouter Apps mechanism + TurnRequest identity  |
 
 All records are captured except 044 and 045, which are **Partial**: 044's
 bitty-owned mechanisms are captured as a draft page in `bitty-docs`
@@ -110,6 +112,7 @@ through PR bitty-docs#315 (merged).
 
 ## Index — code reviews
 
-| Date                 | Scope                                                                                                                                                                  |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `review/2026-09-15/` | Full-workspace review, 11 reports: `bitty` crates (6), `bitty-ai`, `bitty-devtools`, SDK + template, plugins, docs. `bitty-website` out of scope. See its `README.md`. |
+| Date                                      | Scope                                                                                                                                                                                                                                                                                                                         |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `review/2026-09-15/`                      | Full-workspace review, 11 reports: `bitty` crates (6), `bitty-ai`, `bitty-devtools`, SDK + template, plugins, docs. `bitty-website` out of scope. See its `README.md`.                                                                                                                                                        |
+| [2026-09-17](review/2026-09-17/README.md) | Scoped multi-subagent static review with independent verification: 11 reports in terminal (6), AI (2), and plugins (3) directories. 18 of 19 terminal crates scoped; compat-lab excluded. Coverage, corrected priorities, revision drift, and limited test receipts in campaign index; not all-code or full-suite validation. |
