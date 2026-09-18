@@ -98,8 +98,9 @@ To add new research:
 | 052 | Partial  | Minimal Wheel kernel with Lua-plugin composition; bitty-ai distilled                     |
 | 053 | Open     | [Plugin contracts and Lua frameworks](summary/053.md) ([origin](origin/053.md))          |
 | 054 | Open     | Bitty owns plugin lifecycle; Lux serves only the Lua dependency layer at build time      |
+| 055 | Open     | Wheel as Event-Sourced Agent Workspace: headless agents, event log, versioned context    |
 
-Among the indexed records, 046, 047, 053, and 054 are **Open**; 044, 045, 048, 049, 050, 051, and 052 are **Partial**: 044's
+Among the indexed records, 046, 047, 053, 054, and 055 are **Open**; 044, 045, 048, 049, 050, 051, and 052 are **Partial**: 044's
 bitty-owned mechanisms are captured as a draft page in `bitty-docs`
 (`development/execution-host-boundary.md`, DIR-026) through PR bitty-docs#321
 (open, not merged), and 045's bitty-upstream mechanisms as a draft page in
@@ -115,8 +116,8 @@ bitty-ai#122 — all merged; disposition and traceability in the companion
 `research-coverage-ledger.md`), with all other corpora' captures owner-pending —
 `origin/048.md`, `origin/049.md`, `origin/050.md`, `origin/051.md`, and
 `origin/052.md` therefore stay unrenamed, and the summaries' Status fields
-record this Partial disposition. Record 054 stays Open with no verified
-capture; its origin and summary were added by this dispatch for the first
+record this Partial disposition. Records 054 and 055 stay Open with no verified
+capture; 055's origin and summary were added by this dispatch for the first
 time. 024 is captured in `bitty-docs` (documentation workflow,
 DIR-015, project state snapshot, Phase A reconciliation) and 030 in
 `bitty-ai-docs` (`specifications/dependency-strategy.md`). Records 039-041 are
