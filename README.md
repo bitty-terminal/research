@@ -17,11 +17,12 @@ that led there.
 
 ## Layout
 
-| Path       | Content                                                                       |
-| ---------- | ----------------------------------------------------------------------------- |
-| `origin/`  | Full original records, numbered `NNN.md`. Immutable.                          |
-| `summary/` | Trimmed English summaries, `NNN.md` mirrors `origin/NNN.md`.                  |
-| `review/`  | Code-review campaigns, one directory per date, each with its own `README.md`. |
+| Path        | Content                                                                       |
+| ----------- | ----------------------------------------------------------------------------- |
+| `origin/`   | Full original records, numbered `NNN.md`. Immutable.                          |
+| `summary/`  | Trimmed English summaries, `NNN.md` mirrors `origin/NNN.md`.                  |
+| `review/`   | Code-review campaigns, one directory per date, each with its own `README.md`. |
+| `coverage/` | Record-to-document coverage index, one file per docs corpus.                  |
 
 ## Status workflow
 
@@ -101,7 +102,7 @@ To add new research:
 | 055 | Captured | Wheel as Event-Sourced Agent Workspace: headless agents, event log, versioned context    |
 | 056 | Captured | Split stored history from compiled context; commit rationale, not chain-of-thought       |
 
-Records 044–056 are **Captured** (owner directive 2026-09-18: the `*-docs` corpora are the working corpus agents build on; the research archive records discussion provenance, not task state). Per-corpus capture status lives in the owning docs repos and their ledgers — e.g. the `bitty-docs` research-notes-coverage ledger, the `bitty-ai-docs` research-coverage-ledger, and each record summary's Destination/Open-items fields — not in this index. The origin files stay byte-identical; only the `.completed` suffix and this row status changed.
+Records 044–056 are **Captured** (owner directive 2026-09-18: the `*-docs` corpora are the working corpus agents build on; the research archive records discussion provenance, not task state). Record-to-document coverage now lives here, in the [`coverage/`](coverage/README.md) index (one file per docs corpus), together with each record summary's Destination/Open-items fields. The `*-docs` corpora are intentionally research-free — they carry no research references, record numbers, or coverage ledgers — so the mappings are kept only in this archive. The origin files stay byte-identical; only the `.completed` suffix and this row status changed.
 
 Records 042 and 043 are captured as draft pages in `bitty-docs`
 (`development/platform-compatibility.md`, `development/testing-infrastructure.md`)
