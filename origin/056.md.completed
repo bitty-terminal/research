@@ -1,0 +1,1995 @@
+之前讨论的 bitty-ai 那边的 wheel 上下文可以按照 Git 那种形式，然后可以结构化，那么对于 AI 自己思考的部分、跟用户的对话之类的是不是也需要存起来呢？尤其是思考部分可能一个 LLM 会思考很长，而且这样的话如果一个上下文迁移 fork 这种的话也不方便，这种可以如何设计呢？
+
+是的，而且我觉得这里要做一个非常关键的区分：
+
+> **Wheel 的“存储历史”不应该等于“下一次发给 LLM 的上下文”。**
+
+如果把这两个概念拆开，Git 式设计就会非常自然。用户对话、工具调用、文件操作、Agent 的决策过程都可以长期保存；但真正进入模型 Context Window 的，只是经过选择和编译后的一个 working set。
+
+## 1. 我会把 Wheel 分成三层
+
+| 层                          | 作用                  | 类比 Git             |
+| -------------------------- | ------------------- | ------------------ |
+| **History / Object Store** | 完整保存发生过什么           | `.git/objects`     |
+| **Semantic State**         | 提炼“现在知道什么、决定了什么”    | `tree + commit`    |
+| **Working Context**        | 当前真正喂给 LLM 的 prompt | `index + worktree` |
+
+比如：
+
+```text
+Wheel Object Store
+│
+├── messages
+│   ├── user message
+│   ├── assistant message
+│   └── system/developer message
+│
+├── traces
+│   ├── tool call
+│   ├── tool result
+│   ├── command output
+│   └── file observation
+│
+├── reasoning records
+│   ├── assumptions
+│   ├── decisions
+│   ├── hypotheses
+│   ├── rejected alternatives
+│   └── unresolved questions
+│
+├── artifacts
+│   ├── patches
+│   ├── files
+│   └── reports
+│
+└── context commits
+    ├── tree
+    ├── parent(s)
+    ├── metadata
+    └── summary
+```
+
+然后：
+
+```text
+HEAD
+ ↓
+context commit C
+ ↓
+context tree
+ ├── conversation
+ ├── task state
+ ├── reasoning state
+ ├── knowledge
+ ├── artifacts
+ ├── environment
+ └── agent graph
+```
+
+这样一个 Agent 的状态就不再等于：
+
+```text
+messages: Message[]
+```
+
+而更接近：
+
+```rust
+struct ContextCommit {
+    tree: ObjectId,
+    parents: Vec<ObjectId>,
+    agent: AgentId,
+    model: ModelInfo,
+    timestamp: Timestamp,
+    summary: ObjectId,
+}
+```
+
+---
+
+# 2. 用户对话：应该完整存
+
+这个我认为基本没有疑问。
+
+用户说的：
+
+```text
+User:
+把这个 API 改成 streaming。
+```
+
+Agent 回答：
+
+```text
+Assistant:
+我准备先检查现有 transport 层……
+```
+
+都属于不可变的 `Message Object`。
+
+例如：
+
+```rust
+struct Message {
+    id: ObjectId,
+    role: Role,
+    content: Vec<ContentPart>,
+    author: ActorId,
+    timestamp: Timestamp,
+
+    reply_to: Option<ObjectId>,
+    episode: EpisodeId,
+}
+```
+
+甚至我建议不要把对话天然设计成线性数组。
+
+可以直接允许：
+
+```text
+M1 User
+│
+├── M2 Agent A
+│    └── M3 User
+│
+└── M4 Agent B
+     └── M5 User
+```
+
+也就是说：
+
+> **Conversation 本身也可以是 DAG。**
+
+这样特别适合 Wheel，因为你之前设想的 Agent Team 本来就是图结构，而不是 Main Agent + 平铺 Subagent。
+
+---
+
+# 3. 但“AI 思考”不能简单全部存成文本
+
+这里是最值得设计的部分。
+
+我不建议：
+
+```text
+thinking:
+  token 1
+  token 2
+  token 3
+  ...
+  token 30000
+```
+
+然后把它全部塞回下一次上下文。
+
+这会产生非常严重的问题：
+
+```text
+成本爆炸
+    ↓
+上下文越来越长
+    ↓
+Prompt Cache 变差
+    ↓
+Fork 成本提高
+    ↓
+不同模型无法迁移
+    ↓
+旧 reasoning 反过来污染新 reasoning
+```
+
+而且很多模型的内部 reasoning 本身就是 provider-private state，并不一定会暴露给 Harness。
+
+所以 Wheel 最好定义：
+
+> **Reasoning != raw Chain-of-Thought**
+
+而是保存一个 Wheel 自己控制的 **Reasoning Record / Reasoning Journal**。
+
+---
+
+# 4. 保存“推理结果”，而不是保存每一个思维 token
+
+比如 Agent 花了几千甚至几万 token 研究：
+
+```text
+为什么这里 deadlock？
+```
+
+真正值得长期保存的可能只有：
+
+```yaml
+goal:
+  diagnose deadlock in scheduler
+
+observations:
+  - worker A holds queue_lock
+  - worker B holds state_lock
+
+hypotheses:
+  - lock inversion between queue_lock and state_lock
+
+evidence:
+  - src/scheduler.rs:182
+  - src/worker.rs:94
+  - trace:8b8f...
+
+decision:
+  enforce queue_lock -> state_lock ordering
+
+rejected:
+  - replacing mutex with rwlock
+  - increasing worker count
+
+uncertainties:
+  - shutdown path not checked
+
+next:
+  - inspect shutdown.rs
+```
+
+这才是可以跨：
+
+```text
+模型
+Provider
+Session
+Agent
+机器
+Branch
+```
+
+迁移的东西。
+
+我甚至会把它定义成核心对象：
+
+```rust
+struct ReasoningRecord {
+    goal: Option<ObjectId>,
+
+    observations: Vec<ObjectId>,
+    assumptions: Vec<ObjectId>,
+    hypotheses: Vec<ObjectId>,
+
+    decisions: Vec<ObjectId>,
+    rejected: Vec<ObjectId>,
+
+    uncertainties: Vec<ObjectId>,
+    next_actions: Vec<ObjectId>,
+
+    evidence: Vec<ObjectId>,
+}
+```
+
+这比：
+
+```text
+"First I think...
+Maybe...
+Wait...
+Actually..."
+```
+
+有价值得多。
+
+---
+
+# 5. 所以可以有两种“思考”
+
+我会明确区分：
+
+| 类型                  | 生命周期 | 是否进入 Commit |
+| ------------------- | ---: | ----------: |
+| `Scratch Reasoning` |   很短 |         默认否 |
+| `Reasoning Record`  |   长期 |           是 |
+
+例如 Agent 当前正在思考：
+
+```text
+maybe parser...
+no, tokenizer...
+let me inspect...
+```
+
+这种东西类似：
+
+```text
+/tmp
+RAM
+CPU register
+Git working tree dirty state
+```
+
+没有必要长期保存。
+
+但当 Agent 得到一个稳定结论：
+
+```text
+Parser 没问题；
+真正 bug 是 tokenizer 在 CRLF 上错误计算 offset。
+```
+
+就形成：
+
+```text
+ReasoningRecord
+```
+
+然后进入下一个 `Context Commit`。
+
+---
+
+# 6. 这时候 Git 的 commit 思维会非常合适
+
+比如：
+
+```text
+C0 Initial context
+│
+C1 Understand parser architecture
+│
+C2 Identify CRLF offset bug
+│
+├──── C3-A Fix tokenizer
+│
+└──── C3-B Rewrite offset model
+```
+
+创建 fork 时：
+
+```text
+wheel context fork experiment-a
+```
+
+实际上完全不用：
+
+```text
+复制 100MB 对话
+复制 50MB tool output
+复制 reasoning
+```
+
+只需要：
+
+```text
+refs/heads/experiment-a -> C2
+refs/heads/experiment-b -> C2
+```
+
+之后新增对象分别写入：
+
+```text
+C2
+├── C3-A
+│   └── C4-A
+│
+└── C3-B
+    └── C4-B
+```
+
+所有 C2 以前的数据天然共享。
+
+这就是 content-addressed storage 最大的优势。
+
+---
+
+# 7. “Thinking 很长导致 Fork 很重”的问题因此基本消失
+
+因为你不是：
+
+```text
+Session A = 200 MB
+       ↓ copy
+Session B = 200 MB
+```
+
+而是：
+
+```text
+Objects:
+A
+B
+C
+D
+E
+
+Branch 1:
+A → B → C → D
+
+Branch 2:
+A → B → C → E
+```
+
+磁盘实际上只保存：
+
+```text
+A B C D E
+```
+
+而不是：
+
+```text
+A B C D
+A B C E
+```
+
+这正是 Git 的 structural sharing。
+
+---
+
+# 8. 更关键的是：Commit 应该是“逻辑完整快照”，物理上增量存储
+
+这一点我会直接学 Git。
+
+逻辑上：
+
+```text
+Commit C42
+```
+
+表示 Agent 当前完整认知状态：
+
+```text
+goal
+tasks
+conversation
+knowledge
+reasoning
+files
+panels
+agents
+environment
+```
+
+但是物理上并不需要完整复制。
+
+例如：
+
+```text
+C41 Tree
+├── goal      abc
+├── tasks     def
+├── messages  123
+├── knowledge 456
+└── reasoning 789
+```
+
+下一次只改变 reasoning：
+
+```text
+C42 Tree
+├── goal      abc
+├── tasks     def
+├── messages  123
+├── knowledge 456
+└── reasoning 999
+```
+
+只有：
+
+```text
+999
+new tree
+new commit
+```
+
+需要写入。
+
+这就是非常漂亮的 persistent data structure。
+
+---
+
+# 9. Prompt 则通过一个 `Context Compiler` 生成
+
+这一层我觉得最终会成为 Wheel 非常核心的模块：
+
+```text
+Object Store
+     ↓
+Context Graph
+     ↓
+Context Compiler
+     ↓
+Prompt
+     ↓
+LLM
+```
+
+例如实际存储了：
+
+```text
+3GB history
+800MB command logs
+200MB source observations
+5000 messages
+1200 reasoning records
+300 tasks
+```
+
+但当前调用 Claude / GPT / Gemini 时：
+
+```text
+System Core       5k
+Project Rules     3k
+Current Goal      1k
+Relevant Memory   6k
+Recent Messages  12k
+Relevant Reason   5k
+Code Context      8k
+────────────────────
+Actual Context   40k
+```
+
+所以：
+
+> **存储容量和 Context Window 大小应该彻底解耦。**
+
+这是非常重要的架构原则。
+
+---
+
+# 10. 这甚至对应 Git 的 Index
+
+我觉得可以建立一个非常有意思的映射：
+
+| Git         | Wheel                        |
+| ----------- | ---------------------------- |
+| Object DB   | Context Object Store         |
+| Blob        | Message / Output / Artifact  |
+| Tree        | Context Tree                 |
+| Commit      | Context Commit               |
+| HEAD        | Agent current context        |
+| Branch      | Context branch               |
+| Tag         | Milestone                    |
+| Index       | Prompt staging area          |
+| Worktree    | Agent live runtime           |
+| Reflog      | Agent context history        |
+| Stash       | Suspended temporary context  |
+| Merge       | Context merge                |
+| Cherry-pick | Import reasoning/task/result |
+| Rebase      | Rebuild work on new context  |
+| GC          | Context compaction           |
+| Clone       | Context migration            |
+
+尤其是：
+
+### `Index`
+
+非常值得借鉴。
+
+Wheel 可以存在：
+
+```text
+Stored Context
+       ↓
+Context Selector
+       ↓
+Context Index
+       ↓
+Prompt Compiler
+       ↓
+LLM
+```
+
+`Context Index` 就表示：
+
+> “下一次 inference 准备带进去哪些对象。”
+
+所以用户甚至以后可以：
+
+```bash
+wheel context status
+
+staged:
+  goal: #128
+  task: #421
+  reasoning: #829
+  files:
+    src/parser.rs
+    src/tokenizer.rs
+
+excluded:
+  381 old messages
+  42 irrelevant tool traces
+```
+
+这个设计其实非常强。
+
+---
+
+# 11. Merge 也不能简单拼接 messages
+
+假设：
+
+```text
+C10
+├── Agent A
+│   └── conclusion:
+│       use Arc<RwLock<T>>
+│
+└── Agent B
+    └── conclusion:
+        use actor message passing
+```
+
+那么 merge 不能：
+
+```text
+把两个聊天记录 concatenate
+```
+
+而应该生成：
+
+```text
+Merge Commit
+parents:
+  - C-A
+  - C-B
+
+conflicts:
+  architecture:
+    A: Arc<RwLock>
+    B: Actor
+
+resolved:
+  use Actor
+
+reason:
+  avoids shared mutable scheduler state
+
+preserved:
+  Agent A benchmark results
+```
+
+也就是说：
+
+> **Wheel merge 的核心不是文本 merge，而是 semantic merge。**
+
+这和多 Agent 架构会非常契合。
+
+---
+
+# 12. 对长 reasoning，我还会加入 `Episode`
+
+例如：
+
+```text
+User Message
+    ↓
+Episode #182
+    ├── Reasoning
+    ├── tool: read
+    ├── observation
+    ├── reasoning
+    ├── tool: cargo test
+    ├── observation
+    ├── reasoning
+    └── decision
+    ↓
+Assistant Message
+```
+
+整个 Episode 是一个工作单元：
+
+```rust
+struct Episode {
+    trigger: ObjectId,
+
+    events: Vec<ObjectId>,
+
+    outcome: Option<ObjectId>,
+    reasoning_record: Option<ObjectId>,
+}
+```
+
+于是用户看到的是：
+
+```text
+User
+Assistant
+User
+Assistant
+```
+
+而 Wheel 内部实际上是：
+
+```text
+Message
+   ↓
+Episode
+   ├── Action
+   ├── Observation
+   ├── Reasoning
+   ├── Action
+   ├── Observation
+   └── Decision
+   ↓
+Message
+```
+
+这样调试 Agent 会非常舒服。
+
+---
+
+# 13. Provider 自己的 reasoning state 应该作为可选 opaque object
+
+以后不同模型可能存在：
+
+```text
+reasoning ID
+encrypted state
+continuation token
+cache handle
+provider-specific state
+```
+
+这些东西可以存，但不要让 Core 依赖。
+
+比如：
+
+```rust
+struct ProviderState {
+    provider: ProviderId,
+    model: ModelId,
+
+    opaque: Vec<u8>,
+}
+```
+
+然后：
+
+```text
+ContextCommit
+├── portable reasoning record
+└── optional provider state
+```
+
+这样：
+
+```text
+GPT → GPT
+```
+
+可能可以复用 provider state。
+
+而：
+
+```text
+GPT → Claude
+```
+
+仍然可以靠 Wheel 自己的：
+
+```text
+ReasoningRecord
+Decision
+Observation
+Task
+Message
+```
+
+继续运行。
+
+这就是 **portable semantic context** 与 **provider-native state** 的区别。
+
+---
+
+# 14. 我觉得最终 Wheel 可以形成这种模型
+
+```text
+                   Context Graph
+
+                       C42
+                      /   \
+                    C43   C44
+                     │     │
+                     │     │
+                  Agent A Agent B
+                     │     │
+                     └──┬──┘
+                        │
+                       C45
+                    merge commit
+```
+
+而每个 Commit：
+
+```text
+Context Commit
+│
+├── Goal Tree
+├── Task Tree
+├── Conversation Tree
+├── Reasoning Tree
+├── Knowledge Tree
+├── Artifact Tree
+├── Agent Tree
+├── Panel Tree
+└── Environment Tree
+```
+
+LLM 永远不会直接看到整个 Tree。
+
+而是：
+
+```text
+Context Tree
+     ↓
+Selector / Retriever
+     ↓
+Index
+     ↓
+Compiler
+     ↓
+Model-specific Prompt
+```
+
+---
+
+## 我最推荐的核心原则
+
+我认为 Wheel 可以直接把这句话作为架构原则：
+
+> **Persist events, commit knowledge, compile context.**
+
+即：
+
+```text
+发生过什么
+    ↓
+全部可以记录
+Persist Events
+
+真正学到了什么
+    ↓
+结构化、版本化
+Commit Knowledge
+
+模型现在需要知道什么
+    ↓
+动态选择
+Compile Context
+```
+
+这样一来，**用户对话可以完整保留，工具轨迹可以完整保留，但 AI 的长思考不需要作为“几万 token 的文本历史”继承下去**。真正继承的是 `decision / assumption / evidence / unresolved / next action` 这些语义对象。
+
+这比现在绝大多数 Agent Harness 的 `messages[] + compact summary` 模型要强很多，也特别适合你现在设想的 **Agent DAG + Panel + fork/merge + 多 Agent 相互指挥**：到最后 Wheel 管理的其实已经不是“聊天记录”，而是一个**版本化的 Agent cognition graph（认知状态图）**。
+
+
+这也是为什么选择一个工具上面可以填写 reason（why） 部分，也就是为什么要每次这么做吧？这样每次思考过程就可以记录了？
+是不是缓存命中率高并不等于任务做的好呢？比如每次下一次调用的时候思考过程全部删除，然后保留为什么调用工具是不是也可以呢？
+也就是解决 why, what, where, how 这样的信息存储呢？而且缓存命中率的计费在这个缓存错误的部分应该不是很多吧？
+
+对，而且你现在把两个原本容易混在一起的目标拆开了：
+
+> **上下文管理的目标不是“最大化 cache hit rate”，而是“用尽可能少且稳定的信息，让下一次推理拥有足够正确的状态”。**
+
+Cache hit 只是这个目标下的一个成本/延迟优化指标，绝不能反过来主导 Wheel 的认知架构。
+
+## `reason / why` 的价值正是在这里
+
+假设 Agent 要调用：
+
+```text
+read("src/scheduler.rs")
+```
+
+只有 `what`：
+
+```text
+what:
+  read src/scheduler.rs
+```
+
+下一轮模型其实不知道为什么读。
+
+如果保存：
+
+```yaml
+action:
+  tool: read
+
+what:
+  inspect scheduler implementation
+
+why:
+  previous trace suggests the deadlock occurs
+  while scheduler holds queue_lock
+
+where:
+  src/scheduler.rs
+  function: dispatch()
+
+how:
+  inspect lock acquisition order
+
+expected:
+  determine whether queue_lock is acquired
+  before state_lock
+```
+
+工具执行后再追加：
+
+```yaml
+result:
+  queue_lock is acquired first
+
+evidence:
+  src/scheduler.rs:178-203
+
+implication:
+  inconsistent with worker.rs lock ordering
+
+next:
+  inspect worker.rs
+```
+
+这实际上已经保存了绝大部分**真正有长期价值的推理状态**。
+
+而没有必要保存模型内部可能长达几千 token 的：
+
+```text
+Maybe A...
+Wait...
+Perhaps B...
+Let me reconsider...
+...
+```
+
+---
+
+# 所以 Wheel 可以明确区分 `Reasoning` 和 `Rationale`
+
+我甚至建议名称上不要叫：
+
+```text
+reasoning
+```
+
+而叫：
+
+```text
+rationale
+```
+
+或者：
+
+```text
+intent
+```
+
+因为 `reasoning` 很容易让人理解为完整 Chain-of-Thought。
+
+Wheel 真正需要的其实是：
+
+```text
+LLM internal reasoning
+        │
+        │ 临时
+        ▼
+   decision boundary
+        │
+        ▼
+Structured Rationale
+        │
+        ├── Why
+        ├── What
+        ├── Where
+        ├── How
+        ├── Evidence
+        ├── Result
+        └── Next
+```
+
+前者可以随着一次 inference 消失。
+
+后者进入 Context Object Store。
+
+---
+
+## 甚至可以做成 Tool Call 的标准协议
+
+比如我会考虑：
+
+```rust
+struct ActionIntent {
+    /// What am I trying to accomplish?
+    goal: String,
+
+    /// Why is this action necessary?
+    reason: String,
+
+    /// What am I operating on?
+    target: Target,
+
+    /// How will I do it?
+    method: Option<String>,
+
+    /// What do I expect to learn/change?
+    expected: Option<String>,
+}
+```
+
+工具执行产生：
+
+```rust
+struct ActionOutcome {
+    result: ObjectId,
+
+    observation: Option<String>,
+
+    evidence: Vec<EvidenceRef>,
+
+    changed: Vec<ObjectId>,
+
+    implication: Option<String>,
+}
+```
+
+于是一次完整行为：
+
+```text
+Intent
+  ↓
+Action
+  ↓
+Observation
+  ↓
+Outcome
+```
+
+比传统 Harness：
+
+```json
+{
+  "tool": "read",
+  "args": {
+    "file": "foo.rs"
+  }
+}
+```
+
+包含的信息丰富很多。
+
+---
+
+# Why / What / Where / How 确实是一个很好的基础
+
+但我会再加两个：
+
+```text
+Why
+What
+Where
+How
+Expected
+Observed
+```
+
+如果继续扩展：
+
+```text
+WHY       为什么做
+WHAT      要做什么
+WHERE     对什么对象做
+HOW       怎么做
+EXPECTED  希望得到什么
+OBSERVED  实际发现什么
+SO WHAT   这个结果意味着什么
+NEXT      下一步是什么
+```
+
+比如：
+
+```yaml
+why:
+  tests indicate parser offset corruption
+
+what:
+  inspect CRLF handling
+
+where:
+  tokenizer/src/offset.rs
+
+how:
+  compare byte offset and char offset updates
+
+expected:
+  locate inconsistent increment
+
+observed:
+  CRLF increments char offset twice
+
+implication:
+  source mapping becomes incorrect after CRLF
+
+next:
+  patch increment logic and run parser tests
+```
+
+这已经非常接近一个**机器可读的工程日志**。
+
+---
+
+# 这样完全可以“丢掉上一轮长思考”
+
+例如第一轮模型实际进行了：
+
+```text
+15k reasoning tokens
+```
+
+最后只留下：
+
+```text
+~300 tokens structured rationale
+```
+
+下一轮：
+
+```text
+System
+Project State
+Current Goal
+Relevant Decisions
+Recent User Messages
+
+Action #184
+why: ...
+what: ...
+result: ...
+
+Action #185
+why: ...
+what: ...
+result: ...
+```
+
+然后让新的模型**重新思考**。
+
+这其实往往比继续携带旧 reasoning 更健康。
+
+因为旧推理里面可能包含：
+
+```text
+错误假设
+已经排除的路径
+重复探索
+临时猜测
+模型自己的自言自语
+```
+
+把这些永久带进去反而容易产生 **reasoning inertia（推理惯性）**。
+
+---
+
+# Cache hit 高绝对不意味着 Agent 做得好
+
+这是一个很重要的关系：
+
+```text
+Cache Hit Rate ≠ Task Quality
+```
+
+甚至极端情况下：
+
+### Agent A
+
+```text
+Context: 150k tokens
+cache hit: 95%
+```
+
+每次都把巨大历史带进去。
+
+### Agent B
+
+```text
+Context: 25k tokens
+cache hit: 60%
+```
+
+但 Context Compiler 精确挑出了：
+
+```text
+当前 goal
+关键 decisions
+相关代码
+最近 observation
+必要 conversation
+```
+
+Agent B 很可能：
+
+```text
+更快
+更便宜
+注意力更集中
+任务质量更高
+```
+
+所以 Wheel 真正应该优化的是一个多目标函数：
+
+```text
+Task success
+Context relevance
+Latency
+Token cost
+Cache reuse
+Information preservation
+```
+
+而不是：
+
+```text
+maximize(cache_hit_rate)
+```
+
+---
+
+# 甚至“主动破坏缓存”有时候都是正确行为
+
+例如上下文里面有：
+
+```text
+80k old context
+```
+
+缓存命中率很好。
+
+但其中 60k 已经与当前任务无关。
+
+这时候：
+
+```text
+Context Compiler
+        ↓
+重新构造 20k context
+```
+
+可能导致：
+
+```text
+cache miss ↑
+```
+
+但同时：
+
+```text
+输入 Token ↓
+延迟 ↓
+噪声 ↓
+模型注意力 ↑
+```
+
+整体反而更好。
+
+所以以后 Wheel 的 telemetry 不应该只显示：
+
+```text
+cache hit: 84%
+```
+
+而应该类似：
+
+```text
+Context
+────────────────────────
+input             31.4k
+cached            19.2k
+cache hit          61.1%
+
+selected objects     184
+excluded objects   2,921
+compressed          74.3%
+
+relevant estimate   93%
+```
+
+甚至可以有：
+
+```text
+context efficiency
+```
+
+这种 Wheel 自己定义的指标。
+
+---
+
+# Git 类比在这里又成立了
+
+Git 不会因为：
+
+> “历史信息已经存在，所以每次操作都把整个 Git 历史复制到工作目录。”
+
+而这么做。
+
+它是：
+
+```text
+Object Database
+      ↓
+HEAD
+      ↓
+Index
+      ↓
+Working Tree
+```
+
+Wheel 也应该：
+
+```text
+Context Object Store
+      ↓
+HEAD
+      ↓
+Context Index
+      ↓
+Prompt
+```
+
+所以：
+
+> **历史完整性和当前工作集大小没有直接关系。**
+
+这是整个设计最重要的一点之一。
+
+---
+
+# 你的 Tool `reason` 甚至可以承担类似 commit message 的作用
+
+这其实是我觉得特别漂亮的地方。
+
+Git commit：
+
+```text
+fix(parser): correct CRLF offset handling
+
+CRLF previously incremented the logical character
+offset twice, causing source maps to drift.
+```
+
+Wheel Tool Call：
+
+```yaml
+tool: edit
+
+where:
+  tokenizer/src/offset.rs
+
+what:
+  correct CRLF offset increment
+
+why:
+  investigation showed CRLF increments logical
+  position twice, causing source-map drift
+```
+
+二者本质非常像：
+
+> **不要只记录“发生了什么变化”，还要记录“为什么发生这个变化”。**
+
+这会让后来的：
+
+```text
+Agent
+Human
+Context Compiler
+Review Agent
+Debug Agent
+```
+
+都能理解历史。
+
+---
+
+# 关于你最后问的缓存计费
+
+这里需要稍微纠正一下：“cache miss 代价应该不大”**不能一概而论**。
+
+以当前 OpenAI GPT-5.6 的 Prompt Caching 为例，官方文档写的是：
+
+* 普通 uncached input：`1×`
+* cached read：`0.1×`
+* cache write：`1.25×`
+
+也就是说缓存读取确实便宜很多；而首次写入缓存反而比普通输入略贵。如果一个前缀能反复使用，收益会很明显。([OpenAI Developers][1])
+
+所以假设有一个：
+
+```text
+100k token stable prefix
+```
+
+连续调用十几次：
+
+```text
+高 cache hit
+```
+
+和：
+
+```text
+每次全部 miss
+```
+
+成本差距还是可能很大的。
+
+但这依然不意味着应该为了缓存保存垃圾 Context。
+
+正确的优先级应该是：
+
+```text
+1. 信息正确
+2. 信息相关
+3. Context 尽量小
+4. 稳定部分尽量放前面
+5. 在此基础上提高 cache reuse
+```
+
+而不是：
+
+```text
+1. Cache hit
+2. 其他
+```
+
+OpenAI 当前的缓存机制本身也是按照**相同 prompt prefix** 来复用 KV 状态，因此 Wheel 完全可以把 Context Compiler 设计成：
+
+```text
+Stable Prefix
+├── Wheel Core Prompt
+├── Tool Definitions
+├── Project Rules
+├── Stable Project Knowledge
+└── Stable Agent Configuration
+
+Semi-stable
+├── Goal
+├── Task
+└── Decisions
+
+Dynamic Tail
+├── recent messages
+├── latest observations
+├── tool results
+└── current request
+```
+
+这样同时兼顾：
+
+```text
+Context Quality
++
+Cache Hit Rate
+```
+
+而不是二选一。([OpenAI Developers][1])
+
+---
+
+所以我觉得 Wheel 现在可以形成一个很清晰的哲学：
+
+```text
+Raw Thought      → ephemeral
+Rationale        → persistent
+Action           → persistent
+Observation      → persistent
+Decision         → persistent
+Conversation     → persistent
+Prompt           → compiled
+Cache            → optimization
+```
+
+其中最关键的一句话可以是：
+
+> **Wheel 不需要记住 Agent 想过的每一句话，只需要记住它为什么行动、做了什么、发现了什么，以及因此改变了什么认知。**
+
+这其实已经比传统 `messages[]` Agent Harness 更接近真正的 **versioned cognitive state system** 了。
+
+[1]: https://developers.openai.com/zh-Hans/api/docs/guides/prompt-caching?utm_source=chatgpt.com "提示缓存 | OpenAI API"
+
+我先查一下主流 LLM 厂商（OpenAI、Anthropic、Gemini 等）对「缓存命中」的官方计费规则，再对照你说的 90% 命中率这个场景说明实际怎么算。是的，你的理解方向是对的：计费是按 token 拆开算的，不是整次请求二选一。  
+一次请求里，命中缓存的那部分按「缓存命中价」收，没命中的那部分按「普通输入价」收。输出 token 一律按输出价，不打折。
+
+以一次请求输入 10,000 token、命中率 90% 为例：
+
+9,000 token → 按缓存命中价
+1,000 token → 按普通输入价
+输出 token → 按输出价
+
+所以「90% 上下文按缓存价、10% 按正常输入价」这句话，对这一次请求的输入部分基本成立。
+
+实际账单怎么拆
+
+主流厂商会在 usage 里把输入拆成几类，分别乘不同单价：
+
+| 类型 | 一般含义 | 常见价格 |
+|---|---|---|
+| 缓存命中 / cache read | 前缀已处理过，直接复用 | 通常是输入价的 10%（打 1 折，省 90%） |
+| 未命中输入 | 新内容、或前缀对不上的部分 | 1× 普通输入价 |
+| 缓存写入 / cache write | 第一次把这段前缀写入缓存 | Anthropic 常见 1.25×（5 分钟 TTL）或 2×（1 小时 TTL）；OpenAI 多数模型写入不另加价 |
+| 输出 | 模型新生成的内容 | 1× 输出价，缓存不影响 |
+
+Claude 官方文档写得很直白：你付的是「写入缓存（比普通输入贵 25%）+ 读取缓存（只要输入价的 10%）+ 未缓存内容的普通输入」。 breakpoint 本身不收费。
+
+各家差异（2026 年常见规则）
+
+Anthropic Claude（显式缓存）
+要在稳定前缀上打 cache_control
+命中：约 0.1× 输入价
+写入：5 分钟缓存约 1.25×，1 小时约 2×
+所以第一次比「不开缓存」还贵一点，复用 2 次左右才回本
+
+以 Claude Sonnet 4.6 为例（约 $3 / $0.30 / $15 每百万 token）：  
+10,000 token 输入、90% 命中、假设这次是命中而不是写入：
+
+9,000 × $0.30/M = $0.0027
+1,000 × $3/M = $0.003
+输入合计约 $0.0057  
+对比全按输入价 $0.03，输入成本大约只剩 19%。
+
+OpenAI（自动前缀缓存）
+一般不用改代码，前缀 ≥ 1024 token 且开头完全一致就会尝试命中
+新一代 GPT-5.x 命中价也常是输入价的 10%（老模型曾是 5 折）
+多数情况下写入不加价；个别更新模型文档里出现过 cache write 1.25×，要以当下定价页为准
+响应里看 usage.prompt_tokens_details.cached_tokens（或 Responses API 的 cached_tokens）
+
+Google Gemini
+隐式缓存：自动命中，命中部分大约 10% 输入价（2.5+）
+显式 Context Cache：命中也便宜，但额外按「缓存 token × 小时」收存储费
+
+DeepSeek、部分中转/国内通道也是「命中按折扣、未命中按原价」这一套。
+
+有两个容易混的点
+
+1. 「90% 命中率」有两种口径
+
+单次请求**：这次输入里 90% token 来自缓存。计费就是上面那种拆分。
+一段时间平均**：100 次请求里，总输入 token 的 90% 是 cache read。  
+  这时还要把「第一次写入」摊进去。Claude 上写一次贵 25%，后面 9 次便宜 90%，整体仍然很省，但不会刚好等于「全程 90% 都打 1 折」。
+
+2. 缓存是前缀精确匹配，不是语义相似
+
+必须从 prompt 开头逐 token 一致。  
+系统提示、工具定义、文档放前面且固定；用户问题、可变历史放最后。  
+中间改一个空格、换行、工具顺序，从改动点往后全部变成未命中，按原价收。
+
+另外：
+缓存只便宜输入处理，输出照常收费
+缓存 token 通常仍占上下文窗口、也常计入 TPM 限额
+有 TTL：Claude 默认约 5 分钟（命中会刷新），OpenAI 常见数分钟到更长保留，Gemini 显式缓存你自己设 TTL
+
+一句话结论
+
+对，一次 90% 缓存命中 = 90% 输入按缓存命中价 + 10% 输入按普通输入价 + 全部输出按输出价。  
+如果这是「创建缓存」的第一次，Claude 那 90% 还可能先按写入溢价（1.25×/2×）收一次，之后才是 0.1×。
+
+可以，而且这正是 Wheel 这种设计相比传统 `messages[]` Harness 很有潜力的地方：**成本优化和上下文质量优化并不冲突，反而可以互相增强。**
+
+核心结构可以变成：
+
+```text
+Context Object Store
+        ↓
+Context Compiler
+        ↓
+┌─────────────────────────────┐
+│ Stable Prefix               │  ← 尽量缓存
+│ - Wheel Core Prompt         │
+│ - Tool Schemas              │
+│ - Project Rules             │
+│ - Stable Knowledge          │
+├─────────────────────────────┤
+│ Structured State            │  ← 小而稳定
+│ - Goal                      │
+│ - Task                      │
+│ - Decisions                 │
+│ - Rationale                 │
+│ - Important Observations    │
+├─────────────────────────────┤
+│ Dynamic Tail                │  ← 经常变化
+│ - Recent User Messages      │
+│ - Latest Tool Results       │
+│ - Current Request           │
+└─────────────────────────────┘
+        ↓
+       LLM
+```
+
+这时 Wheel 同时获得三个收益。
+
+第一是**缓存友好**。最稳定、最大的那部分放在前面，Provider 可以重复利用；真正变化的通常只有后面的几千 token。也就是说一次 30k context 完全可能有 20k+ 是稳定前缀，而不是每轮全部重新处理。
+
+第二是**上下文更干净**。上一轮模型可能内部思考了 20k token，但 Wheel 不需要把 20k 全部继承，只保留类似：
+
+```yaml
+goal:
+  fix scheduler deadlock
+
+decision:
+  inspect lock acquisition order
+
+rationale:
+  trace indicates inconsistent ordering
+
+evidence:
+  - scheduler.rs:182
+  - worker.rs:94
+
+observed:
+  scheduler: queue -> state
+  worker: state -> queue
+
+next:
+  normalize lock ordering
+```
+
+可能只需要几百 token。
+
+于是下一轮模型看到的是：
+
+```text
+之前得出了什么结论
+为什么得出
+依据在哪里
+目前还缺什么
+```
+
+而不是重新阅读大量模型“自言自语”。
+
+第三是**模型可以重新推理**。这一点甚至可能提升质量。
+
+传统 Harness 经常：
+
+```text
+旧 reasoning
+    ↓
+继续 reasoning
+    ↓
+继续继承旧假设
+```
+
+Wheel 可以：
+
+```text
+old raw reasoning
+      × 丢弃
+
+structured rationale
+      +
+evidence
+      +
+current state
+      ↓
+fresh reasoning
+```
+
+这样新的 inference 可以重新判断：
+
+> “上一轮认为是 deadlock，但证据真的支持吗？”
+
+这比不断把过去的思维链拖进去更不容易形成 reasoning inertia。
+
+---
+
+## 所以 Wheel 真正应该优化的不是 Cache Hit Rate
+
+可以定义成类似：
+
+```text
+Context Efficiency
+```
+
+它大概取决于：
+
+```text
+任务成功率
+    ↑
+
+相关信息 / 总输入信息
+    ↑
+
+可复用稳定 Context
+    ↑
+
+无关历史
+    ↓
+
+重复 reasoning
+    ↓
+
+Token Cost
+    ↓
+
+Latency
+    ↓
+```
+
+所以可能出现：
+
+```text
+方案 A
+150k context
+95% cache hit
+
+方案 B
+30k context
+80% cache hit
+```
+
+即使 A 的 cache rate 更高，B 仍可能更便宜、更快、效果更好。
+
+因为：
+
+```text
+150k × 5% uncached
+```
+
+和：
+
+```text
+30k × 20% uncached
+```
+
+已经很接近；而 B 还少处理了 120k token 的注意力负担。
+
+所以 Wheel 不能搞成：
+
+```text
+maximize(cache_hit)
+```
+
+而应该是：
+
+```text
+minimize(required_context)
+while
+preserving(required_information)
+```
+
+然后：
+
+```text
+maximize(cache_reuse)
+```
+
+作为第二层优化。
+
+---
+
+## `why / what / where / how` 会成为其中非常关键的数据结构
+
+我甚至觉得以后 Tool API 可以统一成两部分：
+
+```rust
+struct Action {
+    intent: Intent,
+    call: ToolCall,
+}
+```
+
+其中：
+
+```rust
+struct Intent {
+    why: String,
+    what: String,
+    where_: Option<Target>,
+    how: Option<String>,
+    expected: Option<String>,
+}
+```
+
+工具完成以后：
+
+```rust
+struct Outcome {
+    observed: String,
+    evidence: Vec<Reference>,
+    changed: Vec<ObjectId>,
+    implication: Option<String>,
+    next: Option<String>,
+}
+```
+
+于是每一步不是传统的：
+
+```text
+read foo.rs
+```
+
+而是：
+
+```text
+WHY
+怀疑 scheduler 与 worker 存在反向锁顺序
+
+WHAT
+检查 scheduler 的锁获取顺序
+
+WHERE
+src/scheduler.rs::dispatch
+
+HOW
+检查 queue_lock / state_lock acquisition
+
+EXPECTED
+确认是否 queue → state
+
+────────────
+
+OBSERVED
+确实 queue → state
+
+EVIDENCE
+scheduler.rs:182-203
+
+IMPLICATION
+与 worker.rs 的 state → queue 冲突
+
+NEXT
+统一锁顺序
+```
+
+这里其实已经把一个长 reasoning 的**有效信息密度极大提高**了。
+
+---
+
+## 这甚至能让 Wheel 的 Context Fork 非常便宜
+
+例如当前状态：
+
+```text
+C100
+├── conversation
+├── rationale
+├── observations
+├── tasks
+└── knowledge
+```
+
+现在两个 Agent fork：
+
+```text
+             C100
+             /  \
+          C101A C101B
+```
+
+不用复制：
+
+```text
+历史对话
+完整 reasoning
+tool output
+项目知识
+```
+
+它们都只是引用已有 Object。
+
+A 新增：
+
+```text
+hypothesis: lock ordering
+```
+
+B 新增：
+
+```text
+hypothesis: shutdown race
+```
+
+真正新增的可能只有几 KB。
+
+同时第一次 inference 可以共享绝大部分 stable prefix。
+
+所以：
+
+```text
+Storage sharing
++
+Context sharing
++
+Prompt caching
+```
+
+三层优化是可以同时发生的。
+
+---
+
+## 我甚至建议 Wheel 将“完整历史”和“模型上下文”完全解耦
+
+例如磁盘中：
+
+```text
+Wheel repository
+2.7 GB
+```
+
+完全没问题。
+
+里面可能有：
+
+```text
+5000 messages
+20000 tool calls
+3GB logs/artifacts
+800 decisions
+1200 observations
+```
+
+但当前 inference：
+
+```text
+Context Compiler
+
+→ 27,421 tokens
+```
+
+其中：
+
+```text
+18k stable cached prefix
+4k structured state
+3k recent conversation
+2k current evidence
+```
+
+这就是理想状态。
+
+类似：
+
+> 一个 Git repo 有几十 GB，并不意味着 `git status` 每次要把几十 GB 数据交给你处理。
+
+Wheel 也一样。
+
+---
+
+## 最后可以形成一个非常清楚的生命周期
+
+```text
+LLM thinks
+    ↓
+Raw reasoning
+    ↓
+ephemeral
+    ↓
+Action Intent
+    ↓
+WHY / WHAT / WHERE / HOW
+    ↓
+Tool
+    ↓
+Observation
+    ↓
+Evidence
+    ↓
+Decision / Knowledge
+    ↓
+Context Commit
+```
+
+然后下一次：
+
+```text
+Context Commit
+     ↓
+Context Compiler
+     ↓
+stable prefix
++
+relevant structured state
++
+dynamic tail
+     ↓
+LLM thinks again
+```
+
+所以是的，**Wheel 完全有机会同时做到“上下文更小、缓存利用率高、成本更低、推理反而更可靠”**。
+
+最核心的不是让模型“记住它以前想过什么”，而是让 Wheel 自己负责把过去的推理转化为：
+
+> **可证明的状态（evidence）、可解释的决定（why）、当前事实（what/where）、以及下一步行动（how/next）。**
+
+到这个阶段，Wheel 已经不像普通 Chat Session Manager 了，更像一个 **LLM-native versioned execution / cognition runtime**。
+
