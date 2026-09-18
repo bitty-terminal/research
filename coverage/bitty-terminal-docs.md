@@ -48,6 +48,10 @@ PRs. Only current topical document names are cited; the retired
   `event-sourced-panel-model-candidate.md` and
   `research-distillation-044-047-053-054-terminal-candidate.md` to
   `terminal-platform-boundaries-candidate.md`.
+- Owner-pending routing: the recovered governance ledger proposed terminal
+  and panel parts of records 011, 018, 019, 021–028, 030–033, and 037 for this
+  corpus but verified no page for them. They are listed here rather than
+  mapped; a corpus owner must confirm before a document is claimed.
 
 ## Related
 
