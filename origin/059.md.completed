@@ -1,0 +1,941 @@
+之前不是讨论了在 Bitty AI, Wheel 中的上下文设计吗？比如结构化、Git 式、why & what & where & how、Context Compiler 等等。
+我想的是冷热分离架构来做，因为一个 LLM 上下文不止是有我们的这种结构化的形式，这种结构化的是利于 Git 式的管理的，那么 LLM 本身还需要有自己 Read 文件的部分，也就是代码、文档这些占大头的部分得如何管理呢？思考的部分如何处理？而且得保证缓存命中合理，以免造成过高的花费。
+比如 Agent Team 中 Agent 是可以相互传递的，这个部分得又要如何设计，应该共享关键部分。
+这样的设计也更加有利于压缩上下文，跟目前主流的上下文压缩不一样，或者说我们做的更像是信息精炼，而不是用压缩这种词语了？
+
+是的，而且我觉得这一步能把 Wheel 的上下文系统从“更聪明的聊天历史管理”真正提升成一个**独立的 Context Runtime**。
+
+之前我们已经定下的核心其实可以继续保留：
+
+> **Persist events, commit knowledge, compile context.**
+
+现在再加上冷热分离、Evidence、Reasoning、Agent Team 后，可以扩成：
+
+> **Store evidence → persist events → refine knowledge → commit state → compile working context.**
+
+这里我尤其赞成你最后说的：**Wheel 内部不应该主要叫 Context Compression，而应该叫 Context Refinement（上下文精炼）**。`Compaction` 可以保留为一种兼容传统 LLM transcript 的特殊操作。
+
+---
+
+# 1. 先把 Context 拆成几个完全不同的平面
+
+我建议最终架构不是一个 `ContextStore` 包办一切，而是：
+
+```text
+                ┌────────────────────────────┐
+                │ Workspace / Git / Tools    │
+                │ Panel / LSP / AST / User   │
+                └─────────────┬──────────────┘
+                              │
+                     observations / reads
+                              │
+                ┌─────────────▼──────────────┐
+                │ Evidence / Object Store    │
+                │ raw file / stdout / diff   │
+                │ docs / tool result / blob  │
+                └─────────────┬──────────────┘
+                              │
+                        derive / refine
+                              │
+                ┌─────────────▼──────────────┐
+                │ Context Graph / DAG        │
+                │ facts / decisions / task   │
+                │ why-what-where-how / refs  │
+                └─────────────┬──────────────┘
+                              │
+                     Working Set Manager
+                     hot / warm / cold
+                              │
+                ┌─────────────▼──────────────┐
+                │ Context Compiler           │
+                │ retrieve / rank / dedup    │
+                │ refine / budget / layout   │
+                │ cache plan / lowering      │
+                └─────────────┬──────────────┘
+                              │
+                    Provider-specific Prompt
+                              │
+              ┌───────────────▼────────────────┐
+              │ OpenAI / Claude / Gemini / ... │
+              └────────────────────────────────┘
+```
+
+还有一个侧面的东西：
+
+```text
+Provider Continuation State
+├── prompt cache state
+├── conversation/session id
+├── provider reasoning state
+├── opaque/encrypted thinking state
+└── provider-specific cache metadata
+```
+
+它**不属于 canonical Context DAG**。
+
+这点非常重要。
+
+---
+
+# 2. “冷热”应该是状态，不是内容类型
+
+这是整个设计里最关键的一点之一。
+
+不要设计成：
+
+```text
+structured = hot
+raw files = cold
+```
+
+而应该：
+
+| 温度       | 含义           | Prompt 表现                       |
+| -------- | ------------ | ------------------------------- |
+| Hot      | 当前推理确实需要     | verbatim / exact slice          |
+| Warm     | 最近可能再次使用     | summary / outline / indexed ref |
+| Cold     | 当前无需关注但必须可恢复 | ref only                        |
+| Archived | 历史证据         | 不进入 Prompt                      |
+
+而 `Pinned` 最好是另一个正交属性，不是第五种温度：
+
+```text
+temperature = hot | warm | cold
+pinned = true | false
+```
+
+例如 Agent 正在重构：
+
+```text
+src/context/compiler.rs::compile()
+```
+
+那么这 120 行源码虽然属于 **raw Evidence**，却是：
+
+```text
+HOT + PINNED
+```
+
+三小时前做出的某个已经被新设计替代的 Decision，虽然属于结构化 Knowledge，却可能已经：
+
+```text
+COLD
+```
+
+所以：
+
+> **Semantic Type 和 Working Temperature 必须正交。**
+
+---
+
+# 3. Read 文件不应该进入“聊天历史”，而应该进入 Evidence 系统
+
+我觉得这里可以直接借鉴 OS 的 **Virtual Memory / Page Cache / Working Set**。
+
+现在很多 Coding Agent 大致是：
+
+```text
+read foo.rs
+↓
+8000 tokens tool_result
+↓
+永久留在 conversation
+↓
+read bar.rs
+↓
+6000 tokens
+↓
+conversation 越来越大
+```
+
+Wheel 不应该这样。
+
+一次：
+
+```text
+code.read("src/context/compiler.rs", symbol="compile")
+```
+
+应该产生类似：
+
+```text
+EvidenceView {
+    id: hash(...),
+
+    source: {
+        path: "src/context/compiler.rs",
+        revision: "...",
+        blob_hash: "...",
+    },
+
+    selector: {
+        symbol: "ContextCompiler::compile",
+        lines: [182, 327]
+    },
+
+    content_hash: "...",
+
+    derived_from: "...",
+    freshness: current,
+}
+```
+
+然后模型当前看到的是：
+
+```text
+EvidenceView → materialize → exact source
+```
+
+而不是：
+
+```text
+tool_result → append forever
+```
+
+### 用完之后怎么办？
+
+假设模型从 145 行代码中得出了：
+
+```text
+ContextCompiler::compile 当前依次执行
+normalize → rank → budget → lower
+
+问题：
+budget 在 dedup 之前执行会浪费 token budget。
+```
+
+那么经过 Refinement 后：
+
+```text
+Exact Source View
+      │
+      ├──> Fact
+      │     compile pipeline 顺序为 ...
+      │
+      ├──> Finding
+      │     dedup 应前移
+      │
+      └──> EvidenceRef
+            compiler.rs@blob:abc#L182-L327
+```
+
+下一轮 Prompt 未必还需要那 145 行。
+
+于是：
+
+```text
+145 lines exact code
+HOT
+  ↓
+WARM
+  ↓
+COLD
+```
+
+但信息并没有丢。
+
+需要复核时：
+
+```text
+Finding
+  ↓ provenance
+EvidenceRef
+  ↓
+exact historical source
+```
+
+这就是我认为 Wheel 比传统 summarization 更重要的性质：
+
+> **Active Context 可以是 lossy 的，但整个 Context System 应该是 recoverable 的。**
+
+也可以概括为：
+
+> **Lossless storage, lossy materialization.**
+
+这比“一直总结越来越短”强很多。
+
+---
+
+# 4. Git 本身还能帮助解决源码 Evidence
+
+甚至没有必要复制所有源码。
+
+对于已经被 Git tracking 的内容：
+
+```text
+EvidenceRef {
+    repo: ...
+    blob_oid: ...
+    path: ...
+    range: ...
+}
+```
+
+Git 自己的 Object Database 就已经是 Content-Addressed Store。
+
+Wheel 只需要保存：
+
+```text
+ref → Git Blob
+```
+
+对于以下内容再进入 Wheel 自己的 CAS：
+
+```text
+untracked file
+terminal output
+web result
+LSP result
+MCP result
+generated artifact
+runtime state
+logs
+external docs
+```
+
+因此 Wheel 的 Context Storage 其实天然可以做成：
+
+```text
+Git ODB ─────────┐
+                 │
+Wheel CAS ───────┼── Evidence Layer
+                 │
+External Ref ────┘
+                       ↓
+                  Context DAG
+```
+
+这和你之前提出的 Git 式思想结合得非常自然。
+
+---
+
+# 5. Git 式 Context 不应该保存“所有东西”，而应该 Commit Knowledge
+
+这是我觉得现在可以进一步明确的地方。
+
+Git 类比可以做到：
+
+```text
+Blob       ≈ Evidence
+Tree       ≈ Context State
+Commit     ≈ Context Checkpoint
+Branch     ≈ Agent Context Branch
+HEAD       ≈ Agent Current Context
+Merge      ≈ Context Merge
+Cherry-pick≈ Knowledge Transfer
+Rebase     ≈ Rebase onto newer team state
+Reflog     ≈ Context history
+GC         ≈ Unreachable evidence cleanup
+```
+
+但是 Agent 每 `read()` 一次，不应该：
+
+```text
+context commit
+```
+
+跟 Git 一样，修改工作区文件也不会立刻产生 commit。
+
+应该存在：
+
+```text
+Evidence / Event
+        ↓
+Working Context
+        ↓
+Refinement
+        ↓
+meaningful knowledge change
+        ↓
+Context Commit
+```
+
+所以之前那句话最好升级成：
+
+```text
+Evidence is stored.
+Events are persisted.
+Knowledge is committed.
+Context is compiled.
+```
+
+---
+
+# 6. `why / what / where / how` 正好作为 Event → Knowledge 的桥梁
+
+之前我们讨论出的：
+
+```text
+Why
+What
+Where
+How
+Expected
+Observed
+Implication
+Next
+```
+
+我仍然认为非常适合。
+
+例如：
+
+```text
+Why:
+  修复 ContextCompiler 重复 materialization
+
+What:
+  调整 dedup 阶段位置
+
+Where:
+  src/context/compiler.rs::compile
+
+How:
+  将 dedup 从 budget 后移动到 retrieval normalize 后
+
+Expected:
+  降低重复 EvidenceView token
+
+Observed:
+  context tokens -18%
+
+Implication:
+  budget 阶段以后只处理唯一 ContextItem
+
+Next:
+  跑 provider cache regression
+```
+
+这比保存模型几千 token 的内部思考有价值太多。
+
+---
+
+# 7. Reasoning 应该单独分成两种
+
+这里一定不要把“模型思考”混进 Git Context DAG。
+
+应该区分：
+
+```text
+Raw Reasoning
+vs
+Reasoning Artifact
+```
+
+Raw reasoning 是：
+
+```text
+hmm...
+maybe...
+let me inspect...
+this could mean...
+actually no...
+```
+
+这种内容：
+
+* 高度模型相关；
+* token 很大；
+* 噪声很多；
+* 不稳定；
+* 跨模型不可移植；
+* 不适合作为长期事实。
+
+所以它应该基本属于：
+
+```text
+Ephemeral / Provider-local
+```
+
+真正应该持久化的是 **Reasoning Artifact**：
+
+```text
+Hypothesis
+Decision
+Rationale
+Assumption
+Constraint
+Finding
+RejectedApproach
+Uncertainty
+Implication
+NextAction
+```
+
+也就是：
+
+```text
+raw reasoning
+       ↓
+   refinement
+       ↓
+reasoning residue
+```
+
+其中 `Rationale` 是“为什么这么做”，而不是完整 chain-of-thought。
+
+---
+
+# 8. 但 Provider 自己的 Thinking State 不应该随便删
+
+这里又涉及 cache。
+
+例如 Anthropic 当前明确区分 tool result clearing 和 thinking block clearing；保留 thinking blocks 可以保持 prompt cache，而删除会在相应位置使 cache 失效。([Claude Platform][1])
+
+所以 Wheel 最好有一个：
+
+```text
+Provider Continuation Layer
+```
+
+它可能保存：
+
+```text
+Claude thinking block
+OpenAI reasoning state / response continuation
+provider conversation ID
+opaque state
+cache breakpoint
+cache TTL
+```
+
+但是这是：
+
+```text
+ephemeral
+provider-specific
+non-portable
+non-canonical
+```
+
+例如：
+
+```text
+Context DAG
+    ↓
+Claude Agent
+    ├── Claude continuation state
+    └── Claude cache state
+```
+
+Agent 换成 GPT 时：
+
+```text
+Context DAG ──────> GPT
+```
+
+仍然可以继续任务。
+
+而：
+
+```text
+Claude raw thinking ─X→ GPT
+```
+
+不需要迁移。
+
+这能很好地区分：
+
+> **Agent continuity ≠ provider conversation continuity。**
+
+---
+
+# 9. Agent Team 最适合用“共同祖先 + 私有 Branch”
+
+这和 Git 的类比几乎是天然契合的。
+
+例如：
+
+```text
+                 Team Context
+                     C0
+                     │
+                     C1
+                  ┌──┴──┐
+                  │     │
+               Agent A Agent B
+                  │     │
+                 A1     B1
+                  │     │
+                 A2     B2
+```
+
+`C1` 可以包含整个 Team 都必须知道的：
+
+```text
+Mission
+Task DAG
+Repository / workspace identity
+global constraints
+architecture decisions
+shared interfaces
+critical findings
+accepted conventions
+```
+
+但 Agent A 自己读了：
+
+```text
+renderer.rs
+wgpu.rs
+```
+
+不应该自动复制给 B。
+
+A 的 Working Set：
+
+```text
+A:
+renderer.rs::render()
+wgpu.rs::submit()
+Finding A17
+Hypothesis A18
+```
+
+B：
+
+```text
+B:
+layout.rs::solve()
+panel.rs::attach()
+Finding B11
+```
+
+只有 A 得出了团队级知识：
+
+```text
+Decision:
+Renderer API 必须保持 frame ownership 在 Core
+```
+
+才：
+
+```text
+Agent A
+   ↓ publish
+Context Commit A3
+   ↓
+Team Context
+```
+
+B 下一次编译上下文时收到这个新 commit。
+
+这就是：
+
+> **Agents share knowledge, not transcripts.**
+
+我觉得这句话可以成为 Wheel Agent Team 的一个核心设计原则。
+
+---
+
+# 10. Agent 之间甚至不应该“大段传递上下文”
+
+例如现在很多 Subagent 系统：
+
+```text
+Main Agent:
+这里有 15k token 背景，请完成 XXX
+
+Subagent:
+...
+返回 8k token 总结
+```
+
+Wheel 可以变成：
+
+```text
+Agent A → Agent B
+
+TaskRef: T42
+BaseContext: team@C17
+KnowledgeRefs:
+  - decision:D13
+  - finding:F82
+EvidenceRefs:
+  - src/foo.rs@abc#Foo
+  - test-output:E917
+Objective:
+  review allocator implementation
+```
+
+B 的 Context Compiler 自己决定：
+
+```text
+哪些 ref 要展开？
+哪些只看 summary？
+哪些 exact materialize？
+```
+
+这会极大减少 Agent Team 里的重复 token。
+
+---
+
+# 11. 这也正好解决多 Agent 的 Prompt Cache
+
+共享 Team Prefix：
+
+```text
+┌──────────────────────────────────┐
+│ Bitty AI / Wheel Core Prompt     │
+│ stable tools                     │
+│ stable capability definitions    │
+│ Team Context C17                 │
+└──────────────────────────────────┘
+                 ↑
+          shared stable prefix
+
+┌──────────────────────────────────┐
+│ Agent Role                       │
+│ Agent Task                       │
+│ Agent Working Set                │
+│ Hot Evidence                     │
+│ Recent Events                    │
+└──────────────────────────────────┘
+                 ↑
+              suffix
+```
+
+这样 Worker、Reviewer、Coordinator 即使后半部分不同，前面仍可以尽量共享。
+
+不过实际 Prompt Layout 要由 **Provider Lowering** 决定，因为不同厂商的 cache 机制不完全一样。
+
+OpenAI 当前的 prompt caching 明确要求 reusable prefix 保持一致；tool definitions、developer instructions、conversation history 等都在 rendered prefix 中，前面的内容或相关设置变化，会影响之后的 prefix cache reuse。官方也明确建议 stable instructions/reference material 放前面、动态内容放后面。([OpenAI 平台][2])
+
+Anthropic 同样把 Prompt Cache 建立在 prefix 上，而且显式建议 static tools/system/context 放前面，并允许 cache breakpoints。([Claude Platform Docs][3])
+
+Gemini 官方同样建议把“大且公共”的内容放在 prompt 前部，以提高 implicit cache hit。([Google AI for Developers][4])
+
+所以我们之前的：
+
+```text
+Context Compiler
+```
+
+现在应该明确多一个：
+
+```text
+Cache Planner
+```
+
+---
+
+# 12. Context Compiler 最终应该优化的不只是 Relevance
+
+它实际上是在解一个多目标优化问题。
+
+可以粗略理解成：
+
+```text
+utility(item) =
+    relevance
+  + criticality
+  + recency
+  + task_dependency
+  + authority
+  + evidence_strength
+  + role_fit
+  - token_cost
+  - staleness
+  - redundancy
+  - cache_disruption
+```
+
+然后对于同一份信息选择不同 representation：
+
+```text
+Exact
+  ↓
+Slice
+  ↓
+Semantic Extract
+  ↓
+Structured Knowledge
+  ↓
+Digest
+  ↓
+Reference Only
+  ↓
+Omit
+```
+
+这才是真正的 **Context Compiler**。
+
+不是：
+
+```text
+找到相关东西 → 全部塞 prompt
+```
+
+而是：
+
+```text
+找到什么
++
+以什么精度呈现
++
+放在什么位置
++
+是否值得破坏 cache
++
+以后如何恢复
+```
+
+---
+
+# 13. 这也是为什么我支持叫 Refinement，而不是 Compression
+
+我现在会把几个术语严格分开：
+
+| 操作                  | 意义                             |
+| ------------------- | ------------------------------ |
+| **Refinement**      | Evidence → 更高信息密度的 Knowledge   |
+| **Materialization** | Ref / Knowledge → 当前 Prompt 内容 |
+| **Promotion**       | Cold/Warm → Hot                |
+| **Demotion**        | Hot → Warm/Cold                |
+| **Eviction**        | 从 active context 移除，但不删除       |
+| **Compaction**      | 把一段 transcript 重写成更短表示         |
+| **GC**              | 真正删除不可达/过期数据                   |
+
+这样语义非常清楚。
+
+尤其是：
+
+```text
+Eviction != deletion
+Refinement != summarization
+Compaction != GC
+```
+
+目前一些主流 context management 还是明显围绕 conversation 做操作。例如 Anthropic 的 Context Editing 可以清旧 tool results、清 thinking blocks，Compaction 则用 summary 替换历史；官方自己也指出这会和 prompt caching 存在权衡。([Claude Platform][1])
+
+OpenAI 当前文档也明确说明 compaction 会替换更早的 conversation context，从而可能降低之前 prefix 的 cache reuse。([OpenAI 平台][2])
+
+所以 Wheel 可以做到更上一层：
+
+```text
+传统：
+Transcript
+   ↓
+太长
+   ↓
+Compress Transcript
+
+Wheel：
+Evidence Store
+    +
+Knowledge DAG
+    +
+Working Set
+    ↓
+Compile exactly what model needs
+```
+
+也就是说，**最好从一开始就不要制造那个必须被不断压缩的巨型 transcript。**
+
+---
+
+# 14. Cache 甚至应该影响 Refinement 的时机
+
+这点也很重要。
+
+不能：
+
+```text
+上下文多了 1000 token
+→ refine
+→ prefix 改变
+
+又多 800 token
+→ refine
+→ prefix 又改变
+```
+
+这样为了省一点 context，反而一直打碎 cache。
+
+Anthropic 官方当前就专门提供 `clear_at_least`，目的之一就是：只有一次能清掉足够多 token 时才值得承受 cache invalidation。([Claude Platform][1])
+
+OpenAI 当前也明确说明 cache reuse 是基于完整 prefix，且 compaction/rewriting 会影响命中；GPT-5.6+ 甚至把 cache write/read 分别计价，因此是否改写 prefix 本身就是经济决策。([OpenAI 平台][2])
+
+所以 Wheel 可以有：
+
+```text
+Refinement Threshold
+```
+
+例如只有：
+
+```text
+expected_saved_tokens
+        >
+cache_break_cost + refinement_cost
+```
+
+才执行一次大的 refinement。
+
+这实际上已经很像数据库的 compaction、LSM merge 或 GC policy 了。
+
+---
+
+# 15. 我最终会把 Wheel Context 定义成这 6 个核心组件
+
+这一组我觉得已经比较接近可以写 RFC 的程度了：
+
+1. **Evidence Store**：源码、文档、tool result、stdout、diff 等原始事实，content-addressed，保留 provenance。
+2. **Context DAG**：Task、Decision、Finding、Rationale、Constraint、Handoff 等结构化 Knowledge，并通过 ref 指向 Evidence。
+3. **Working Set Manager**：管理 Hot/Warm/Cold、Pinned、promotion/demotion/eviction，类似 OS working set。
+4. **Refinement Engine**：将 raw Evidence/Event 精炼成高信息密度 Knowledge，但保留可逆 provenance。
+5. **Context Compiler**：根据 Agent、Task、Role、budget、freshness、relevance 编译当前真正需要的 Context IR。
+6. **Cache Planner / Provider Lowering**：把 Context IR 排成适合 OpenAI/Claude/Gemini 等 provider cache 特性的最终 Prompt，并管理 provider-local continuation state。
+
+于是整个系统是：
+
+```text
+                 ┌──── immutable evidence ────┐
+                 │                            │
+Reality → Evidence → Events → Refinement → Knowledge DAG
+                 │                            │
+                 └──────── provenance ────────┘
+                                               │
+                                    Working Set Manager
+                                               │
+                                      Context Compiler
+                                               │
+                                         Context IR
+                                               │
+                                       Cache Planner
+                                               │
+                                      Provider Lowering
+                                               │
+                                              LLM
+```
+
+而 Agent Team 在上面只是：
+
+```text
+Team Context Ref
+       │
+ ┌─────┼─────┐
+ A     B     C
+ │     │     │
+branch branch branch
+ │     │     │
+publish knowledge
+ └─────┼─────┘
+       ↓
+ Team Context Ref'
+```
+
+我认为这会比“做一个更优秀的 `/compact`”高一个架构层次。**Wheel 真正管理的不是 Prompt，而是 Information Lifecycle；Prompt 只是 Context Compiler 的一个临时构建产物。**
+
+甚至可以把这一点写成 Wheel Context System 的设计原则：
+
+> **Prompt is a build artifact, not the source of truth.**
+> **Transcript is an execution trace, not the memory.**
+> **Evidence is stored, knowledge is refined, context is compiled.**
+
+这三句话基本就把你现在这套上下文架构的核心区别讲清楚了。
+
+[1]: https://platform.claude.com/docs/en/build-with-claude/context-editing "Context editing - Claude Platform Docs"
+[2]: https://platform.openai.com/docs/guides/prompt-caching "Prompt caching | OpenAI API"
+[3]: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching "Prompt caching - Claude Platform Docs"
+[4]: https://ai.google.dev/gemini-api/docs/caching?authuser=00&hl=en&utm_source=chatgpt.com "Context caching  |  Gemini API  |  Google AI for Developers"

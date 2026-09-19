@@ -1,0 +1,1651 @@
+对于 Beacon 那个插件吗，也就是灵感来自 flash.nvim 的那个，得如何进行设计呢？
+
+知道，而且结合我们刚才讨论出的 **Bitty UI Runtime / Panel / Activity / Workspace Scene**，Beacon 现在其实可以设计得比最早的 `flash.nvim` 类比完整得多。
+
+我会把它定义成：
+
+> **Beacon = Bitty 的 Spatial + Semantic Targeting Engine**
+> 它把当前 Bitty 中“可操作的对象”瞬间变成键盘可寻址目标，再把目标交给统一 Command Registry 执行动作。
+
+所以它不是单纯的“跳转插件”。
+
+---
+
+# 1. Beacon 最核心的模型应该是 `Action × Target`
+
+最早那个方向仍然是对的：
+
+```text
+Beacon
+=
+Target Discovery
++
+Label Allocation
++
+Annotation Rendering
++
+Action Dispatch
+```
+
+比如当前界面：
+
+```text
+┌───── Workspace ─────────────────────────┐
+│                                         │
+│  ┌──────── Terminal ───────┐ ┌─ Git ─┐ │
+│  │ $ cargo test            │ │       │ │
+│  │ ...                     │ │       │ │
+│  │ $ git status            │ │       │ │
+│  └─────────────────────────┘ └───────┘ │
+│                                         │
+└─────────────────────────────────────────┘
+```
+
+进入 Beacon：
+
+```text
+┌─────────────────────────────────────────┐
+│                                         │
+│  ┌────── [A] ─────────────┐ ┌─ [S] ─┐ │
+│  │ $ cargo test    [D]     │ │       │ │
+│  │ ...                     │ │       │ │
+│  │ $ git status    [F]     │ │       │ │
+│  └─────────────────────────┘ └───────┘ │
+│                                         │
+└─────────────────────────────────────────┘
+```
+
+然后：
+
+```text
+A → Terminal Panel
+S → Git Panel
+D → cargo test CommandBlock
+F → git status CommandBlock
+```
+
+但这些 Label 自己没有动作意义。
+
+动作来自：
+
+```text
+focus + A
+fold  + D
+copy  + F
+close + S
+```
+
+也就是：
+
+```text
+Action(Target)
+```
+
+---
+
+# 2. Beacon 不应该自己实现“Close Panel”
+
+这一点结合现在的 Command Registry 特别重要。
+
+不要：
+
+```lua
+Beacon:
+  if action == close then
+      panel:close()
+  end
+```
+
+更好的结构是：
+
+```text
+Beacon
+       │
+       │ selected TargetRef
+       ▼
+Command Registry
+       │
+       ├─ panel.focus
+       ├─ panel.close
+       ├─ panel.toggle-floating
+       ├─ panel.fullscreen
+       ├─ command-block.fold
+       ├─ command-block.copy
+       └─ ui.focus
+```
+
+也就是说 Beacon 只负责：
+
+```text
+“选哪个对象”
+```
+
+而不是：
+
+```text
+“怎么操作这个对象”
+```
+
+最终：
+
+```text
+Keyboard
+Mouse
+Command Palette
+Beacon
+CLI
+IPC
+Wheel Agent
+        │
+        ▼
+   Command Registry
+```
+
+全部统一。
+
+这会比现在文档里 P7 写的“Lua callback”更进一步。
+
+我会建议以后把：
+
+```lua
+actions = {
+    close = function(...) ... end
+}
+```
+
+逐渐收敛成：
+
+```lua
+actions = {
+    close = "panel.close"
+}
+```
+
+也就是 **Command ID 而不是任意 callback**。
+
+---
+
+# 3. `TargetRef` 应该成为 Beacon 最重要的数据结构
+
+例如概念上：
+
+```rust
+struct BeaconTarget {
+    id: TargetId,
+    kind: TargetKind,
+    anchor: TargetAnchor,
+    scope: TargetScope,
+
+    label_hint: Option<LabelHint>,
+
+    actions: ActionSet,
+
+    semantic_ref: TargetRef,
+}
+```
+
+其中 `TargetRef` 不应该包含 Rust 内部指针。
+
+而是类似：
+
+```text
+PanelRef(PanelId, Generation)
+
+WorkspaceRef(WorkspaceId)
+
+CommandBlockRef(
+    TerminalId,
+    CommandId
+)
+
+UiNodeRef(
+    PanelId,
+    UiSemanticId,
+    Generation
+)
+
+RichBlockRef(...)
+
+LinkRef(...)
+```
+
+这样目标永远是：
+
+> **semantic handle**
+
+而不是 UI tree pointer。
+
+---
+
+# 4. `View` 最好不要成为普通 Beacon target
+
+这也是刚才新的 Panel/View 分工带来的变化。
+
+早期 P3 里面有：
+
+```text
+Panel
+Workspace
+View
+CommandBlock
+```
+
+但如果现在：
+
+```text
+View = compositor placement
+Panel = application identity
+```
+
+那么普通用户其实不应该看到：
+
+```text
+View #73
+```
+
+Beacon 应该默认操作：
+
+```text
+Panel
+Workspace
+Activity
+Control
+Semantic Object
+```
+
+`ViewId` 只适合：
+
+```text
+debug
+developer tools
+compositor internals
+```
+
+否则 abstraction leak。
+
+---
+
+# 5. UI Runtime 出来以后，Beacon 会突然变得非常强
+
+因为以前 Beacon 的 target 主要来自：
+
+```text
+Terminal semantic data
+Panel
+Workspace
+```
+
+现在每一个 UI Component 都可以有 semantic identity。
+
+例如 Button：
+
+```lua
+ui.button {
+    id = "container.restart",
+    label = "Restart",
+    command = "docker.restart",
+}
+```
+
+Tree item：
+
+```lua
+FileTreeItem {
+    semantic_id = "file:src/main.rs"
+}
+```
+
+TextInput：
+
+```lua
+ui.text_input {
+    semantic_id = "docker.filter",
+}
+```
+
+所以 Beacon 不需要知道 Button/Card/List 长什么样。
+
+UI Runtime 只需要提供：
+
+```text
+Focusable
+Clickable
+Actionable
+SemanticId
+Bounds
+Command
+```
+
+Beacon 就能发现它。
+
+---
+
+# 6. UI Node 可以主动声明自己是否参与 Beacon
+
+例如：
+
+```lua
+ui.button {
+    label = "Restart",
+
+    beacon = {
+        enabled = true,
+        actions = {
+            activate = "docker.restart"
+        }
+    }
+}
+```
+
+不过官方 Button 甚至默认可以：
+
+```text
+Button
+→ beacon target automatically
+```
+
+因为 Button 本来就是 actionable。
+
+而纯 Card：
+
+```text
+Card
+→ 默认不参与
+```
+
+TextInput：
+
+```text
+TextInput
+→ focus target
+```
+
+Link：
+
+```text
+Link
+→ open/copy target
+```
+
+所以 Beacon 应该建立在 **UI semantics** 上，而不是视觉元素上。
+
+---
+
+# 7. Beacon target provider 可以分三类
+
+我会设计成：
+
+```text
+Core Providers
+Plugin Providers
+Derived Providers
+```
+
+### Core Provider
+
+Rust Runtime 天然知道：
+
+```text
+Panel
+Workspace
+CommandBlock
+UI focusable nodes
+Links
+RichBlock
+```
+
+这些直接生成 Target Snapshot。
+
+### Plugin Provider
+
+插件可以贡献自己的 domain object。
+
+例如 Git 插件：
+
+```text
+Branch
+Commit
+ChangedFile
+```
+
+Docker：
+
+```text
+Container
+Image
+Volume
+```
+
+Wheel：
+
+```text
+Agent
+Task
+Panel
+ToolCall
+```
+
+比如：
+
+```lua
+beacon.register_provider {
+    id = "docker.containers",
+
+    collect = function(context)
+        ...
+    end
+}
+```
+
+但这里仍然应该是 **cold path collection**。
+
+不是每 frame 调 Lua。
+
+---
+
+# 8. 最理想的是“UI 自动发现 + Domain 显式注册”
+
+例如 Docker Dashboard：
+
+```text
+Container Card
+├─ Start Button
+├─ Stop Button
+└─ Logs Button
+```
+
+这些 Button Beacon 自动知道。
+
+但是：
+
+```text
+Container 本身
+```
+
+可能并不是一个 Button。
+
+Docker 插件仍然可以注册：
+
+```text
+TargetKind = "docker.container"
+```
+
+那么 Beacon 就可以：
+
+```text
+inspect container
+open container
+restart container
+logs container
+```
+
+所以两个体系共存：
+
+```text
+UI semantic targets
++
+Domain semantic targets
+```
+
+---
+
+# 9. Target Scope 非常重要
+
+如果所有东西一次都显示标签，很快就会爆炸。
+
+一个 Workspace 可能：
+
+```text
+6 Panels
+×
+几十个 Buttons
++
+几十个 CommandBlocks
++
+Workspace Rail
+```
+
+瞬间上百。
+
+所以 Beacon 必须有 Scope。
+
+我建议：
+
+```text
+CurrentControlGroup
+CurrentPanel
+CurrentWorkspace
+Window
+WorkspaceRail
+SemanticDomain
+```
+
+用户通常不会执行：
+
+```text
+“给我标记 Bitty 里所有东西”
+```
+
+而是：
+
+```text
+“我要 focus 一个 Panel”
+“我要 fold 一个 CommandBlock”
+“我要点击一个 Control”
+```
+
+所以：
+
+```text
+beacon.focus()
+```
+
+只扫描：
+
+```text
+Panel + focusable UI
+```
+
+而：
+
+```text
+beacon.fold()
+```
+
+只扫描：
+
+```text
+visible CommandBlock
+```
+
+这样目标数量天然很少。
+
+---
+
+# 10. 我更推荐 Action-first，而不是“先把所有 Target 全打标签”
+
+也就是：
+
+```text
+Leader
+   ↓
+Beacon
+   ↓
+Action
+   ↓
+Targets
+```
+
+例如：
+
+```text
+Leader f
+```
+
+表示：
+
+```text
+focus
+```
+
+然后显示：
+
+```text
+[A] Terminal
+[S] Git
+[D] AI
+[F] File
+```
+
+而：
+
+```text
+Leader z
+```
+
+可能表示 Fold：
+
+```text
+[D] cargo test
+[F] git status
+[G] pytest
+```
+
+这样用户看到的 label 一定跟当前动作有关。
+
+比：
+
+```text
+进入 Beacon
+→ 100 个目标
+→ 再想做什么
+```
+
+认知负担低很多。
+
+---
+
+# 11. 但可以同时支持 Target-first
+
+比如高级用户可能喜欢：
+
+```text
+Leader Space
+```
+
+进入 general Beacon：
+
+```text
+[A] Terminal Panel
+[S] Git Panel
+[D] CommandBlock
+[F] Button
+```
+
+选择 `A` 后：
+
+```text
+focus
+close
+float
+fullscreen
+move
+inspect
+```
+
+类似 context action。
+
+所以可以同时存在：
+
+### Action-first
+
+```text
+Action → Target
+```
+
+适合高频。
+
+### Target-first
+
+```text
+Target → Action
+```
+
+适合探索。
+
+底层还是同一个：
+
+```text
+Action × Target
+```
+
+---
+
+# 12. Label Allocator 可以比 flash.nvim 更有 Bitty 特色
+
+当前文档已经提到：
+
+```text
+单字符优先
+→ 超出后双字符
+```
+
+这个方向没问题。
+
+比如默认字符池：
+
+```text
+asdfghjkl
+qwertyuiop
+zxcvbnm
+```
+
+甚至可以根据用户配置：
+
+```lua
+beacon.labels = {
+    primary = "asdfghjkl",
+    secondary = "qwertyuiop",
+}
+```
+
+例如 6 个目标：
+
+```text
+A S D F G H
+```
+
+20 个目标：
+
+```text
+A S D F G H J K L
+Q W E R T Y U I O P
+...
+```
+
+再多才：
+
+```text
+AA AS AD AF ...
+```
+
+---
+
+# 13. 但可以进一步做 Spatial Label Allocation
+
+这是 Bitty 比 flash.nvim 更有条件做好的地方。
+
+例如：
+
+```text
+左侧目标
+→ A S D F
+
+右侧目标
+→ J K L ;
+```
+
+或者：
+
+```text
+屏幕左半边
+→ 左手 keys
+
+屏幕右半边
+→ 右手 keys
+```
+
+这样视觉位置和键盘位置产生映射。
+
+甚至：
+
+```text
+top-left    Q W E
+middle-left A S D
+bottom-left Z X C
+
+top-right   U I O
+middle-right J K L
+bottom-right M , .
+```
+
+Beacon 可以有不同 LabelStrategy：
+
+```text
+compact
+home-row
+spatial
+frequency
+```
+
+这个完全可以作为 Lua policy。
+
+Label engine 机制仍然 Rust。
+
+---
+
+# 14. Label Rendering 必须是一整个 Annotation Layer
+
+这一点以前设计得就是对的。
+
+绝对不要：
+
+```text
+256 target
+=
+256 overlays
+```
+
+应该：
+
+```text
+BeaconAnnotationLayer {
+    badges: Vec<Badge>
+}
+```
+
+一次送到 GPU。
+
+结构类似：
+
+```text
+WorkspaceScene
+├─ tiled
+├─ floating
+├─ pinned
+├─ popover
+├─ overlay
+└─ annotation
+   └─ BeaconLayer
+```
+
+Beacon 不需要创建任何 Panel。
+
+它是：
+
+> **ephemeral scene annotation**
+
+类似：
+
+```text
+selection
+IME underline
+search highlights
+drag preview
+Beacon labels
+```
+
+都是 annotation。
+
+---
+
+# 15. Beacon 本身甚至可以成为 UI Runtime 的测试场
+
+因为它会同时验证：
+
+```text
+SemanticId
+Hit Testing
+Focus
+Bounds
+Command Registry
+Annotations
+Workspace
+Panel
+Accessibility
+Plugin APIs
+```
+
+比如：
+
+```text
+Button
+```
+
+如果 Beacon 无法发现它，很可能说明 UI semantics 没设计好。
+
+所以可以把一个原则写进 UI Runtime：
+
+> **任何用户可以通过鼠标操作的重要 Bitty-native control，都应该能够被语义化寻址。**
+
+那么 Beacon 就是键盘访问这些对象的统一方式之一。
+
+这其实还能增强 Accessibility。
+
+---
+
+# 16. Beacon 与 Workspace Rail 的组合会特别好
+
+例如：
+
+```text
+Workspace Rail
+
+[A] Coding
+[S] Research
+[D] Server
+[F] Chat
+```
+
+那么：
+
+```text
+Beacon workspace
+→ S
+```
+
+直接切 Workspace。
+
+甚至 Action-first：
+
+```text
+move Panel
+→ Beacon Workspace
+→ S
+```
+
+就变成：
+
+```text
+panel.move_to_workspace(S)
+```
+
+这和我们刚才设计的 Mod+拖拽：
+
+```text
+Panel → Workspace Rail
+```
+
+是完全同一语义。
+
+一个鼠标，一个键盘。
+
+---
+
+# 17. Beacon 与 Panel movement 也能结合
+
+例如：
+
+```text
+Leader
+m
+```
+
+进入：
+
+```text
+move current Panel
+```
+
+然后其他 Panel 显示：
+
+```text
+[A] left
+[S] right
+[D] above
+[F] below
+```
+
+或者 Workspace：
+
+```text
+[1] Coding
+[2] Research
+[3] Server
+```
+
+最终调用：
+
+```text
+panel.move
+panel.move_to_workspace
+```
+
+同样经过 Command Registry。
+
+这就让 Beacon 不只是 navigation。
+
+而是：
+
+> **空间编辑器**
+
+---
+
+# 18. 甚至很适合做 Operator 模型
+
+这和 Vim 非常像：
+
+```text
+operator × target
+```
+
+Vim：
+
+```text
+d + w
+y + }
+c + iw
+```
+
+Beacon：
+
+```text
+focus   + target
+close   + panel
+fold    + command block
+copy    + command block
+move    + workspace
+inspect + agent
+open    + file
+```
+
+所以 Beacon 本质可以理解成：
+
+> **Bitty Workspace 的 Operator-Pending Mode**
+
+这个描述其实比“flash.nvim clone”准确得多。
+
+---
+
+# 19. 比如具体键盘语言可以变成这样
+
+假设：
+
+```text
+Leader = Alt+Space
+```
+
+那么：
+
+```text
+Alt+Space f
+```
+
+Focus：
+
+```text
+[A] Terminal
+[S] Git
+[D] AI
+```
+
+```text
+Alt+Space x
+```
+
+Close：
+
+```text
+[A] Terminal
+[S] Git
+[D] AI
+```
+
+```text
+Alt+Space z
+```
+
+Fold：
+
+```text
+[A] cargo test
+[S] git status
+[D] build
+```
+
+```text
+Alt+Space m
+```
+
+Move：
+
+```text
+[A] Coding
+[S] Research
+[D] Server
+```
+
+```text
+Alt+Space i
+```
+
+Inspect：
+
+```text
+[A] Container
+[S] Agent
+[D] Git commit
+```
+
+而 which-key 可以直接告诉用户：
+
+```text
+f  Focus
+x  Close
+z  Fold
+m  Move
+i  Inspect
+```
+
+所以：
+
+```text
+Leader
+→ Which-Key
+→ Beacon Action
+→ Labels
+→ Command
+```
+
+是非常自然的一条链。
+
+---
+
+# 20. Lua 层最好不要直接操作 Label
+
+比如不要让插件写：
+
+```lua
+beacon.label("A", ...)
+```
+
+Label 是 global scarce resource。
+
+必须由 Host allocator 管。
+
+插件应该只声明：
+
+```lua
+beacon.target {
+    id = "...",
+    kind = "...",
+    anchor = ...,
+    actions = ...
+}
+```
+
+Host 决定：
+
+```text
+A / S / D / ...
+```
+
+这样：
+
+```text
+collision
+ordering
+visibility
+overflow
+```
+
+都能统一控制。
+
+---
+
+# 21. 更进一步，普通插件甚至不该提供具体屏幕坐标
+
+比如：
+
+```lua
+x = 328
+y = 271
+```
+
+这种 API 不好。
+
+更合理：
+
+```text
+Anchor::UiNode(id)
+Anchor::Panel(id)
+Anchor::CommandBlock(id)
+Anchor::Rect(handle)
+```
+
+真正屏幕坐标由 UI Runtime resolve：
+
+```text
+SemanticId
+     ↓
+Layout Tree
+     ↓
+current LogicalRect
+     ↓
+Beacon badge position
+```
+
+这样 resize/animation/DPI 变化都不会失效。
+
+---
+
+# 22. Target 应该是 Snapshot，而不是长期对象
+
+Beacon Mode 开启：
+
+```text
+collect
+→ snapshot
+→ labels
+```
+
+然后用户选择。
+
+如果期间：
+
+```text
+Panel 被关闭
+CommandBlock 消失
+UI rerender
+Plugin reload
+```
+
+dispatch 时重新验证：
+
+```text
+TargetRef + Generation
+```
+
+失效：
+
+```text
+StaleTarget
+```
+
+然后 Beacon cancel/recollect。
+
+不要持有 Lua/Rust 活对象。
+
+这和 Bitty 当前 generation-based architecture 非常一致。
+
+---
+
+# 23. Beacon Runtime 最好是一套 Core Mechanism，Beacon 插件只是 Policy
+
+虽然 Beacon 是独立官方插件 `bitty-terminal/beacon`，但真正通用的 mechanism 不应该全部放在它里面。
+
+我建议：
+
+```text
+Rust Core
+├─ TargetRegistry
+├─ Semantic Target Snapshot
+├─ LabelAllocator
+├─ AnnotationLayer
+├─ BeaconCapture / transient input state
+└─ Dispatch bridge
+```
+
+或者这些 generic mechanism 不叫 Beacon：
+
+```text
+HintEngine
+TargetEngine
+AnnotationEngine
+```
+
+而 Beacon Lua Plugin：
+
+```text
+Beacon
+├─ default key language
+├─ actions
+├─ scopes
+├─ filters
+├─ label strategy policy
+├─ styles
+└─ provider composition
+```
+
+这正好沿着现有文档：
+
+```text
+P3 Hint Engine
+→ P6 Cross-panel Hint API
+→ P7 Beacon
+```
+
+演进。
+
+不要把 P3 重写一遍。
+
+---
+
+# 24. 所以 Beacon 最终可以非常薄
+
+概念上甚至：
+
+```lua
+local beacon = require("bitty.beacon")
+
+beacon.mode {
+    id = "focus",
+
+    targets = {
+        "panel",
+        "control",
+    },
+
+    action = "focus",
+}
+
+beacon.mode {
+    id = "fold",
+
+    targets = {
+        "command-block",
+    },
+
+    action = "toggle-fold",
+}
+```
+
+然后 UI style：
+
+```lua
+beacon.theme {
+    badge = {
+        radius = 4,
+        padding = 3,
+    },
+
+    dim_background = 0.15,
+}
+```
+
+插件负责的是体验。
+
+Engine 负责 correctness。
+
+---
+
+# 25. Beacon 还可以成为插件之间通用的 Extension Point
+
+例如 Bitter 编辑器插件可以注册：
+
+```text
+Symbol
+Diagnostic
+Buffer
+Tab
+CodeAction
+```
+
+Wheel：
+
+```text
+Agent
+Task
+ToolCall
+Artifact
+```
+
+Docker：
+
+```text
+Container
+Image
+Volume
+```
+
+Git：
+
+```text
+Branch
+Commit
+ChangedFile
+```
+
+那么 Beacon 不用依赖这些插件。
+
+它只消费：
+
+```text
+TargetProvider
+```
+
+最终生态会变成：
+
+```text
+Bitter ─────┐
+Docker ─────┤
+Wheel ──────┤
+Git ────────┤
+Terminal ───┤
+UI Runtime ─┤
+            ▼
+       Target Registry
+            │
+            ▼
+          Beacon
+```
+
+这个设计很漂亮。
+
+---
+
+# 26. 权限模型也比较简单
+
+Plugin 注册 target：
+
+```text
+不应该获得新 capability
+```
+
+例如：
+
+```text
+Docker plugin
+```
+
+注册：
+
+```text
+RestartContainer target action
+```
+
+Beacon 选择它以后，最终仍然是：
+
+```text
+docker.restart
+```
+
+由 Docker plugin 自己的 capability 执行。
+
+所以：
+
+```text
+Beacon capability
+≠
+Target capability
+```
+
+Beacon 只是 mediator。
+
+它永远不能因为：
+
+> “用户通过 Beacon 选中了这个”
+
+就获得对目标的额外权限。
+
+---
+
+# 27. Beacon 本身也不要读取插件内部状态
+
+只应该看到：
+
+```text
+Target {
+    semantic id
+    label
+    description
+    anchor
+    supported commands
+}
+```
+
+比如 Wheel Agent：
+
+```text
+Target:
+  id = agent:42
+  label = "Review Agent"
+  actions = focus, inspect
+```
+
+Beacon 不需要看到：
+
+```text
+LLM context
+system prompt
+secret
+memory
+```
+
+这样隔离边界很干净。
+
+---
+
+# 28. 我建议最后把 Beacon 的架构正式收成这六个概念
+
+```text
+BeaconTarget
+BeaconProvider
+BeaconScope
+BeaconAction
+LabelAllocator
+BeaconSession
+```
+
+其中：
+
+### `BeaconTarget`
+
+一个可寻址语义对象。
+
+### `BeaconProvider`
+
+产生 targets。
+
+### `BeaconScope`
+
+决定本次扫描哪些对象。
+
+### `BeaconAction`
+
+Command Registry 中可作用于这些 targets 的 command。
+
+### `LabelAllocator`
+
+把目标映射成短键。
+
+### `BeaconSession`
+
+一次：
+
+```text
+enter
+→ collect
+→ label
+→ narrow
+→ select
+→ dispatch/cancel
+```
+
+---
+
+# 29. Session State Machine 可以很简单
+
+```text
+Idle
+ │
+ │ beacon.focus
+ ▼
+Collecting
+ │
+ ▼
+Active
+ │
+ ├── valid prefix ──→ Narrowed
+ │                       │
+ │                       └── complete ──→ Dispatch
+ │
+ ├── Esc ───────────────→ Cancel
+ │
+ ├── timeout ───────────→ Cancel
+ │
+ └── stale target ──────→ Recollect / Cancel
+```
+
+而且：
+
+```text
+Idle 时完全没有成本
+```
+
+没有 constant polling。
+
+这和 Bitty 的 frame-on-demand 哲学一致。
+
+---
+
+# 30. 和现在文档相比，我会做一个重要升级
+
+目前 `semantic-terminal-rfc.md` 里 Beacon 仍然主要是：
+
+```text
+P7 of Semantic Terminal
+```
+
+但实际上经过 Panel/UI 这些设计以后：
+
+> **Beacon 已经不属于 Semantic Terminal。**
+
+Semantic Terminal 只是它的一个 provider：
+
+```text
+CommandBlockProvider
+```
+
+更准确的关系应该是：
+
+```text
+                 Beacon
+                   │
+       ┌───────────┼─────────────┐
+       ▼           ▼             ▼
+   UI Runtime    Panel        Semantic Terminal
+   controls      Runtime       CommandBlocks
+       │           │             │
+       └───────────┴─────────────┘
+                   │
+              TargetRegistry
+```
+
+所以我以后会把 Beacon 从：
+
+```text
+semantic-terminal-rfc P7
+```
+
+提升成：
+
+```text
+bitty-plugins-docs/
+    specifications/
+        beacon-targeting-framework.md
+```
+
+或者 Beacon 自己的 docs。
+
+而 `Semantic Terminal RFC` 只保留：
+
+> 提供 `CommandBlock` targets 给 Hint/Beacon engine。
+
+这会更加符合现在整个 Bitty 的架构。
+
+---
+
+## 最终定位
+
+我现在会把 Beacon 定义为：
+
+> **Beacon 是 Bitty 面向整个 Workspace 的语义寻址层。**
+>
+> Mouse 通过空间坐标定位对象；
+> Beacon 通过短标签定位对象；
+> Command Registry 定义对对象做什么。
+
+所以可以形成一个非常漂亮的对偶：
+
+```text
+Mouse
+pointer coordinate
+       ↓
+    Hit Test
+       ↓
+    TargetRef
+```
+
+和：
+
+```text
+Keyboard
+Beacon label
+       ↓
+ Target Registry
+       ↓
+    TargetRef
+```
+
+最后都进入：
+
+```text
+TargetRef
+   +
+Command
+   ↓
+Command Registry
+```
+
+我认为这才是 Beacon 最值得做成 Bitty 官方核心插件的原因：**它不是 flash.nvim 在终端里的复刻，而是把 Bitty 的整个 Workspace 变成一个可以纯键盘语义寻址和操作的空间。**

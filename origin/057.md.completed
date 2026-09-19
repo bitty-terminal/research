@@ -1,0 +1,2470 @@
+对于 Bitty 本身的 UI 框架具体是如何设计的，需要结合 Bitty 独特的 Panel/Workspace 机制来好好设计，比如参考现有的 Kitty, Ghostty, WezTerm 等等终端和 Hyprland, Niri, Sway 等等平铺式窗口管理器。
+
+而且里面是可以非常高度自定义的，比如之后是可以封装成 Lua Core 的专门的 UI 框架的，因为对于插件系统来说大多数时候都是插件带有 UI 的。
+
+作为 Bitty 有一些特点，一个 Panel 可以作为纯命令行的界面，也可以作为一个插件程序的界面，比如像 btop 那样显示系统状态、docker 状态、statusline 也是这样的，并非 TUI，而是像 Windows/MacOS 那种原生的 UI 开发，而不是像 Flutter, WebView 这种的跨平台框架。
+
+或者说应该是 Plugin as a serve 了，也就是 PAAS 了，一个插件都是可以算作是一个服务的，但是因为 Bitty 使用 Piccolo，所以启动速度非常快，我做了个基准测试：
+
+已在 [`/mnt/data/Applications/piccolo-benchmark`](file:///mnt/data/Applications/piccolo-benchmark) 搭建了完备的自动化基准测试套件，并针对 **Lua (纯 Rust 实现的无栈式虚拟机 Piccolo 0.3.3)**、**TypeScript (Bun v1.4.0 / JavaScriptCore JIT)** 与 **Python (uv 管理的 CPython 3.13.13)** 完成了全方位的性能与内存剖析。
+
+---
+
+## 1. 测试环境与基准测试套件设计
+
+* **Host 环境**: Linux 6.18 x86_64, CachyOS
+* **Piccolo (Lua 运行时)**: [`piccolo = "0.3.3"`](file:///mnt/data/Applications/piccolo-benchmark/piccolo_bench/Cargo.toml)，Rust 纯实现、无外部 C 依赖，栈帧由垃圾回收器统一管理（Stackless VM）。
+* **TypeScript (Bun)**: `Bun v1.4.0`，基于 JavaScriptCore 并启用 JIT。
+* **Python (uv)**: `CPython 3.13.13`，使用 `uv run` 调度及裸 `python3` 对比。
+* **测试调度器**: [`run_benchmarks.py`](file:///mnt/data/Applications/piccolo-benchmark/run_benchmarks.py)，通过 Linux `os.wait4` 精准采集子进程执行耗时与峰值物理常驻内存（`ru_maxrss`）。
+
+测试覆盖了 **冷启动开销**、**多沙箱并发密度** 以及 **6 个维度的核心工作负载**。完整测试结果已固化在 [`benchmark_results.json`](file:///mnt/data/Applications/piccolo-benchmark/benchmark_results.json) 与 [`README.md`](file:///mnt/data/Applications/piccolo-benchmark/README.md)。
+
+---
+
+## 2. 实测数据对比
+
+### ① 冷启动与单实例基础开销 (Cold Start & Baseline)
+
+| 指标 | Piccolo (Pure Rust Lua) | TypeScript (Bun) | Python (uv run) | Python (bare python3) |
+| :--- | :--- | :--- | :--- | :--- |
+| **VM / 引擎初始化延迟** | **35.3 µs (0.035 ms)** | 2.77 ms | 18.85 ms | 8.29 ms |
+| **单实例独立堆内存 (Heap)** | **11.2 KB** | ~4 - 8 MB | ~5 - 10 MB | ~5 - 10 MB |
+| **进程峰值物理内存 (RSS)** | **13.5 MB** (含 Rust 驱动) | 13.5 MB | 44.6 MB | 13.5 MB |
+| **冷启动延迟倍数对比** | **1.0x (基准，快 78~530 倍)** | **78.4x 慢** | **533.6x 慢** | **234.8x 慢** |
+
+---
+
+### ② 100 个隔离实例并发创建 (Multi-Instance Isolation Density)
+> 模拟终端中同时拉起 100 个插件沙箱，或 Agent Harness 中同时运行多个独立 Subagent Context 的开销：
+
+| 指标 | Piccolo (100 独立 Lua VM) | TypeScript (100 vm.Context) | Python (100 isolated dicts) |
+| :--- | :--- | :--- | :--- |
+| **100 实例总耗时** | **0.99 ms** | 6.14 ms | 0.44 ms (注: 仅普通字典) |
+| **单实例平均创建延迟** | **9.92 µs** | 61.37 µs | 4.44 µs |
+| **100 实例新增堆内存** | **1.21 MB** | ~14.3 MB (增量) | ~31.7 MB (增量) |
+| **单 VM 平均独立内存** | **12.3 KB** | ~143 KB | ~317 KB |
+| **进程峰值物理内存 (RSS)** | **13.5 MB** | 27.8 MB | 45.2 MB |
+
+---
+
+### ③ 核心工作负载执行性能 (Workload Benchmarks)
+> 取 3 轮独立采样中的最优执行时间与峰值内存，耗时越短越优：
+
+| 负载项目 (Benchmark) | 负载特征 | Piccolo (Lua) | TypeScript (Bun JIT) | Python (CPython 3.13) |
+| :--- | :--- | :--- | :--- | :--- |
+| **`string_concat`** | 50,000 次字符串密集拼接与索引查找 | **1.98 ms** ⚡ (**全场最快**) | 6.11 ms | 1,251.56 ms (**慢 632 倍**) |
+| **`hashmap`** | 100,000 键值对插入与遍历累加 | **40.40 ms** | 31.54 ms | 32.68 ms |
+| **`array`** | 1,000,000 元素连续读写、反转与求和 | **99.58 ms** | 7.92 ms | 83.21 ms |
+| **`binary_trees`** | 深度 14 二叉树对象创建与 GC 回收 | **14.78 ms** | 1.31 ms | 6.22 ms |
+| **`fib(32)`** | 深层函数递归调用与调用栈调度 | **532.99 ms** | 10.45 ms | 151.79 ms |
+| **`numeric`** | 10,000,000 次密集浮点算术运算 | **1,078.14 ms** | 64.04 ms | 883.15 ms |
+
+---
+
+## 3. 架构深度剖析：为什么 Piccolo 是 Bitty 的天选之选？
+
+从纯数值计算与 JIT 角度看，Bun 在 `fib`、`numeric` 和 `array` 上凭借成熟的 Trace JIT / C2 编译器占据绝对优势。然而，结合 Bitty 终端与 AI Harness（Wheel）的工程现实，评测数据直接证实了 Rust + Piccolo 技术路线的必然性：
+
+### 1. 终端与 Agent Harness 到底在计算什么？
+终端插件与 Agent 控制面（Harness）有 **90% 以上的工作负载集中在：**
+* **文本切分、语法着色、ANSI 转义序列流式解析**
+* **Prompt 模板组装、JSON / MCP 协议编解码、命令管线拼接**
+* **状态表（State Table）索引、配置查询与派发**
+
+在 **`string_concat`** 测试中：
+* Piccolo 耗时仅 **1.98 ms**，不仅大幅超越 Python（1,251.56 ms，快 **632 倍**），甚至比 Bun（6.11 ms）快 **3 倍**。
+* 在 10 万键值对的 **`hashmap`** 测试中，Piccolo（40.4 ms）与高度内联优化的 CPython（32.7 ms）和 Bun（31.5 ms）完全处在同一毫秒级水平线。
+这证明在**终端宿主的核心业务场景中，Piccolo 的处理效率甚至优于大型 JIT 引擎**。
+
+### 2. 宿主集成与多实例隔离密度（12 KB vs 45 MB）
+* **实例冷启动**：Piccolo 仅需 **35.3 微秒**，而 Python `uv run` 需要 **18.8 毫秒**（慢 533 倍）。
+* **内存占用底噪**：单个 Piccolo VM 的 Heap 仅 **11.2 KB**。并发创建 100 个完全独立的 Lua 虚拟机仅耗时 **0.99 毫秒**，新增总堆内存仅 **1.21 MB**。
+* 反观 Python，拉起一个解释器就需要 44.6 MB 物理内存，且缺乏原生的进程内隔离沙箱（只能依靠受限字典或子进程）；Bun 的单个 Context 开销也达到 140+ KB 且进程常驻近 30 MB。
+* 在 Bitty 终端中，如果加载 50 个插件或同时运行 10 个后台 Agent，Piccolo 只需消耗不到 1 MB 内存，能在 1 毫秒内全部就绪；若使用 Python 或 Node.js，终端启动时间将直接飙升至秒级，常驻内存突破数百兆。
+
+### 3. Stackless 设计的工程权衡（The Stackless Trade-off）
+实测中 Piccolo 在 `fib` 和 `numeric` 耗时较长，这源于 Piccolo 独特的 **Stackless 架构**：
+* **无 C/Native 栈绑定**：Piccolo 不依赖底层操作系统的调用栈（Native Call Stack），每个 Lua 函数的调用帧（Execution Frame）直接分配在 GC Arena（堆）中。
+* **随时随地可挂起（Suspendable / Resumable）**：由于执行状态全部在堆上，Piccolo 的执行器（[`piccolo::Executor`](file:///mnt/data/Applications/piccolo-benchmark/piccolo_bench/src/main.rs#L1)）可以无损打断。当遇到 I/O 阻塞、网络调用或用户输入时，VM 可以直接挂起并序列化状态，完美无缝融入 Rust 的 `async/await` 与 Tokio 事件循环。
+* **确定性 Fuel 预算（Deterministic Fuel Mechanism）**：通过 [`Fuel::with(budget)`](file:///mnt/data/Applications/piccolo-benchmark/piccolo_bench/src/main.rs#L42)，Bitty 宿主可以精确控制每个插件在每次渲染帧内最多消耗多少指令配额。即使第三方插件写了 `while true do end` 死循环，Piccolo 也能在耗尽 Fuel 时主动让出控制权，**从物理上根绝了插件导致终端 UI 冻结的风险**。
+* **重型数值计算交由 Rust Core**：Bitty 的矢量渲染、Pty 流转发、SIMD 文本解码全部由底层 Rust 承载，Lua 仅作为胶水层和策略层。用计算密集型的微小退让，换取极致的**内存安全、无损协程挂起、细粒度资源沙箱和微秒级启动**，是极具远见的架构取舍。
+
+---
+```
+
+
+
+也就是说之后的每一个插件就很像是一个独立的程序，不过运行在 Bitty 之上。
+
+那么对于只说 UI/UX 部分，Bitty 应该怎么做呢？应该不止是 Panel 设计，还有别的需要设计，比如 Workspace 那个状态条（类比于浏览器的 Sidebar），然后因为 Panel 是可以像窗口一样移动的，且可以移动到别的 Workspace 以及新的 Workspace 中的，是默认通过 Mod+鼠标左键实现拖拽的。
+
+那么具体的 UI/UX 得如何设计呢？结合现有的文档来看有哪些需要调整更好呢？而且这些可以被 Lua Core 复用的部分非常多，比如就算是动画、透明度、模糊程度、宽度高度等等都是可以自定义的
+
+
+## 结论
+
+结合我刚检查的 `bitty-terminal-docs`、`bitty-plugins-docs` 以及现在已经 Accepted 的 Panel Runtime，我认为 Bitty 的 UI 不应该继续被理解成“终端渲染器上再加一些控件”，而应该正式提升成一个 **Workspace-native Application UI Runtime**。
+
+最合适的整体模型是：
+
+```text
+Bitty
+└─ Native Window
+   ├─ Window Chrome
+   │  ├─ Workspace Rail / Sidebar
+   │  ├─ Status Bar
+   │  ├─ Command / Notification Surface
+   │  └─ Global Overlay Root
+   │
+   └─ Workspace
+      ├─ Tiled Layer
+      │  └─ LayoutTree<ViewId>
+      ├─ Floating Layer
+      ├─ Pinned Layer
+      ├─ Popover Layer
+      └─ Scratchpad / Hidden Set
+
+View
+└─ Panel(PanelId)
+   ├─ Panel Chrome
+   └─ ActivityStack
+      └─ Activity
+         ├─ Terminal(TerminalId)
+         ├─ NativeUI(UiTreeId)
+         ├─ Rich
+         ├─ CanvasScene
+         ├─ Browser
+         └─ Helper
+```
+
+这里最关键的思想是：
+
+> **Workspace 管空间，View 管“放在哪里”，Panel 管应用实例，Activity 管“当前展示什么”。**
+
+这会比继续把 `View / Terminal / Panel / Rich / Browser` 放在同一个层面清晰很多。
+
+---
+
+# 1. 先把“原生 UI”这个概念定义清楚
+
+你描述的目标其实和 Ghostty 的“native UI”不完全一样。
+
+Ghostty 真正意义上的 native 是：
+
+* macOS 用 Swift + AppKit / SwiftUI；
+* Linux 用 GTK4；
+* 核心 `libghostty` 再提供跨平台 terminal engine。
+
+所以它的 Tab、Split、错误框等是真的操作系统/桌面 toolkit 控件。([Ghostty][1])
+
+Bitty 如果希望：
+
+```text
+Lua Plugin
+   ↓
+一套相同 UI API
+   ↓
+Windows / macOS / Linux / BSD
+```
+
+那么不应该让 Lua 最终映射成 WinUI/AppKit/GTK Widget。
+
+否则跨平台行为和样式很快就会裂开。
+
+Bitty 更适合定义自己的：
+
+> **Bitty-native UI**
+
+也就是：
+
+```text
+Lua
+ ↓
+Retained UI Tree
+ ↓
+Rust Layout / Input / Text / Animation / A11y
+ ↓
+wgpu
+ ↓
+Native Window
+```
+
+它不是 Flutter，也不是 WebView，也不是 TUI；但严格意义上也不是 AppKit/WinUI native widgets。
+
+真正调用 OS-native 的部分应该限定在：
+
+```text
+Window
+IME
+Clipboard
+Drag & Drop
+Accessibility
+File Picker
+Notifications
+System Menu
+Cursor
+Input Method
+```
+
+而 Button、Table、Tree、Graph、Sidebar、Chat、Docker Dashboard 都由 Bitty 自己画。
+
+我建议文档以后统一使用 **Bitty-native UI** 这个术语，避免把它写成 “native OS UI”。
+
+---
+
+# 2. `View` 和 `Panel` 现在必须正式分工
+
+目前最大的设计债，其实就是 `RFC-OQ-3`。
+
+现在 Accepted 的 `Panel Runtime RFC` 已经承认：
+
+```text
+PanelId != ViewId != TerminalId
+```
+
+但 Panel 到底：
+
+```text
+A. 是 ViewContent::Panel
+B. 替代 View 成为 LayoutTree leaf
+C. 和 View 分离
+```
+
+仍然没有最终决定。
+
+我更建议接近 **C，但不是简单 side-car**：
+
+| 概念         | 职责                                 |
+| ---------- | ---------------------------------- |
+| `View`     | compositor presentation attachment |
+| `Panel`    | application/session identity       |
+| `Activity` | Panel 当前展示的内容                      |
+| `Terminal` | 一种 Activity 背后的 session/resource   |
+| `Document` | 可被 Activity/View 展示的数据对象           |
+
+也就是说：
+
+```text
+LayoutTree
+   ↓
+ ViewId
+   ↓
+ PanelId
+   ↓
+ Activity
+```
+
+用户和 Lua API **几乎不需要知道 View**。
+
+比如：
+
+```lua
+panel:move_to("workspace:2")
+panel:float()
+panel:fullscreen()
+panel:push(activity)
+```
+
+而不是：
+
+```lua
+view:set_content(...)
+view:rebind(...)
+```
+
+`View` 应该越来越像 compositor 内部概念。
+
+这和 WezTerm 把 multiplexing model 与 GUI presentation 分离的思想是相似的：WezTerm 的 mux 独立管理 panes/windows/workspaces，甚至 mux 可以在没有 GUI 的情况下存在。([WezTerm][2])
+
+---
+
+# 3. Workspace 不应该再只是 `LayoutTree`
+
+这是我认为现有设计最需要升级的一点。
+
+现在的：
+
+```text
+Workspace
+└─ LayoutTree
+   └─ View
+```
+
+对于纯 tiling terminal 很好。
+
+但是你现在已经有：
+
+```text
+tiled
+floating
+fullscreen
+scratchpad
+pinned
+popover
+overlay
+```
+
+再让所有东西围绕 `LayoutTree` 打补丁就会越来越别扭。
+
+应该正式引入：
+
+```text
+WorkspaceScene
+```
+
+其内部类似：
+
+```text
+WorkspaceScene
+├─ background
+├─ tiled_layer
+│  └─ LayoutTree<ViewId>
+├─ floating_layer
+│  └─ ZStack<ViewId>
+├─ pinned_layer
+│  ├─ left
+│  ├─ right
+│  ├─ top
+│  └─ bottom
+├─ popover_layer
+└─ overlay_layer
+```
+
+这样 `PresentationMode` 就真正变成：
+
+> Panel/View 在 Workspace Scene 中选择哪一种 presentation strategy。
+
+而不是 Panel 类型。
+
+这和现在 Accepted Panel RFC 的方向完全一致。
+
+### Fullscreen
+
+甚至不用单独搞新的 layout：
+
+```text
+workspace.fullscreen = Some(ViewId)
+```
+
+compositor 临时只展示它。
+
+### Scratchpad
+
+是：
+
+```text
+Workspace
+└─ hidden_set<ViewId>
+```
+
+或者 Window-scoped 的 scratchpad registry。
+
+### Floating
+
+进入 `floating_layer`。
+
+### Tiled
+
+挂在 `LayoutTree`。
+
+这样结构非常干净。
+
+Sway 本身也明确区分 tiled/floating 层，并支持 focus between tiled/floating、workspace move、scratchpad、fullscreen，同时其 `floating_modifier` 就是 Mod+左键移动、Mod+右键 resize。([Arch Manual Pages][3])
+
+所以你现在的 **Mod + LMB** 设计其实非常合理。
+
+---
+
+# 4. Native UI Runtime 应该使用 Retained / Declarative，而不是 Immediate Mode
+
+这一点我建议直接定下来。
+
+不要设计：
+
+```lua
+function draw(frame)
+    ui.rect(...)
+    ui.text(...)
+end
+```
+
+更不要每 8~16ms 调一次 Lua。
+
+应该：
+
+```text
+Lua State
+   ↓
+Declarative UiTree
+   ↓
+Rust reconciliation
+   ↓
+Layout
+   ↓
+Hit Test
+   ↓
+Accessibility Tree
+   ↓
+Paint List
+   ↓
+wgpu
+```
+
+Lua 只在：
+
+```text
+state change
+user semantic action
+service event
+timer
+data update
+```
+
+的时候工作。
+
+比如概念 API：
+
+```lua
+return ui.column {
+    gap = 8,
+
+    ui.text {
+        text = state.cpu .. "%",
+        role = "heading",
+    },
+
+    ui.progress {
+        value = state.cpu / 100,
+    },
+
+    ui.button {
+        label = "Refresh",
+        on_click = refresh,
+    },
+}
+```
+
+CPU 从 43% 变 47%：
+
+```text
+Lua state change
+→ UI patch
+→ Rust marks node dirty
+→ layout/paint affected subtree
+→ one frame
+→ back to sleep
+```
+
+而不是让 Lua 自己画 60 FPS。
+
+这正好利用 Piccolo：
+
+```text
+Lua = State + Policy + Composition
+Rust = Mechanism + Hot Path
+```
+
+---
+
+# 5. UI Framework 应该分成三层，而不是“一个 Lua 插件”
+
+我会稍微修改当前 `plugin-ecosystem-model.md` 里的“framework plugin”方向。
+
+对于 UI Widget framework，如果每个：
+
+```text
+ui.text()
+ui.row()
+ui.button()
+```
+
+都需要跨 Plugin Service boundary，就太重了。
+
+更好的结构是：
+
+```text
+Rust UI Runtime
+        │
+        │ stable ABI
+        ▼
+bitty.ui              ← Host Lua API
+        │
+        ▼
+Bitty UI Standard Lib ← Lua library，同一个 VM 内运行
+        │
+        ▼
+Optional Frameworks
+        │
+        ▼
+Application Plugin
+```
+
+其中：
+
+| 层               | 做什么                                     |
+| --------------- | --------------------------------------- |
+| Rust `bitty-ui` | layout/render/input/a11y/text/animation |
+| `bitty.ui`      | 最小稳定 semantic API                       |
+| Lua UI Stdlib   | component/state/theme/composition       |
+| Plugin          | Docker/Git/AI/btop/files 等              |
+
+而跨 VM 的：
+
+```text
+Plugin Service
+```
+
+更适合：
+
+```text
+Git Service
+LLM Service
+Docker Service
+HTTP Service
+Database Service
+```
+
+而不是 Widget framework。
+
+这会是我建议你修改现有“四层 framework ecosystem”设计的一个重要点：
+
+> **UI framework 是 in-VM library；domain framework 才更适合跨 VM service。**
+
+---
+
+# 6. Rust Core 和 Lua Core 的边界
+
+可以明确到这个程度：
+
+| Rust UI Runtime        | Lua UI Framework        |
+| ---------------------- | ----------------------- |
+| Scene Tree             | Component               |
+| Flex/Grid/Stack layout | Card                    |
+| Text shaping           | Button composition      |
+| TextInput/IME          | Form                    |
+| Editor primitive       | Vim-like behavior       |
+| Scroll                 | Tabs                    |
+| Virtualization         | Table policy            |
+| Hit testing            | Dashboard               |
+| Pointer dispatch       | Docker UI               |
+| Focus engine           | Git UI                  |
+| Accessibility          | AI Chat                 |
+| Animation timeline     | Motion preset selection |
+| GPU resources          | Theme                   |
+| Image decode/cache     | Application state       |
+| Terminal surface       | Workflow                |
+| Canvas display list    | Graph semantics         |
+
+尤其是这几个不能轻易交给 Lua：
+
+```text
+TextInput
+Editor viewport
+VirtualList
+IME
+Text shaping
+Hit testing
+Accessibility
+animation interpolation
+scroll physics
+```
+
+因为它们都属于高频机制。
+
+---
+
+# 7. Canvas 也不应该给 Lua 一个 draw loop
+
+比如以后 btop-like 插件要绘图表。
+
+不要：
+
+```lua
+function on_frame(canvas)
+    for ...
+        canvas:line(...)
+    end
+end
+```
+
+更适合：
+
+```lua
+ui.canvas {
+    scene = {
+        polyline(...),
+        text(...),
+        rect(...),
+    }
+}
+```
+
+Lua提交的是：
+
+```text
+bounded display list
+```
+
+Rust 保存并重新绘制。
+
+数据变化才更新 Scene。
+
+这样一个 CPU graph 即使屏幕刷新 144Hz：
+
+```text
+Lua 1 Hz 更新 CPU samples
+Rust compositor 负责 transition
+```
+
+而不是 Lua 跑 144 次。
+
+---
+
+# 8. 宽高也必须区分“期望尺寸”和“实际尺寸”
+
+这个很重要。
+
+插件不能写：
+
+```lua
+panel.width = 721
+panel.height = 513
+```
+
+然后强迫 tiled compositor 接受。
+
+应该有：
+
+```text
+min_size
+preferred_size
+max_size
+aspect_ratio
+```
+
+例如：
+
+```lua
+size = {
+    min = { 360, 240 },
+    preferred = { 720, 520 },
+    max = { 1600, 1200 },
+}
+```
+
+对于：
+
+### Tiled
+
+这些是 layout constraints。
+
+### Niri-style
+
+`preferred_width` 特别重要。
+
+Niri 自身就支持 default/preset column widths，并允许固定 logical pixels 或输出比例；它甚至允许应用自身决定 initial width。([GitHub][4])
+
+这非常适合 Bitty。
+
+因为：
+
+```text
+Terminal     900px
+File tree    280px
+AI Chat      480px
+Docker       600px
+```
+
+这些 Surface 根本不应该被 BSP 强行平均压成 350px。
+
+所以 Bitty 的 Niri-style `LayoutProvider` 我反而认为会比普通 desktop WM 更有价值。
+
+---
+
+# 9. Appearance 应该形成真正的 Style Cascade
+
+你现在已经有：
+
+```text
+border
+border width
+background
+background image
+opacity
+blur
+radius
+animation
+```
+
+接下来不能继续一个字段一个字段添加。
+
+应该做统一的：
+
+```text
+ResolvedStyle
+```
+
+大概按照：
+
+```text
+Safety Policy
+       ↓
+User explicit PanelRule
+       ↓
+WorkspaceRule
+       ↓
+User Theme
+       ↓
+Plugin Panel Preference
+       ↓
+Plugin Content Theme
+       ↓
+Framework Default
+```
+
+其中必须区分三块：
+
+| 范围                  | 控制权                             |
+| ------------------- | ------------------------------- |
+| Window/Shell Chrome | Core + User                     |
+| Panel Chrome        | Core/User 最终决定；Plugin 可 request |
+| Panel Content       | Plugin 自己控制，Host 限制资源           |
+
+也就是说 Docker 插件完全可以说：
+
+```text
+我希望自己的 Panel：
+background = ...
+accent = ...
+radius = ...
+preferred_motion = ...
+```
+
+但用户可以覆盖。
+
+插件不能说：
+
+```text
+所有 Workspace blur = 40
+全局 border = transparent
+隐藏所有 focus indication
+```
+
+---
+
+# 10. Panel Rules 应该尽快成为一等公民
+
+这正是 Hyprland 给 Bitty 最值得借鉴的东西之一。
+
+Hyprland 已经把 workspace rules 和 window rules 作为非常核心的 policy 层：可以针对 workspace/layout/gaps/animation，也能按 window 属性配置 floating、focus、blur、animation、size 等。([Hypr Wiki][5])
+
+但 Bitty 可以做得比它更 typed。
+
+例如概念模型：
+
+```lua
+panel_rule {
+    match = {
+        plugin = "bitty.docker",
+        role = "dashboard",
+    },
+
+    presentation = "floating",
+
+    size = {
+        preferred = { 720, 500 },
+        min = { 420, 300 },
+    },
+
+    appearance = {
+        opacity = 0.96,
+        blur = 16,
+    },
+
+    focus = {
+        on_open = false,
+    },
+}
+```
+
+我反而**不建议**完全复制 Hyprland“规则顺序决定结果”的行为。Hyprland 当前的 rules 明确存在顺序语义。([Hypr Wiki][6])
+
+Bitty 可以定义更严格的：
+
+```text
+priority
+specificity
+source precedence
+conflict diagnostic
+```
+
+同优先级发生互斥设置甚至可以直接报 diagnostic。
+
+更符合你整个 Bitty 的 typed contract 思路。
+
+---
+
+# 11. 动画一定要 Core-owned
+
+这个和 Piccolo 的定位高度相关。
+
+Lua：
+
+```text
+改变 target state
+```
+
+Rust：
+
+```text
+从 current state 插值到 target state
+```
+
+例如：
+
+```text
+panel rect A
+    ↓ state change
+panel rect B
+```
+
+Lua 到这里已经结束。
+
+Rust compositor 负责：
+
+```text
+A → B
+```
+
+而不是：
+
+```lua
+for t = 0, 1, 0.01 do
+    panel.x = ...
+end
+```
+
+建议统一成 Motion Tree：
+
+```text
+motion.default
+motion.workspace
+motion.panel
+motion.panel.open
+motion.panel.close
+motion.panel.move
+motion.panel.resize
+motion.panel.focus
+motion.overlay
+motion.sidebar
+```
+
+然后继承。
+
+例如：
+
+```text
+panel.move inherits panel
+panel inherits default
+```
+
+每一级可以覆盖：
+
+```text
+duration
+easing
+spring
+enabled
+```
+
+Lua 可以自定义 preset，Core 执行。
+
+另外必须从一开始支持：
+
+```text
+reduced_motion
+```
+
+以及 frame-on-demand：
+
+```text
+无 damage
+无动画
+无输入
+→ 0 animation wakeup
+```
+
+---
+
+# 12. Blur/opacity/shadow 不是普通 style 属性
+
+从 Lua API 看可以统一：
+
+```lua
+style = {
+    opacity = 0.9,
+    blur = 16,
+    shadow = ...
+}
+```
+
+但是 Rust 内部应该把它们当作 **GPU effects budget**。
+
+否则某个插件创建：
+
+```text
+32 Panels
+× huge backdrop blur
+× large radius
+× animations
+```
+
+Piccolo 的 Fuel 一点用都没有，因为压力已经到了 GPU。
+
+所以你的 isolation/resource RFC 应增加：
+
+```text
+UI node count
+scene bytes
+decoded image pixels
+GPU texture bytes
+active animation count
+blur surface area
+Canvas command count
+a11y node count
+UI updates/sec
+```
+
+这一点也正好说明你的 benchmark 需要稍微谨慎解释。
+
+Piccolo 的：
+
+```text
+~12 KB / VM
+```
+
+非常优秀，但这只是 Lua VM heap 的量级。
+
+一个插件真正跑起来以后：
+
+```text
+UiTree
+text layout
+glyphs
+image
+render target
+event queue
+service data
+network buffer
+```
+
+往往远比 VM 本身贵。
+
+同理：
+
+> `Fuel` 能限制 Lua instruction execution，不等于整个插件不可能卡 UI。
+
+例如 Lua 一次请求 Core：
+
+```text
+decode 500 MB image
+create 1M SceneNodes
+blur 8K surface
+```
+
+真正的成本发生在 Rust/GPU。
+
+所以必须同时有：
+
+```text
+Lua Fuel
++
+Host API admission budget
++
+UI/GPU resource budget
+```
+
+三层。
+
+---
+
+# 13. Workspace Sidebar 应该提升成 `Window Chrome`
+
+你提到类似浏览器 Sidebar 的 Workspace 状态条，我非常赞成，但不建议继续塞进现在的 `Status System Specification`。
+
+现在文档里 StatusBar 是：
+
+```text
+bottom anchored
+left / center / right
+Waybar-like
+```
+
+这对于终端状态栏没问题。
+
+但未来实际会出现：
+
+```text
+Workspace Sidebar
+Status Bar
+Panel Bar
+Notification Center
+Command Palette
+AI indicator
+Agent indicator
+Plugin status
+```
+
+所以应该抽象：
+
+```text
+WindowChromeRuntime
+```
+
+然后：
+
+```text
+WindowChrome
+├─ WorkspaceRail
+├─ StatusBar
+├─ OverlayRoot
+├─ NotificationArea
+└─ CommandSurface
+```
+
+现有 `StatusBar` 只是它的一个 consumer。
+
+### Workspace Rail
+
+我建议默认是一条窄的垂直 Rail：
+
+```text
+┌──┬─────────────────────────────┐
+│1 │                             │
+│2 │        Workspace            │
+│●3│                             │
+│4 │                             │
+│  │                             │
+│+ │                             │
+└──┴─────────────────────────────┘
+```
+
+Workspace entry 可以有：
+
+```text
+name/icon
+active
+Panel count
+attention badge
+running task/agent indicator
+```
+
+最重要的是它天然就是 **Panel drag target**。
+
+---
+
+# 14. `Mod + LMB` 拖动可以设计得非常漂亮
+
+完整 UX 应该是：
+
+```text
+Mod + LMB down
+      ↓
+Host captures gesture
+      ↓
+Panel enters "lifted" state
+      ↓
+pointer moves
+      ↓
+Compositor calculates drop targets
+      ↓
+preview
+      ↓
+commit / Esc rollback
+```
+
+其中需要支持这些 Drop Target：
+
+```text
+another tiled Panel
+→ left/right/top/bottom split
+
+Workspace empty area
+→ insert according to LayoutProvider
+
+floating area
+→ become floating
+
+Workspace Rail item
+→ move to workspace
+
+Workspace Rail "+"
+→ create Workspace + move
+
+pinned edge
+→ become pinned
+```
+
+尤其是：
+
+```text
+Workspace 1
+   │
+   └── Panel A
+          │ drag
+          ▼
+Workspace "+"
+```
+
+最好作为一次 transaction：
+
+```text
+create workspace
++ detach view
++ reattach panel
++ layout commit
++ focus update
+```
+
+任何一步失败：
+
+```text
+rollback
+```
+
+`Esc` 也恢复原 layout。
+
+最关键的是：
+
+> **跨 Workspace 移动只改变 presentation attachment，不改变 PanelId、Activity、TerminalId。**
+
+所以一个运行 `nvim` 的 Terminal Activity 被拖到 Workspace 4：
+
+```text
+PTY 不动
+TerminalId 不动
+PanelId 不动
+Lua VM 不动
+```
+
+只改变 Workspace/View binding。
+
+这会非常稳定。
+
+Sway 已经验证了这种统一 command model 的价值：同一套体系里同时有 modifier-drag、move-to-workspace、scratchpad、floating、resize 等。([Arch Manual Pages][3])
+
+---
+
+# 15. 所有鼠标操作都应该有 Command 等价形式
+
+这是 Bitty 比普通 GUI 更重要的一点。
+
+例如：
+
+```text
+mouse:
+Mod + LMB drag
+
+keyboard:
+Mod+Shift+H/J/K/L
+
+command:
+panel.move(...)
+
+CLI:
+bitty panel move ...
+
+IPC:
+command.invoke(...)
+
+Agent:
+command.execute(...)
+```
+
+最终全部进入：
+
+```text
+Command Registry
+```
+
+而不是五套实现。
+
+这也是 kitty 很值得参考的一点：它把大量窗口/layout/session 操作暴露成统一 remote-control actions，脚本也能操作正在运行的终端实例。([Kovid's Software Projects][7])
+
+Bitty 可以进一步做到：
+
+```text
+Keyboard
+Mouse
+Palette
+Lua
+CLI
+IPC
+Wheel Agent
+```
+
+全部共享一个 command ontology。
+
+---
+
+# 16. Workspace Rail 可以直接成为 Drag & Drop UX 的核心
+
+例如：
+
+```text
+┌──── Workspace Rail
+│
+│  ● Coding        3
+│    Research      2
+│  ! Server        4
+│    Chat          1
+│
+│  ＋
+└────
+```
+
+当 Panel 开始拖：
+
+```text
+Coding
+Research  ← highlight
+Server
+Chat
++
+```
+
+拖到 `Research` 上：
+
+```text
+move
+```
+
+停留时甚至可以临时 preview Workspace。
+
+拖到 `+`：
+
+```text
+ghost Workspace appears
+```
+
+松手创建。
+
+这比传统：
+
+```text
+Shift+Mod+3
+```
+
+更适合鼠标用户，同时键盘用户仍然使用 command。
+
+---
+
+# 17. Focus、Visibility、Attention 千万不要继续塞进一个状态枚举
+
+Panel 应该拥有正交状态：
+
+| Axis         | 示例                                                            |
+| ------------ | ------------------------------------------------------------- |
+| Lifecycle    | created / mounted / suspended / disposed                      |
+| Presentation | tiled / floating / fullscreen / scratchpad / pinned / popover |
+| Visibility   | visible / occluded / hidden / inactive-workspace              |
+| Focus        | focused / unfocused                                           |
+| Attention    | none / info / urgent                                          |
+| Interaction  | normal / pointer-captured / modal-blocked                     |
+| Activity     | terminal / UI / rich / browser                                |
+
+比如：
+
+```text
+Panel:
+  mounted
+  tiled
+  inactive-workspace
+  unfocused
+  urgent
+```
+
+这是完全合理的。
+
+不要构造成：
+
+```text
+MountedFocusedVisibleTiled
+MountedUnfocusedVisibleTiled
+MountedFocusedFloating
+...
+```
+
+否则状态爆炸。
+
+---
+
+# 18. 不建议让 Plugin 直接抢 Focus
+
+插件可以：
+
+```text
+request_attention()
+request_focus()
+```
+
+但 Core/User Policy 决定是否执行。
+
+尤其以后 AI、Chat、Docker、Build 插件都可能不断出事件。
+
+默认更适合：
+
+```text
+background activity
+→ attention badge
+→ Workspace Rail indicator
+```
+
+而不是把用户从当前 terminal 抢走。
+
+Sway 也明确区分 activation 与 urgency；应用请求激活并不一定意味着直接聚焦。([Arch Manual Pages][3])
+
+---
+
+# 19. `ActivityStack` 我认为值得正式落 RFC
+
+你现在 Panel Runtime 里已经记录了这个方向：
+
+```text
+Panel is not Activity
+```
+
+我认为应该正式推进。
+
+比如 Docker Panel：
+
+```text
+ActivityStack
+
+Docker Overview
+   ↓ push
+Container Detail
+   ↓ push
+Logs
+   ↓ pop
+Container Detail
+```
+
+Terminal Panel：
+
+```text
+Terminal
+  ↓ push
+Search Results
+  ↓ pop
+Terminal
+```
+
+AI Panel：
+
+```text
+Chat
+ ↓
+Model Settings
+ ↓
+Tool Detail
+```
+
+这里 Panel 的：
+
+```text
+position
+workspace
+size
+focus
+identity
+```
+
+完全没有变化。
+
+只有内部 navigation stack 变化。
+
+这会让 Panel 真正接近一个 application window，而不是一种 renderer。
+
+---
+
+# 20. Plugin 也不要和 Panel 生命周期绑定
+
+这也是你说的 “Plugin as a service” 最重要的地方。
+
+建议正式区分：
+
+```text
+Plugin Package
+      ↓
+Plugin Runtime / Lua VM
+      ├─ Services
+      ├─ Commands
+      ├─ Background Tasks
+      ├─ PanelProvider
+      │   ├─ Panel A
+      │   └─ Panel B
+      └─ UI Components
+```
+
+所以：
+
+```text
+close Panel
+≠
+unload Plugin
+```
+
+同样：
+
+```text
+Plugin
+≠
+Panel
+```
+
+一个 Git 插件可能有：
+
+```text
+GitService
+
+Panel:
+  Git Status
+
+Panel:
+  Commit History
+
+Status component:
+  branch
+
+Command:
+  git.checkout
+
+Background watcher
+```
+
+这才是真正的 application/service architecture。
+
+我不建议文档里把它缩写成 **PaaS**，因为软件领域 PaaS 几乎已经固定意味着 Platform as a Service。
+
+可以叫：
+
+> **Plugin Application Runtime**
+
+或者：
+
+> **Service-oriented Plugin Model**
+
+---
+
+# 21. Piccolo 对这个模式确实特别合适，但不要把 VM 状态等同于持久化
+
+你的 benchmark 对架构选择非常有价值，尤其是：
+
+```text
+大量独立 VM
+lazy activation
+short-lived helper
+per-plugin isolation
+Fuel
+```
+
+这些都和 Bitty 非常匹配。
+
+但这里有一个需要纠正的推论：
+
+> **Stackless / suspendable 不自动意味着 VM 可以安全序列化到磁盘。**
+
+“暂停 Executor”与：
+
+```text
+关闭 Bitty
+→ 保存 Lua VM call stack
+→ 重启
+→ 恢复到任意 coroutine instruction
+```
+
+是完全不同的问题。
+
+Bitty 的 Workspace persistence 不应该依赖 Lua VM snapshot。
+
+应该保存：
+
+```text
+Workspace layout
+Panel identities/types
+presentation mode
+size
+Activity route/state
+plugin durable store
+Terminal PersistentId（如果相应合同支持）
+```
+
+然后重新创建 VM 并进行 declarative rehydration。
+
+这样升级 Lua runtime 也不会让以前的 VM heap snapshot 全部失效。
+
+---
+
+# 22. 现有文档我建议这样调整
+
+这是我看完当前 main 分支后认为最需要改的部分：
+
+| 文档                                    | 当前问题                                                     | 建议                                                 |
+| ------------------------------------- | -------------------------------------------------------- | -------------------------------------------------- |
+| `product/panel-vision.md`             | 明显停留在 8/30，仍写 Workspace/Panel Runtime 未 Accepted         | **重写为 Vision v2 或 archive**                        |
+| `specifications/panel-runtime-rfc.md` | Runtime 已 Accepted，但 Activity / placement / rules 仍 open | 后续 `Panel Activity RFC`                            |
+| `workspace-compositor.md`             | 核心仍然太 `LayoutTree`-centric                               | 新增 `Workspace Scene RFC`，不要破坏已 Accepted 合同         |
+| `ui-compositor-gap-analysis.md`       | 9/13 snapshot，比 Panel RFC 还旧                             | 刷新或 archive 成 historical evidence                  |
+| `ui-extensibility-architecture.md`    | P2 仍说“blocked on future Panel RFC”                       | 立即 reconcile 9/14 Accepted 状态                      |
+| `plugin-ecosystem-model.md`           | framework plugin 与 UI library 混在一起                       | 区分 in-VM Lua library / cross-VM service framework  |
+| `status-system.md`                    | Waybar bottom bar 抽象太窄                                   | 提升为 `Window Chrome Runtime`，StatusBar 只是一个 surface |
+| `input-pointer-rfc.md`                | 已有 Mod/Input contract，但完整 panel drag transaction 不足      | 加 move/resize/drop/cross-workspace contract        |
+| Appearance RFC                        | per-View 已开始，但还不够统一                                      | 引入 scoped `ResolvedStyle`                          |
+| Animation RFC                         | 已有 Panel animation                                       | 升级 Motion hierarchy + property whitelist           |
+| Isolation Resource RFC                | 主要关注 VM/event                                            | 加 UI/GPU budgets                                   |
+| 尚无                                    | UI 树本身没有统一正式 contract                                    | **新增 `Native UI Runtime RFC`**                     |
+| 尚无                                    | Accessibility contract 不完整                               | **新增 Accessibility/Input Semantics contract**      |
+
+尤其 `panel-vision.md` 已经不是小修能解决的。
+
+它现在属于：
+
+```text
+历史上非常重要
+但事实状态已经明显过期
+```
+
+我会选择保留历史版然后出 `Panel/Application Vision v2`。
+
+---
+
+# 23. 我会把后面的 UI RFC 收敛成 5 个，而不是继续散开
+
+最终我建议形成这样的规范边界：
+
+```text
+UI Runtime RFC
+├─ UiTree
+├─ layout
+├─ widget primitives
+├─ input/hit-test
+├─ accessibility
+├─ diff
+└─ UI resource budget
+
+Workspace Scene RFC
+├─ tiled
+├─ floating
+├─ pinned
+├─ fullscreen
+├─ scratchpad
+├─ popover
+└─ overlay
+
+Panel & Activity RFC
+├─ Panel/View relation
+├─ ActivityStack
+├─ PanelProvider
+├─ lifecycle
+└─ persistence state
+
+Panel Rules & Styling RFC
+├─ rules
+├─ size constraints
+├─ appearance
+├─ themes
+└─ precedence
+
+Window Chrome RFC
+├─ WorkspaceRail
+├─ StatusBar
+├─ plugin chrome slots
+├─ notifications
+└─ global overlays
+```
+
+已有的：
+
+```text
+Input RFC
+Animation RFC
+Appearance RFC
+Isolation RFC
+```
+
+则作为它们依赖的底层合同，不需要再重复定义。
+
+---
+
+# 24. 最终 Rust → Lua → Plugin 结构
+
+如果把整个东西压缩成一张架构图，我认为 Bitty 应该最终长成：
+
+```text
+┌─────────────────────────────────────────────────┐
+│                 Application Plugins             │
+│ Docker / Git / AI / Files / btop / Mail / ...  │
+├─────────────────────────────────────────────────┤
+│               Lua UI Framework                  │
+│ Components / State / Theme / Routing / Widgets  │
+├─────────────────────────────────────────────────┤
+│                 Public Lua SDK                  │
+│ panel / ui / workspace / command / service      │
+├─────────────────────────────────────────────────┤
+│                  App Runtime                    │
+│ Plugin / Service / Panel / Activity / EventBus  │
+├─────────────────────────────────────────────────┤
+│               Workspace Compositor              │
+│ Tiled / Floating / Pinned / Overlay / Focus     │
+├─────────────────────────────────────────────────┤
+│                   UI Runtime                    │
+│ Tree / Layout / Input / A11y / Animation        │
+├─────────────────────────────────────────────────┤
+│          Terminal + Rich + Graphics Core        │
+├─────────────────────────────────────────────────┤
+│               wgpu + Platform                   │
+│ winit / IME / Clipboard / OS Integration        │
+└─────────────────────────────────────────────────┘
+```
+
+这时 Bitty 已经不只是：
+
+> terminal emulator with plugins
+
+而更准确是：
+
+> **一个 terminal-centered application shell / programmable workspace。**
+
+这也解释了为什么你的 Piccolo 选择会越来越有价值：Lua 不承担 renderer，也不承担 heavy computation，它负责的是**应用状态、策略、组合以及服务编排**。
+
+而 Rust Core 不需要知道：
+
+```text
+Docker 是什么
+Git 是什么
+LLM 是什么
+Mail 是什么
+```
+
+它只知道：
+
+```text
+Plugin
+Service
+Command
+Panel
+Activity
+UiTree
+Workspace
+Event
+Capability
+```
+
+这套抽象一旦稳定下来，后面无论是 Wheel、Docker dashboard、btop-like monitoring、Git client、文件管理器甚至完整 editor，实际上都只是**在 Bitty Application Platform 上运行的不同 Lua application**。
+
+这会比单独不断增加 `RichPanel`、`AIPanel`、`GitPanel` 之类的特殊类型可扩展得多。
+
+[1]: https://ghostty.org/docs/about?utm_source=chatgpt.com "About Ghostty"
+[2]: https://wezterm.org/multiplexing.html?utm_source=chatgpt.com "Multiplexing - Wez's Terminal Emulator"
+[3]: https://man.archlinux.org/man/sway.5?utm_source=chatgpt.com "sway(5) — Arch manual pages"
+[4]: https://github.com/YaLTeR/niri/wiki/Configuration%3A-Layout "Configuration: Layout · niri-wm/niri Wiki · GitHub"
+[5]: https://wiki.hypr.land/configuring/core/rules/workspace-rules/?utm_source=chatgpt.com "Workspace Rules – Hyprland Wiki"
+[6]: https://wiki.hypr.land/Configuring/Basics/Window-Rules/?utm_source=chatgpt.com "Window Rules – Hyprland Wiki"
+[7]: https://sw.kovidgoyal.net/kitty/overview/ "Overview - kitty"
+
+这样的话，是不是各个部分其实都算是组装的呢，比如 Sidebar, List, Button, Card 这些呢？就像网页设计那样呢？只是 Bitty 不需要设计那么多 HTML 的元素？更多还是做抽象，然后用户自己设计？
+
+是的，而且我觉得 **Bitty UI 最适合走“少量 Primitive + 大量组合”**，而不是自己复制一套 HTML 元素大全。
+
+## 1. 可以把它理解成“网页设计式组合”，但底层更小
+
+大概是：
+
+```text
+Rust UI Primitives
+    ↓
+Lua Core Components
+    ↓
+Application Components
+    ↓
+Panel / Sidebar / Dashboard / App
+```
+
+例如：
+
+```text
+Box
+├─ Text
+├─ Image
+├─ Scroll
+├─ Input
+├─ Canvas
+├─ Split
+└─ Overlay
+```
+
+这些才是真正需要 Rust Core 保证的东西。
+
+然后：
+
+```text
+Button
+Card
+List
+Sidebar
+Tabs
+Toolbar
+StatusBar
+TreeView
+Table
+Dialog
+CommandPalette
+```
+
+很多都可以只是 **Lua 组合组件**。
+
+---
+
+## 2. 比如 Button 本质上都不一定需要是 Core Primitive
+
+一个 Button 完全可以抽象成：
+
+```lua
+function Button(props)
+    return ui.box {
+        padding = { x = 12, y = 6 },
+        radius = 6,
+        focusable = true,
+
+        on_click = props.on_click,
+
+        ui.text {
+            text = props.label
+        }
+    }
+end
+```
+
+也就是说：
+
+```text
+Button
+=
+Box
++ Text
++ Focus
++ Pointer interaction
++ Keyboard activation
++ Style
+```
+
+真正 Core 要提供的是：
+
+```text
+hit testing
+focus
+pointer event
+keyboard semantics
+accessibility role
+layout
+paint
+```
+
+而不是一定内置一个叫 `Button` 的 Rust class。
+
+---
+
+# 3. Card 更明显就是纯组合
+
+Card 几乎完全没有必要做 Core Primitive。
+
+```text
+Card
+└─ Box
+   ├─ Background
+   ├─ Border
+   ├─ Padding
+   ├─ Header
+   └─ Content
+```
+
+Lua：
+
+```lua
+ui.card {
+    title = "Docker",
+    content = ui.column {
+        ...
+    }
+}
+```
+
+底层其实还是：
+
+```text
+Box
+Column
+Text
+```
+
+---
+
+# 4. Sidebar 也是一种 Layout Pattern，而不是底层元素
+
+例如 Workspace Sidebar：
+
+```text
+Sidebar
+├─ Header
+├─ VirtualList
+│  ├─ WorkspaceItem
+│  ├─ WorkspaceItem
+│  └─ WorkspaceItem
+└─ Footer
+   └─ AddButton
+```
+
+所以 Sidebar 更像：
+
+> **一个 reusable component**
+
+而不是像 HTML `<aside>` 那样需要 Runtime 专门认识。
+
+Runtime 根本不需要知道“这是 Sidebar”。
+
+它只知道：
+
+```text
+这是一个宽度 48px 的 Column
+里面有一组可点击、可聚焦的节点
+固定在 Window Chrome 左侧
+```
+
+---
+
+# 5. Bitty 和 HTML 最大的区别就在这里
+
+HTML 本身需要表达：
+
+```html
+article
+section
+nav
+aside
+header
+footer
+button
+input
+form
+table
+ul
+li
+dialog
+details
+summary
+...
+```
+
+这是因为 Web 不只是 UI toolkit。
+
+HTML 同时承担：
+
+```text
+document semantics
+SEO
+accessibility
+browser interoperability
+forms
+navigation
+content structure
+legacy compatibility
+```
+
+所以 HTML 元素会很多。
+
+Bitty 没必要背这些历史和 Web 语义。
+
+Bitty 可以非常小：
+
+```text
+layout primitives
+interaction primitives
+content primitives
+semantic metadata
+```
+
+就够了。
+
+---
+
+# 6. 我反而建议不要设计几十个 Widget Primitive
+
+例如不要 Rust Core 一开始就有：
+
+```text
+Button
+Checkbox
+Radio
+Card
+Sidebar
+Navbar
+Toolbar
+Accordion
+Breadcrumb
+Avatar
+Badge
+Chip
+Menu
+MenuItem
+List
+ListItem
+Tree
+...
+```
+
+这很容易变成：
+
+> 自己重新实现 GTK / Qt / HTML。
+
+而 Bitty 的理念本来应该是小 Core。
+
+更好的方式：
+
+### Core primitive
+
+```text
+Node
+Box
+Text
+Image
+Scroll
+Input
+Canvas
+TerminalSurface
+Stack
+Clip
+Portal/Overlay
+```
+
+然后布局：
+
+```text
+Row
+Column
+Grid
+Absolute
+Flex
+```
+
+甚至 `Row/Column` 都可能只是 Box 的参数：
+
+```lua
+ui.box {
+    direction = "row"
+}
+```
+
+---
+
+# 7. 但有一些“高复杂度 Widget”还是适合 Rust primitive
+
+这里不能极端成“所有东西 Lua 都自己拼”。
+
+例如：
+
+```text
+TextInput
+Editor
+VirtualList
+ScrollView
+Terminal
+Canvas
+RichText
+Table virtualization
+Tree virtualization
+```
+
+这些虽然看起来像组件，但内部涉及：
+
+```text
+IME
+selection
+cursor
+grapheme
+layout
+virtualization
+scroll physics
+huge data set
+hit testing
+incremental rendering
+```
+
+所以应该是：
+
+> **Rust mechanism + Lua appearance/composition**
+
+例如：
+
+```lua
+ui.virtual_list {
+    count = #containers,
+
+    item = function(i)
+        return DockerRow(containers[i])
+    end
+}
+```
+
+Lua 控制：
+
+```text
+每一行长什么样
+```
+
+Rust 控制：
+
+```text
+只实例化屏幕附近 30 行
+```
+
+这就是非常理想的边界。
+
+---
+
+# 8. 最适合 Bitty 的其实更像 React / SwiftUI，而不是 HTML
+
+开发体验可能更像：
+
+```lua
+function DockerSidebar(state)
+    return ui.column {
+        style = styles.sidebar,
+
+        Header {
+            title = "Docker"
+        },
+
+        ui.virtual_list {
+            items = state.containers,
+
+            render = function(container)
+                return ContainerCard {
+                    name = container.name,
+                    status = container.status,
+                }
+            end
+        }
+    }
+end
+```
+
+重点是：
+
+```text
+描述“UI 是什么”
+```
+
+而不是：
+
+```text
+命令式告诉 renderer 如何画
+```
+
+即：
+
+```text
+Declarative UI
+```
+
+非常适合 Piccolo。
+
+---
+
+# 9. 而且 Theme 也应该是组合体系
+
+例如：
+
+```lua
+local theme = {
+    spacing = {
+        xs = 4,
+        sm = 8,
+        md = 12,
+        lg = 16,
+    },
+
+    radius = {
+        sm = 4,
+        md = 8,
+        lg = 12,
+    },
+
+    colors = {
+        bg = ...,
+        surface = ...,
+        accent = ...,
+    }
+}
+```
+
+然后：
+
+```lua
+Card {
+    padding = theme.spacing.md,
+    radius = theme.radius.md,
+}
+```
+
+这样 Bitty 不需要规定：
+
+> Card 必须长这样。
+
+而只需要官方 UI Library 给一个默认 implementation。
+
+用户完全可以：
+
+```text
+换 Card
+换 Button
+换 Sidebar
+换 List Item
+```
+
+---
+
+# 10. 甚至官方 UI Framework 本身也可以非常薄
+
+我会分成三层：
+
+```text
+bitty.ui
+```
+
+最底层稳定 API。
+
+然后：
+
+```text
+bitty-ui-core
+```
+
+官方 Lua component library，例如：
+
+```text
+Button
+Card
+List
+Tabs
+Sidebar
+Dialog
+Badge
+Tooltip
+```
+
+再上面：
+
+```text
+third-party framework
+```
+
+例如以后完全可能有：
+
+```text
+bitty-material
+bitty-minimal
+bitty-retro
+bitty-tui-like
+bitty-pixel
+```
+
+甚至有人可以实现：
+
+```text
+Neovim-style UI framework
+```
+
+或者：
+
+```text
+macOS-like UI framework
+```
+
+而 Rust Core 完全不用改。
+
+这其实非常符合 Bitty：
+
+> **Core 提供能力，插件决定体验。**
+
+---
+
+# 11. `List` 也应该拆成“机制”和“外观”
+
+例如：
+
+```text
+List
+```
+
+表面上是一个组件。
+
+但是实际上分成：
+
+```text
+Virtualization mechanism
+Selection model
+Keyboard navigation
+Scroll model
+Item presentation
+```
+
+其中：
+
+Rust：
+
+```text
+virtualization
+scroll
+focus movement
+selection primitive
+```
+
+Lua：
+
+```text
+row appearance
+icon
+text
+badge
+hover state
+context actions
+```
+
+这样 Docker List、Git Branch List、Workspace List 都复用同一个机制。
+
+---
+
+# 12. UI Core 可以非常接近“语义型 Primitive”
+
+我甚至建议最后 API 的 primitive 不要以视觉元素分类，而以能力分类：
+
+```text
+Layout
+Content
+Interaction
+Surface
+Effect
+```
+
+比如：
+
+```text
+Layout:
+  box
+  stack
+  scroll
+
+Content:
+  text
+  image
+  terminal
+  canvas
+
+Interaction:
+  focus
+  pointer
+  drag
+  drop
+  input
+
+Surface:
+  panel
+  overlay
+  popover
+
+Effect:
+  clip
+  opacity
+  transform
+  blur
+```
+
+然后：
+
+```text
+Button
+=
+Layout
++ Text
++ Focus
++ Click
++ Accessibility semantics
+```
+
+这比一开始设计：
+
+```text
+50 个 Widget
+```
+
+更漂亮。
+
+---
+
+# 13. 但 Accessibility role 不能完全交给用户“随便组合”
+
+比如用户做了：
+
+```lua
+ui.box {
+    on_click = ...
+}
+```
+
+视觉上它可能已经是 Button。
+
+但 accessibility 不能不知道它是什么。
+
+所以需要：
+
+```lua
+ui.box {
+    role = "button",
+    label = "Start",
+    focusable = true,
+}
+```
+
+或者官方：
+
+```lua
+Button {}
+```
+
+自动补齐：
+
+```text
+role=button
+keyboard Enter/Space
+focus semantics
+disabled semantics
+a11y name
+```
+
+因此：
+
+> **视觉可以高度自由，交互语义最好有标准 component。**
+
+这也是为什么官方 Lua component library 仍然很重要。
+
+---
+
+# 14. 一个比较理想的层次
+
+我会这样定：
+
+```text
+Level 0 — Rust mechanisms
+
+Layout
+Text
+Image
+Scroll
+Input
+Focus
+HitTest
+Animation
+Accessibility
+GPU
+```
+
+```text
+Level 1 — Lua primitives
+
+Box
+Text
+Image
+ScrollView
+VirtualList
+TextInput
+Canvas
+Terminal
+Overlay
+```
+
+```text
+Level 2 — Standard components
+
+Button
+Card
+List
+Sidebar
+Tabs
+Toolbar
+Dialog
+Tooltip
+Menu
+Table
+Tree
+CommandPalette
+```
+
+```text
+Level 3 — Domain components
+
+WorkspaceSidebar
+GitBranchList
+DockerContainerCard
+AgentStatusCard
+FileTree
+ChatMessage
+ModelSelector
+```
+
+```text
+Level 4 — Application
+
+Docker Plugin
+Wheel UI
+Git Plugin
+btop-like Monitor
+File Manager
+Editor
+```
+
+我认为这就是 Bitty UI 最清楚的分层。
+
+---
+
+## 最核心的一句话
+
+是的，**Bitty 的 UI 应该高度组件化、组合式，和现代 Web/React UI 很像；但 Bitty 不需要复制 HTML 的元素体系。**
+
+HTML 的方向是：
+
+```text
+大量标准元素
+```
+
+Bitty 更适合：
+
+```text
+少量稳定机制
++
+少量 semantic primitives
++
+Lua 自由组合
++
+官方标准组件库
++
+第三方 UI framework
+```
+
+甚至 `Sidebar / Card / Button / List` 都不应该被看成 Bitty Core 的“功能”，而应该被看成：
+
+> **建立在 Bitty UI Runtime 上的 reusable Lua components。**
+
+这样以后 Bitty UI 才真的会像 Neovim 配置生态一样，可以被用户重新设计到几乎看不出是同一个默认界面，但底下仍然共享同一套稳定的 UI Runtime。
+
