@@ -1,0 +1,614 @@
+我看了下 piccolo，分析了后是这样的：
+对 [`/mnt/data/Applications/piccolo`](file:///mnt/data/Applications/piccolo) 的源码、[`COMPATIBILITY.md`](file:///mnt/data/Applications/piccolo/COMPATIBILITY.md) 以及模块实现进行了全面审查。
+
+### 核心结论
+**Piccolo 上游并没有提供 Bitty 所需的所有功能。**  
+Piccolo 的定位是一个**极简、纯 Rust、无栈式的嵌入式微虚拟机内核（Micro-VM Engine）**，专注于提供安全内存垃圾回收（`gc-arena`）与指令挂起机制，而**并非开箱即用的通用 Lua 运行时**。
+
+对于 Bitty 终端与插件生态而言，**Piccolo 上游恰好提供了最难实现的底层机制，但缺失了大量上层必备的标准库、模块加载与异步 I/O 设施，下游 Bitty 必须在宿主侧自行补全**。
+
+---
+
+## 1. Piccolo 上游已经具备且不可替代的优势（无需重复造轮子）
+
+1. **绝对纯净的 Rust 内存安全与独立沙箱**：
+   * 零 C 依赖，全部由 Safe Rust 驱动（隔离的 Unsafe 仅用于底层 RawTable 与类型擦除），不会引发宿主崩溃。
+2. **微秒级冷启动与极致内存密度**：
+   * 单 VM 初始化仅需 **35 µs**，独立堆仅 **11.2 KB**，并发拉起 100 个隔离实例仅需 0.99 ms / 1.2 MB，支持为每个插件分配完全独立的 VM。
+3. **无栈式执行器（Stackless Trampoline）与协程挂起**：
+   * 调用栈物化在 GC Arena 中，支持在任意指令边界无损挂起与恢复，天然契合异步事件驱动。
+4. **确定性指令配额（Deterministic Fuel）**：
+   * [`Fuel`](file:///mnt/data/Applications/piccolo/src/fuel.rs) 计数器可在外层循环精确控制每次步进的最大指令数，物理上杜绝插件死循环冻结终端 UI。
+
+---
+
+## 2. Piccolo 上游缺失、Bitty 下游必须自建的关键能力
+
+根据 [`COMPATIBILITY.md`](file:///mnt/data/Applications/piccolo/COMPATIBILITY.md) 与源码实现，以下关键功能上游均**未实现（Unimplemented）**或缺失：
+
+### ① 模块化加载系统完全缺失（`require` / `package.*` 为空）
+* **上游现状**：[`package`](file:///mnt/data/Applications/piccolo/COMPATIBILITY.md#L74-L87) 模块未实现，全局没有 `require(modname)`，没有 `package.searchers`，没有 `package.loaded`。
+* **Bitty 需求**：053/054/057.md 明确要求插件支持模块化分拆（如 `local utils = require("my_plugin.utils")`）和加载官方标准库（`require("bitty.ui")`、`require("bitty.beacon")`）。
+* **下游应对方案**：Bitty 必须在宿主初始化时注入自定义的 `require` 函数与沙箱虚拟文件系统（VFS Searcher），维护各 VM 内部的已加载模块表。
+
+### ② 文本与模式匹配工具链严重残缺（缺少 `string.format` 与 Pattern Matching）
+* **上游现状**：[`src/stdlib/string.rs`](file:///mnt/data/Applications/piccolo/src/stdlib/string.rs) 仅实现了基础的 `byte`, `char`, `len`, `lower`, `reverse`, `sub`, `upper`。
+  * **没有 `string.format`**（格式化输出完全缺失）
+  * **没有 `string.find`, `string.match`, `string.gmatch`, `string.gsub`**（Lua 正则/模式引擎完全缺失）
+  * **没有 `utf8.*` 模块**（无法在 Lua 侧处理 Unicode 字符边界与宽度）
+* **Bitty 需求**：终端插件（如 Git 分支展示、Docker 日志过滤、状态栏拼装）极度依赖字符串格式化与模式匹配。
+* **下游应对方案**：
+  * Bitty 必须在 Rust 侧实现 `string.format` 的绑定注入。
+  * 引入纯 Rust 实现的 Lua 模式匹配库（或通过 Rust `regex` 桥接）补齐 `match/find/gsub`。
+  * 将 Rust 的 `unicode-segmentation` 与 `unicode-width` 能力封装并注入为 `utf8` 库。
+
+### ③ 缺乏真正的 Tokio 异步 I/O 桥接（Async Callback 只是内部状态机）
+* **上游现状**：[`src/async_callback.rs`](file:///mnt/data/Applications/piccolo/src/async_callback.rs#L25-L33) 明确声明：其内部 Context 的 Waker 是 **NOOP**，只是用来编写内部 Sequence 状态机的语法糖。**如果在里面直接 `.await` 真实的外部 Tokio Future，会导致 panic**。
+* **Bitty 需求**：插件需要发起网络请求（HTTP）、等待 PTY 输出流、与 LLM 通信或等待定时器唤醒。
+* **下游应对方案**：
+  * Bitty 必须基于 Piccolo 的 **Trampoline 机制** 自建真正的异步调度桥：
+    1. Lua 调用 `bitty.http.get(url)` 时，Rust 回调挂起（Yield）该 Lua 协程，返回挂起句柄给宿主。
+    2. 控制权返回到外层的 Tokio 任务，Tokio 异步执行实际 I/O。
+    3. I/O 就绪后，Bitty 主调度器调用 `thread.resume(&ctx, result)` 唤醒 Lua 协程并继续执行。
+
+### ③ 缺少细粒度错误回溯与调试信息（Error Traceback）
+* **上游现状**：[`debug.traceback`](file:///mnt/data/Applications/piccolo/COMPATIBILITY.md#L230) 未实现，`error(message, level)` 忽略堆栈层级，执行失败时仅抛出原始错误值，缺少直观的文件名与行号调用栈。
+* **Bitty 需求**：第三方插件编写出错时，必须清晰报错（如 `plugin/docker.lua:42: attempt to index a nil value`）。
+* **下游应对方案**：Bitty 需要在 Rust 侧结合编译期保留的 Source Map，在 `try_enter` 捕获异常时自行组装格式化的 Stack Trace。
+
+### ④ 内存硬配额限制（Memory Hard Limits / OOM Defense）
+* **上游现状**：Piccolo 提供了 `Metrics::total_memory()` 供宿主读取内存，但底层 `gc-arena` 在分配对象时**没有硬性阈值拦截机制**；如果一段 Lua 代码在一次操作内突发分配数百兆内存，GC 来不及介入就会导致宿主进程内存膨胀。
+* **Bitty 需求**：050/057.md 要求严格限制单插件的内存配额（如每个插件默认上限 10MB）。
+* **下游应对方案**：Bitty 可以在 `Executor::step` 的每轮步进循环中监控 `total_memory()`，超标时强制取消 Executor；或者通过 `allocator-api2` 为单个 VM 注入带配额限制的 Custom Allocator。
+
+### ⑤ 受限的文件系统访问（Sandboxed VFS）
+* **上游现状**：为了安全，Piccolo 的 `io.*` 和 `os.*` 绝大部分为未实现或拒绝实现（不开放直接操作系统的接口）。
+* **Bitty 需求**：插件需要读取本地资源文件或持久化配置。
+* **下游应对方案**：Bitty 必须按照 Capability 权限模型，单独为 Lua 暴露受限的 `bitty.fs` 命名空间，仅限读写插件私有数据目录。
+
+---
+
+## 3. 架构分工总结
+
+| 维度 | Piccolo 上游职责 | Bitty 下游必须自建的 Host Layer 职责 |
+| :--- | :--- | :--- |
+| **执行核心** | 字节码编译、OpCode 执行、GC Arena 管理、Fuel 消耗 | 驱动步进循环、监控超时与内存峰值、崩溃兜底 |
+| **模块管理** | 仅支持单段代码解析为 Closure | 自定义 `require`、VFS Searcher、模块缓存表、Lux 依赖映射 |
+| **标准库支持** | 基础数学（`math`）、基础 Table、基础 String 操作 | `string.format`、模式匹配（`match/gsub`）、`utf8` 库、JSON 编解码 |
+| **I/O 与并发** | 无原生 I/O，仅提供单线程 Trampoline 挂起机制 | Tokio 异步事件桥接、PTY 流交互、定时器与网络请求 |
+| **调试与诊断** | 仅保留基本 OpCode 级 Line 信息 | 结构化 Stack Trace 格式化、错误高亮输出、插件崩溃日志 |
+| **权限与安全** | 默认纯沙箱（无任何系统特权） | 权限能力模型（Capability Gate）、细粒度资源配额拦截 |
+
+**一句话总结**：  
+Piccolo 完美解决了 Bitty 插件系统最关键的**轻量化微沙箱与 Fuel 挂起**底座，但**所有的应用层胶水能力（模块加载、文本格式化/正则、异步 I/O、调用栈调试、沙箱文件系统）都属于上游缺失、下游必须构建的 Host ABI 层**。这正是后续我们在开发 Bitty Core 时需要重点实现的配套基础设施。
+
+
+然后你可以结合 Piccolo 的 issues，我觉得可以 fork 下 Piccolo，然后自己造一个更好的、更完整的轮子吧？名字还是跟仓鼠相关的？
+
+可以，而且结合 Piccolo 现在的状态，我觉得这已经不只是“为了 Bitty 打几个 patch”，而是**很适合发展成一个独立 successor runtime** 的场景。
+
+## Piccolo 现在更像是“治理吞吐不足”，不是彻底死亡
+
+Piccolo 本身的底层设计其实很有价值：pure Rust、stackless VM、Fuel、GC memory tracking、sandbox-oriented API，这些正是最难重新实现的部分。上游 README 也明确把 DoS resistance、CPU/RAM 限制、安全 Rust binding 当作核心目标，同时承认大量 stdlib、stack trace、debugger 等还没有完成。([GitHub][1])
+
+但更有意思的是，现在 GitHub 上不是没人补这些东西，而是已经有 **29 个 open PR**，其中直接包含：
+
+| PR   | 内容                                  |
+| ---- | ----------------------------------- |
+| #128 | `string.format`                     |
+| #129 | `string.match/gmatch/gsub/find`     |
+| #110 | 完整 `utf8` stdlib                    |
+| #112 | 大量 `io.* / file:*`                  |
+| #121 | Error backtrace + `debug.traceback` |
+| #130 | Lua 风格错误                            |
+| #132 | Debugger                            |
+| #135 | 更详细 compiler error                  |
+| #134 | string method calls                 |
+
+很多正好就是你刚才列出来的缺口，而且部分 PR 从 2024/2025 年就已经挂在那里。([GitHub][2])
+
+与此同时，2026 年仍然有人提交 Issue 和 PR，包括 table panic、32-bit 编译、metatable compatibility 等，所以不能说 Piccolo “死了”；更准确的是：
+
+> **社区仍然活着，但 upstream merge/release/governance 的速度已经明显赶不上 downstream 使用者的需求。**
+
+当前 Issue 页面也仍有 2026 年新问题。([GitHub][3])
+
+这其实恰恰是一个 successor fork 很合理的时机。
+
+---
+
+# 我倾向于 Fork，而不是在 Bitty 内部偷偷维护魔改版
+
+否则很容易最后变成：
+
+```text
+Bitty
+└── vendor/piccolo
+    ├── patch-001-string-format
+    ├── patch-002-pattern
+    ├── patch-003-traceback
+    ├── patch-004-require
+    ├── patch-005-memory-limit
+    ├── patch-006-async
+    ├── ...
+    └── 3 年后没人知道这还是不是 Piccolo
+```
+
+这其实是最糟糕的状态。
+
+既然你已经确定 Bitty 会长期依赖 Lua，而且以后：
+
+```text
+Bitty Core
+   ↓
+Lua Core
+   ↓
+UI framework
+   ↓
+Wheel
+   ↓
+第三方插件
+```
+
+整个生态都会压在这个 runtime 上，那么这个 runtime 本身已经属于 **基础设施**。
+
+更合理的是：
+
+```text
+Piccolo
+   │
+   │ fork
+   ▼
+新的独立 Runtime
+   │
+   ├── Bitty 使用
+   ├── 其他程序也可以使用
+   └── 保持部分 Piccolo compatibility
+```
+
+而不是：
+
+```text
+Piccolo
+   ↓
+Bitty-specific monster patch
+```
+
+---
+
+## 但有一点我会修改你刚才的架构判断
+
+不是所有缺失功能都应该放进一个 crate。
+
+最好把 **Lua Runtime** 和 **Bitty Host ABI** 切开。
+
+例如：
+
+```text
+phodopus
+│
+├── phodopus-core
+│   ├── VM
+│   ├── bytecode
+│   ├── GC
+│   ├── coroutine
+│   ├── Fuel
+│   └── executor
+│
+├── phodopus-stdlib
+│   ├── string
+│   ├── table
+│   ├── utf8
+│   ├── math
+│   └── package
+│
+├── phodopus-module
+│   ├── require
+│   ├── package.loaded
+│   ├── searchers
+│   └── module resolver
+│
+├── phodopus-debug
+│   ├── traceback
+│   ├── source location
+│   └── debugger API
+│
+├── phodopus-sandbox
+│   ├── memory quota
+│   ├── Fuel policy
+│   ├── cancellation
+│   └── resource accounting
+│
+└── phodopus-async
+    ├── suspended operation
+    ├── Future bridge
+    └── runtime-independent async API
+```
+
+然后 Bitty 才是：
+
+```text
+bitty-lua
+│
+├── bitty.fs
+├── bitty.ui
+├── bitty.panel
+├── bitty.workspace
+├── bitty.ipc
+├── bitty.process
+├── bitty.http
+└── bitty.plugin
+```
+
+这个边界非常重要。
+
+---
+
+# 特别是 `Tokio` 不应该直接塞进 VM Core
+
+我甚至不建议：
+
+```text
+VM
+└── depends on Tokio
+```
+
+更好的模型是：
+
+```text
+Lua VM
+   │
+   │ Suspend
+   ▼
+Host Async ABI
+   │
+   ├── Tokio adapter
+   ├── async-std adapter
+   └── custom executor
+```
+
+例如：
+
+```rust
+HostOp::Pending(handle)
+```
+
+VM 只知道：
+
+```text
+当前 coroutine suspended
+operation_id = 42
+```
+
+至于：
+
+```text
+42 -> Tokio HTTP Future
+```
+
+是宿主 runtime 的事情。
+
+这样这个 fork 才可能成为真正独立于 Bitty 的通用库，而不是：
+
+> Piccolo + Tokio + Bitty。
+
+---
+
+# `require` 也应该成为通用 Runtime 能力
+
+但：
+
+```lua
+require("foo")
+```
+
+不应该等价于：
+
+```text
+随便读取整个 OS filesystem
+```
+
+我比较倾向：
+
+```text
+require()
+   ↓
+Module Resolver
+   ↓
+Searcher chain
+```
+
+比如：
+
+```text
+preloaded modules
+       ↓
+embedded modules
+       ↓
+VFS
+       ↓
+host-provided resolver
+```
+
+Bitty 再注册：
+
+```text
+PluginVfsSearcher
+LuxPackageSearcher
+BuiltinBittySearcher
+```
+
+于是 generic runtime 有标准 Lua：
+
+```lua
+local foo = require("foo")
+```
+
+而 Bitty 决定：
+
+> `foo` 到底可以从哪里来。
+
+这和 capability model 完全兼容。
+
+---
+
+## 还有两个细节我建议不要照你原方案直接做
+
+第一个是 Lua Pattern：
+
+```text
+Lua Pattern != regex
+```
+
+所以最好不要简单：
+
+```text
+string.match → Rust regex crate
+```
+
+因为 Lua pattern 的语义并不等于 regular expression。
+
+既然现在 upstream 已经有专门实现 `string.match/find/gsub/gmatch` 的 PR #129，更合理的是直接 Review 那个实现，把它演化成兼容 Lua semantics 的实现。([GitHub][2])
+
+第二个是：
+
+```text
+Lua utf8 library != terminal Unicode library
+```
+
+Lua `utf8.*` 主要处理 UTF-8 code point。
+
+而 Bitty 真正还需要：
+
+```text
+grapheme cluster
+East Asian Width
+terminal cell width
+emoji width
+combining marks
+```
+
+所以应该分成：
+
+```lua
+utf8.len(...)
+utf8.codepoint(...)
+```
+
+和：
+
+```lua
+bitty.text.width(...)
+bitty.text.graphemes(...)
+```
+
+后者才使用：
+
+```text
+unicode-width
+unicode-segmentation
+```
+
+不要污染标准 Lua API。
+
+---
+
+# Memory quota 也值得直接上升成 fork 的核心卖点
+
+Piccolo 已经有 memory tracking，而且 README 本身就明确把“bounded memory”列为目标；但它目前更多是**提供机制供 Host 管理**，还不是你想要的真正：
+
+```rust
+VmConfig {
+    memory_limit: 16 * 1024 * 1024,
+}
+```
+
+这种完整 runtime contract。([GitHub][1])
+
+你的 fork 完全可以把目标提升为：
+
+```text
+CPU quota
+Memory quota
+Wall-clock timeout
+Capability isolation
+Async cancellation
+VM isolation
+```
+
+最终得到类似：
+
+```rust
+Runtime::builder()
+    .memory_limit(16 * MIB)
+    .fuel_limit(100_000)
+    .module_loader(loader)
+    .build()
+```
+
+这个就已经明显超过“补标准库”了。
+
+它会变成：
+
+> **A sandbox-first embedded Lua runtime written in Rust.**
+
+这个定位其实非常清晰。
+
+---
+
+# 名字我支持继续用“仓鼠体系”，但不要直接叫 Bitty 什么
+
+如果这个项目只服务 Bitty：
+
+```text
+bitty-lua
+bittie-vm
+```
+
+都可以。
+
+但既然已经准备把它做成一个**独立、通用、可能被别人使用的 Rust Lua runtime**，我反而建议像 `winit`、`wgpu` 那样拥有自己的 identity。
+
+我目前比较喜欢的是 **Phodopus**。
+
+`Phodopus` 是仓鼠属名之一，包括 dwarf hamster / Roborovski hamster；它确实属于 Cricetinae（hamsters）。([国家生物技术信息中心][4])
+
+而且名字感觉很像 Rust 基础设施：
+
+```text
+Tokio
+Serde
+Winit
+Wgpu
+Piccolo
+Phodopus
+```
+
+可以自然形成：
+
+```toml
+[dependencies]
+phodopus = "0.1"
+```
+
+或者 workspace：
+
+```text
+phodopus
+phodopus-core
+phodopus-stdlib
+phodopus-async
+phodopus-sandbox
+```
+
+我快速查了一下，没有发现明显已经存在的同名 Rust/software runtime 项目；相比之下，几个更直白的名字反而有明显冲突：
+
+| 名称             | 问题                                           |
+| -------------- | -------------------------------------------- |
+| `Squeak`       | 已经是非常著名的 Smalltalk VM 名称                     |
+| `Nibble`       | crates.io 已有 `nibble` crate ([文档.rs][5])     |
+| `Pouch`        | Rust 生态已有 Pouch 相关项目 ([文档.rs][6])            |
+| `Burrow`       | 已有活跃的 `burrow-*` Rust ecosystem ([文档.rs][7]) |
+| **`Phodopus`** | 相对独特，而且直接对应仓鼠                                |
+
+所以如果现在让我给这个 Piccolo successor 起名字，**我第一选择其实会是 `Phodopus`**。
+
+---
+
+## 而且它可以很好地接入你现在这套命名体系
+
+甚至会形成一种挺有意思的关系：
+
+```text
+Bitty
+│
+├── Bittie      mascot / hamster
+│
+├── Wheel       Agent Harness / hamster wheel
+│
+└── Phodopus    Lua Runtime / hamster genus
+```
+
+但 `Phodopus` 又不需要绑定 Bitty：
+
+```text
+Other Application
+       │
+       └── Phodopus
+```
+
+这点很重要。
+
+---
+
+# Fork 的策略也不要一开始就“大改”
+
+我比较建议：
+
+```text
+Phase 0
+Piccolo fork
+│
+├── 保持 Git history
+├── 保留 MIT/CC0 attribution
+└── 建立 upstream remote
+
+Phase 1
+吸收 upstream 已有优秀 PR
+│
+├── string.format
+├── pattern matching
+├── utf8
+├── traceback
+├── debugger
+└── correctness fixes
+
+Phase 2
+补 Lua runtime
+│
+├── package / require
+├── module resolver
+├── complete stdlib
+└── better diagnostics
+
+Phase 3
+Sandbox Runtime
+│
+├── memory quota
+├── Fuel policy
+├── cancellation
+└── capability system
+
+Phase 4
+Async Runtime
+│
+├── generic async bridge
+└── optional Tokio adapter
+
+Phase 5
+Bitty integration
+│
+└── bitty-lua Host ABI
+```
+
+这样它还是：
+
+> Piccolo 的技术血统。
+
+但是到了 Phase 3/4，它事实上就已经成为：
+
+> **Piccolo-derived successor runtime**
+
+而不是普通 fork 了。
+
+Piccolo 本身是 MIT/CC0 双许可，因此这种 fork 和继续发行在许可证层面也相当友好，不过仍应保留历史、版权/许可证信息，并明确说明项目源自 Piccolo。([GitHub][1])
+
+我觉得这个方向比“Bitty 自己补一个巨大的 Host Layer”更有长期价值：**Bitty 需要的东西，实际上暴露出了 Piccolo 和一个真正 production-ready embedded Lua runtime 之间缺失的那一整层。** 把这一层做成独立项目，本身就是一个很合理的轮子。
+
+[1]: https://github.com/kyren/piccolo?utm_source=chatgpt.com "GitHub - kyren/piccolo: An experimental stackless Lua VM implemented in pure Rust · GitHub"
+[2]: https://github.com/kyren/piccolo/pulls "Pull requests · kyren/piccolo · GitHub"
+[3]: https://github.com/kyren/piccolo/issues "Issues · kyren/piccolo · GitHub"
+[4]: https://www.ncbi.nlm.nih.gov/mesh/68006224?utm_source=chatgpt.com "Cricetinae - MeSH - NCBI"
+[5]: https://docs.rs/crate/nibble/latest?utm_source=chatgpt.com "nibble 0.1.0 - Docs.rs"
+[6]: https://docs.rs/crate/pouch-run/latest?utm_source=chatgpt.com "pouch-run 0.1.0 - Docs.rs"
+[7]: https://docs.rs/crate/burrow-core/latest?utm_source=chatgpt.com "burrow-core 0.1.1 - Docs.rs"
