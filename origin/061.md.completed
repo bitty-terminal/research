@@ -1,0 +1,1840 @@
+## 我会把它设计成「Bitty Remote Client」，而不是另一个终端
+
+对于 Bitty 来说，这个 App 的定位其实非常自然：
+
+```text
+Desktop / Server
+┌─────────────────────────────────────────┐
+│                 Bitty                   │
+│                                         │
+│ Workspace                               │
+│ ├─ Panel A  shell                       │
+│ ├─ Panel B  Wheel Agent                 │
+│ ├─ Panel C  btop-like plugin            │
+│ └─ Panel D  custom UI                   │
+│                                         │
+│          Bitty Remote Service           │
+└────────────────┬────────────────────────┘
+                 │
+                 │ secure protocol
+                 │
+        Wi-Fi / Internet / VPN
+                 │
+                 ▼
+┌─────────────────────────────────────────┐
+│            Bitty Remote App             │
+│                                         │
+│ Workspace                               │
+│ ┌─────────┐ ┌─────────┐                │
+│ │ Panel A │ │ Panel B │                │
+│ └─────────┘ └─────────┘                │
+│                                         │
+│     open / view / input / switch        │
+└─────────────────────────────────────────┘
+ Android / iPhone / iPad
+```
+
+关键在于：
+
+> **PTY、Shell、Agent、Plugin 都仍然运行在远端 Bitty。手机只负责呈现 Panel 状态、发送输入和控制指令。**
+
+这样 App 会比“手机终端模拟器”简单很多，也更符合 Bitty 的 Panel-first 架构。
+
+---
+
+# 技术栈：我最推荐 `React Native + Expo + Rust Core`
+
+我会优先选：
+
+```text
+Bitty Remote App
+│
+├── React Native
+│   ├── TypeScript
+│   ├── Expo
+│   ├── Expo Router
+│   └── normal mobile UI
+│
+├── Panel Renderer
+│   ├── 第一阶段：React Native Skia
+│   └── 后期：Rust / wgpu native renderer
+│
+└── bitty-remote-core
+    └── Rust
+        ├── protocol
+        ├── connection
+        ├── state sync
+        ├── crypto
+        └── panel model
+```
+
+也就是说，不建议做成：
+
+```text
+100% React Native
+```
+
+而更适合：
+
+```text
+React Native = App Shell
+Rust         = Bitty shared infrastructure
+GPU Renderer = Panel View
+```
+
+这实际上和 Bitty 自己的设计哲学非常一致。
+
+Expo 现在允许通过 Expo Modules API 编写 Swift/Kotlin native module，而且完全支持 React Native New Architecture，所以之后需要接 Rust native library 或高性能 Native View 时，并不会被 Expo 限死。([Expo documentation][1])
+
+---
+
+# 为什么不是 Flutter
+
+Flutter 当然可以做，而且 Canvas / 自定义绘制能力很强。
+
+但 Bitty 已经是：
+
+```text
+Rust
+wgpu
+自定义 Renderer
+Panel
+IPC
+Plugin Runtime
+```
+
+如果再引入：
+
+```text
+Dart
+Flutter Rendering
+Flutter Plugin
+Rust FFI
+```
+
+会形成完全不同的第二套技术体系。
+
+而你现在本来已经大量使用：
+
+```text
+Rust
+TypeScript
+Bun
+Web ecosystem
+```
+
+那么：
+
+```text
+Bitty                   Rust
+Bitty Remote Core       Rust
+Bitty Remote UI         TypeScript
+```
+
+整个项目的语言组合要自然很多。
+
+所以这里不是 Flutter 不好，而是 **Bitty 没有什么理由为了 Remote App 再引入 Dart 生态**。
+
+---
+
+# 为什么我也不会优先用 Tauri Mobile
+
+Tauri 2 很符合：
+
+```text
+Rust Core
+    +
+Web UI
+```
+
+这个模型。
+
+但 Bitty Remote 有一个很特殊的部分：
+
+> **Panel 本身是高度交互、低延迟、可能高刷新率的显示区域。**
+
+普通设置页：
+
+```text
+Connections
+Settings
+Agents
+Workspaces
+Device Pairing
+```
+
+用 WebView 完全没问题。
+
+但：
+
+```text
+Terminal grid
+光标
+文本选择
+触摸滚动
+IME
+软键盘
+鼠标模拟
+高频 Panel diff
+图片
+复杂 Plugin UI
+```
+
+我更愿意直接走 React Native / Native View / GPU Canvas。
+
+所以：
+
+```text
+Tauri Mobile
+
+适合 Bitty 配套管理工具
+          ↓
+但不是我对 Panel Remote Client 的第一选择
+```
+
+---
+
+# 真正最重要的是 `Panel Remote Protocol`
+
+其实这个 App 最难的部分根本不是 React Native。
+
+是你必须先回答：
+
+> **“一个 Panel 怎么通过网络传给另一个设备？”**
+
+这甚至值得从 Bitty Core 里面独立成：
+
+```text
+crates/
+├── bitty-panel
+├── bitty-render
+├── bitty-protocol
+├── bitty-ipc
+└── bitty-remote
+```
+
+然后定义一个正式的：
+
+```text
+Bitty Remote Protocol
+BRP
+```
+
+名称当然只是举例。
+
+它不能只是：
+
+```text
+remote.send(stdout bytes)
+```
+
+因为 Bitty 的 Panel 已经远远不只是传统 shell。
+
+---
+
+# 我建议 Panel Remote Protocol 分成四层
+
+例如：
+
+```text
+┌──────────────────────────────┐
+│       Control Protocol       │
+│ open / close / focus / move  │
+├──────────────────────────────┤
+│        Input Protocol        │
+│ key / text / mouse / touch   │
+├──────────────────────────────┤
+│        Panel State           │
+│ grid / UI tree / cursor ...  │
+├──────────────────────────────┤
+│          Transport           │
+│ WebSocket / QUIC / etc.      │
+└──────────────────────────────┘
+```
+
+### Control
+
+比如：
+
+```text
+workspace.list
+
+panel.list
+panel.attach
+panel.detach
+panel.focus
+panel.resize
+
+agent.list
+agent.status
+
+panel.subscribe
+panel.unsubscribe
+```
+
+这部分其实跟你之前设计的 Bitty IPC 可以共享大量概念。
+
+---
+
+# 不要发送屏幕截图
+
+最简单的 Remote Desktop 做法是：
+
+```text
+Bitty
+  ↓
+render framebuffer
+  ↓
+H.264/AV1
+  ↓
+Phone
+```
+
+但我不建议把它作为 Bitty Remote 的主要协议。
+
+因为 Bitty 自己知道：
+
+```text
+这个是文本
+这个是 cell
+这个是 cursor
+这个是 image
+这个是 Button
+这个是 Sidebar
+这个是 Panel
+```
+
+那完全没必要把所有语义先：
+
+```text
+结构化数据
+   ↓
+像素
+   ↓
+压缩视频
+   ↓
+网络
+   ↓
+解压
+```
+
+再传过去。
+
+更好的做法是：
+
+```text
+Bitty
+  │
+  ├─ terminal cell diff
+  ├─ cursor diff
+  ├─ panel metadata
+  ├─ UI tree diff
+  └─ asset
+       ↓
+    Remote App
+       ↓
+   本地 Render
+```
+
+这会是 Bitty Remote 最大的架构优势。
+
+---
+
+# Terminal Panel 可以做 State/Diff 同步
+
+第一次连接：
+
+```text
+PanelSnapshot
+{
+    panel_id
+    rows
+    cols
+    cells[]
+    cursor
+    scrollback_position
+    title
+    cwd
+}
+```
+
+之后不要重复传整个屏幕，而是：
+
+```text
+PanelDiff
+{
+    sequence: 1042,
+
+    operations: [
+        UpdateCells(...),
+        MoveCursor(...),
+        Scroll(...),
+        SetTitle(...)
+    ]
+}
+```
+
+假设一个：
+
+```text
+160 × 50
+```
+
+的终端：
+
+```text
+8000 cells
+```
+
+但一次 `cargo build` 可能只有底下几行变化。
+
+于是：
+
+```text
+Full Frame
+
+████████████████████████
+████████████████████████
+████████████████████████
+████████████████████████
+
+             ↓
+
+Diff
+
+                    ████
+                    ████
+```
+
+网络流量差距会非常大。
+
+而且这种设计天生允许：
+
+```text
+disconnect
+   ↓
+reconnect
+   ↓
+last sequence = 1042
+   ↓
+补 1043...1068
+
+或者
+
+重新发送 Snapshot
+```
+
+这会比远程桌面协议更符合 Bitty。
+
+---
+
+# 那 Plugin Panel 怎么办？
+
+这个反而和你前面正在设计的 **Bitty UI Framework** 联系非常大。
+
+假设 Bitty Plugin 最后不是自己任意画像素，而是：
+
+```lua
+ui.sidebar {
+    ui.list {
+        ui.card {...},
+        ui.card {...}
+    }
+}
+```
+
+那么远程协议完全可以传：
+
+```text
+UI Tree
+
+Panel
+└── Sidebar
+    └── List
+        ├── Card
+        ├── Card
+        └── Card
+```
+
+Remote App 自己重建 UI。
+
+于是：
+
+```text
+Desktop Bitty
+
+Sidebar
+├── Card
+├── Button
+└── List
+```
+
+和：
+
+```text
+iPad Bitty Remote
+
+Sidebar
+├── Card
+├── Button
+└── List
+```
+
+是**同一个语义 UI**，但布局甚至可以针对 Mobile 自适应。
+
+这其实会反过来给 Bitty UI Framework 提出一个非常好的约束：
+
+> Bitty UI 不仅应该 Renderable，还应该 **Serializable / Remoteable**。
+
+这个设计价值很高。
+
+---
+
+# 最终甚至可以支持 3 种 Remote Rendering Mode
+
+我比较建议以后形成这样的结构：
+
+| Panel 类型          | Remote 传输            | 手机端          |
+| ----------------- | -------------------- | ------------ |
+| Terminal          | Cell/Grid Diff       | 本地渲染         |
+| Bitty UI          | UI Tree Diff         | 本地渲染         |
+| Image/Rich Media  | Asset + Metadata     | 本地渲染         |
+| 无法结构化的特殊 Renderer | Frame/Video fallback | Pixel Stream |
+
+也就是说：
+
+```text
+Semantic First
+      ↓
+Structured Diff
+      ↓
+Pixel Streaming as Fallback
+```
+
+而不是：
+
+```text
+Everything = Remote Desktop
+```
+
+---
+
+# 手机端的 Panel Renderer
+
+第一阶段我甚至不会急着复用 Bitty 的 wgpu Renderer。
+
+可以直接：
+
+```text
+React Native
++
+React Native Skia
+```
+
+React Native Skia 本身提供 GPU Canvas，而且它的 `Picture` API 有 immediate-mode drawing model，比较适合这种不断变化的 drawing commands。([Shopify][2])
+
+所以 MVP：
+
+```text
+                React Native
+                     │
+        ┌────────────┴────────────┐
+        │                         │
+   Regular UI                 PanelView
+        │                         │
+React Native Components        Skia
+                                  │
+                           terminal cells
+                           cursor
+                           selection
+                           image
+```
+
+甚至官方目前直接提供 Expo + Skia 项目模板。([Shopify][3])
+
+这就非常适合先做一个实验。
+
+---
+
+# 后面可以进一步复用 Bitty Renderer
+
+等协议验证成功以后，我反而会认真考虑：
+
+```text
+bitty-render
+      │
+      ├── Desktop Bitty
+      │      ↓
+      │    wgpu
+      │
+      └── Mobile
+             ↓
+           wgpu
+```
+
+最终：
+
+```text
+                    bitty-render-core
+                          Rust
+                            │
+              ┌─────────────┴─────────────┐
+              │                           │
+         Bitty Desktop               Bitty Remote
+              │                           │
+           Surface                      Surface
+              │                           │
+     Vulkan/Metal/DX12              Vulkan/Metal
+```
+
+这时候手机 App 里的：
+
+```text
+<PanelView panelId="xxx" />
+```
+
+表面上只是一个 React Native Component。
+
+实际上下面：
+
+```text
+React Native
+    ↓
+Native View
+    ↓
+Rust FFI
+    ↓
+bitty-render
+    ↓
+wgpu
+    ↓
+Metal / Vulkan
+```
+
+这应该会是最终形态。
+
+Expo Modules API 允许创建自定义 Native View，因此 App Shell 用 React Native，并不代表 Panel 本身必须由 React Native 渲染。([Expo documentation][1])
+
+这点非常重要。
+
+---
+
+# Rust Core 也可以共享
+
+Remote App 可以拥有：
+
+```text
+bitty-remote-core/
+├── protocol/
+├── codec/
+├── crypto/
+├── sync/
+├── panel_state/
+├── reconnect/
+└── transport/
+```
+
+然后：
+
+```text
+Desktop Bitty
+     │
+     └── bitty-remote-core
+              ↑
+              ↓
+Mobile native module
+```
+
+这样 TypeScript 根本不需要理解复杂的 protocol internals。
+
+TS 层看到的可能只是：
+
+```ts
+const panel = await bitty.attachPanel(panelId)
+
+panel.onUpdate(update => {
+    ...
+})
+
+panel.sendInput("cargo test\n")
+```
+
+底下实际上：
+
+```text
+TS
+ ↓
+Expo Native Module
+ ↓
+Swift / Kotlin thin bridge
+ ↓
+Rust
+ ↓
+Bitty Remote Protocol
+```
+
+这样 architecture boundary 会很干净。
+
+---
+
+# 网络层第一版不要上来就搞 QUIC
+
+我建议 MVP 先：
+
+```text
+WebSocket
++
+TLS
+```
+
+原因非常实际：
+
+```text
+Android        ✓
+iOS            ✓
+React Native   ✓
+Rust           ✓
+LAN            ✓
+Internet       ✓
+Debug          容易
+Proxy          容易
+```
+
+等协议稳定之后，如果实际测试发现：
+
+```text
+latency
+multiplexing
+packet loss
+connection migration
+```
+
+确实值得优化，再评估：
+
+```text
+QUIC
+```
+
+而不要先因为 QUIC 更现代就使用 QUIC。
+
+协议层应该设计成：
+
+```rust
+trait Transport {
+    async fn send(&self, message: Message);
+    async fn recv(&self) -> Message;
+}
+```
+
+那么：
+
+```text
+WebSocketTransport
+
+以后：
+QUICTransport
+LocalTransport
+RelayTransport
+```
+
+可以自由换。
+
+---
+
+# 配对方式可以很漂亮
+
+我觉得 Bitty 很适合：
+
+```text
+$ bitty remote pair
+
+┌─────────────────────┐
+│                     │
+│       QR CODE       │
+│                     │
+└─────────────────────┘
+
+Device: xuepoo-desktop
+Expires: 02:00
+```
+
+手机：
+
+```text
+Bitty Remote
+   ↓
+Scan QR
+   ↓
+Verify device key
+   ↓
+Pair
+```
+
+以后：
+
+```text
+Devices
+
+● Desktop
+  CachyOS
+  Online
+
+● Laptop
+  Arch Linux
+  Offline
+
+● Server
+  Ubuntu
+  Online
+```
+
+然后：
+
+```text
+Desktop
+  ↓
+Workspace 1
+  ├── shell
+  ├── nvim
+  └── Wheel Agent
+
+Workspace 2
+  ├── server
+  └── logs
+```
+
+这种 UX 会非常自然。
+
+---
+
+# iPad 会尤其适合 Bitty
+
+实际上我觉得这个项目 **iPad 版本甚至可能比手机版本更有价值**。
+
+手机可以：
+
+```text
+┌──────────────────┐
+│ Desktop          │
+├──────────────────┤
+│                  │
+│                  │
+│     Panel        │
+│                  │
+│                  │
+├──────────────────┤
+│   custom keys    │
+└──────────────────┘
+```
+
+iPad 可以直接：
+
+```text
+┌──────────┬────────────────────────────────┐
+│ Desktop  │                                │
+│          │                                │
+│ WS 1     │                                │
+│ ├ shell  │             Panel              │
+│ ├ Wheel  │                                │
+│ └ logs   │                                │
+│          │                                │
+│ WS 2     │                                │
+├──────────┴────────────────────────────────┤
+│ Ctrl Alt Esc Tab ↑ ↓ ← →   Command Bar    │
+└───────────────────────────────────────────┘
+```
+
+再支持：
+
+```text
+hardware keyboard
+trackpad
+mouse
+Apple Pencil（以后甚至可以）
+```
+
+基本就成一个非常强的 Bitty Thin Client。
+
+---
+
+# Wheel 会因此变得特别有意思
+
+例如你人在外面：
+
+```text
+Phone
+ ↓
+Bitty Remote
+ ↓
+Desktop Bitty
+ ↓
+Wheel Dashboard
+```
+
+看到：
+
+```text
+Agent A
+Implementing parser
+████████░░ 80%
+
+Agent B
+Running tests
+
+Agent C
+Waiting
+```
+
+然后点进去：
+
+```text
+Agent A Panel
+
+> cargo test
+...
+```
+
+甚至直接：
+
+```text
+Ask Agent
+"先暂停这个任务，去 review parser.rs"
+```
+
+实际上手机并没有运行 LLM：
+
+```text
+Phone
+   │
+   │ command
+   ▼
+Bitty Desktop
+   │
+   ▼
+Wheel
+   │
+   ▼
+Agent / Headless Panel
+```
+
+这样 Mobile App 几乎就是 Bitty 整个 Workspace/Panel/Agent architecture 的 **remote frontend**。
+
+---
+
+# 所以我会把最终技术架构定成这样
+
+```text
+┌──────────────────────────────────────────────┐
+│              Bitty Remote App                │
+│                                              │
+│ React Native + Expo                          │
+│                                              │
+│ ┌─────────────┐ ┌────────────┐               │
+│ │ Navigation  │ │ Settings   │               │
+│ ├─────────────┤ ├────────────┤               │
+│ │ Devices     │ │ Workspace  │               │
+│ └─────────────┘ └────────────┘               │
+│                                              │
+│              <PanelView />                   │
+│                    │                         │
+│           React Native Skia                  │
+│                    │                         │
+│          later: Rust + wgpu                  │
+│                                              │
+├──────────────────────────────────────────────┤
+│        bitty-remote-core — Rust              │
+│                                              │
+│ protocol │ state │ codec │ crypto │ sync     │
+├──────────────────────────────────────────────┤
+│           WebSocket / later QUIC             │
+└───────────────────────┬──────────────────────┘
+                        │
+                        │
+                        ▼
+┌──────────────────────────────────────────────┐
+│                    Bitty                     │
+│                                              │
+│               Remote Gateway                 │
+│                      │                       │
+│                 Bitty Core                   │
+│          ┌───────────┼───────────┐           │
+│          ▼           ▼           ▼           │
+│       Panel       Workspace      Wheel       │
+│                                              │
+│ Terminal Grid / UI Tree / Asset / Metadata   │
+└──────────────────────────────────────────────┘
+```
+
+### 最值得先做的实验
+
+如果你准备继续采用前面说的 `experiments/` 思路，这个我甚至建议**不要先创建正式 App 仓库**，而是先做一个：
+
+```text
+experiments/
+└── panel-remote/
+```
+
+第一版只验证一件事情：
+
+```text
+Bitty Desktop
+     ↓
+Panel Snapshot
+     ↓ WebSocket
+Panel Diff
+     ↓
+Expo App
+     ↓
+Skia Render
+     ↓
+手机输入
+     ↓
+Bitty Panel
+```
+
+只支持：
+
+```text
+一个 Terminal Panel
+文本
+颜色
+cursor
+scroll
+keyboard input
+resize
+reconnect
+```
+
+一旦这个实验成功，后面的 **Workspace、多个 Panel、Wheel、Plugin UI、Remote UI Tree** 都只是向协议继续扩展。
+
+从整个 Bitty 架构来看，我认为这个实验的价值甚至不只是“做手机 App”——它会直接验证你现在设计的 **Panel abstraction 到底够不够干净**。如果一个 Panel 可以在完全不同的设备上被重建、控制和迁移，那么 Panel 基本就真正从“窗口里的终端区域”提升成了 Bitty 的一个独立计算/交互实体。
+
+[1]: https://docs.expo.dev/modules/overview/?utm_source=chatgpt.com "Expo Modules API: Overview - Expo documentation"
+[2]: https://shopify.github.io/react-native-skia/docs/canvas/overview/?utm_source=chatgpt.com "Canvas | React Native Skia"
+[3]: https://shopify.github.io/react-native-skia/docs/getting-started/installation/?utm_source=chatgpt.com "Installation | React Native Skia"
+
+那么背后的后端技术应该是怎么样的呢？前端我知道是怎么样的了。
+这部分我肯定是做成 Rust Core 部分，而不是 Lua Core 部分，因为会涉及网络依赖相关的。
+这个是不是可以参考 RustDesk 的设计呢？之后是否还可以扩展 https://github.com/filebrowser/filebrowser这种的呢？然后也支持别的基于这些相关的插件，比如像 ntfy 这种的通知之类的呢？
+
+是的，而且我觉得这里可以把思路再提升一层：
+
+> **不要把它设计成“Panel Remote 后端”，而应该设计成 Bitty 的统一 Remote Infrastructure。**
+
+Panel 只是第一个消费者。以后文件管理、Wheel/Agent、通知、Clipboard、任务状态、甚至插件远程 UI，都可以共享同一套 **设备身份、连接、权限、传输、Relay、事件系统**。
+
+你说放在 **Rust Core 而不是 Lua Core** 是合理的。Lua Plugin 应该消费这些能力，而不是负责建立 NAT traversal、TLS/QUIC、Relay、设备身份之类的基础设施。
+
+---
+
+# 1. 最终形态应该像这样
+
+我会拆成：
+
+```text
+                         Internet
+                            │
+                ┌───────────┴───────────┐
+                │                       │
+          Bitty Rendezvous         Bitty Relay
+          / Discovery              / Fallback
+                │                       │
+                └───────────┬───────────┘
+                            │
+                  direct P2P preferred
+                            │
+             ┌──────────────┴──────────────┐
+             │                             │
+      Desktop / Server                Mobile / iPad
+           Bitty                       Bitty Remote
+             │                             │
+      bitty-remote-core  ←────────→  bitty-remote-core
+             │
+   ┌─────────┼─────────┬─────────────┐
+   │         │         │             │
+ Panel    Files      Wheel        Notify
+ Service  Service    Service      Service
+```
+
+最重要的不是：
+
+```text
+Phone → HTTP API → Bitty
+```
+
+而是：
+
+```text
+Device A
+   ↕
+Authenticated Remote Session
+   ↕
+Device B
+```
+
+建立 Session 后，在一个连接中 multiplex 很多能力。
+
+---
+
+# 2. RustDesk 最值得参考的是“连接层”
+
+RustDesk 现在的自托管架构实际上就非常值得参考：
+
+```text
+hbbs
+= ID / Rendezvous / Signaling
+
+hbbr
+= Relay
+```
+
+客户端会先向 `hbbs` 注册自身地址；建立连接时优先尝试 NAT hole punching 直连，如果失败才走 `hbbr` Relay。([RustDesk][1])
+
+所以 Bitty 可以对应成：
+
+```text
+RustDesk             Bitty
+
+hbbs            →    bitty-rendezvous
+hbbr            →    bitty-relay
+RustDesk peer   →    Bitty device
+desktop stream  →    Bitty services
+```
+
+但后半部分不要照搬。
+
+RustDesk 主要传的是：
+
+```text
+Video
+Audio
+Mouse
+Keyboard
+Clipboard
+Files
+```
+
+Bitty 应该传的是：
+
+```text
+Panel State
+Panel Input
+Workspace State
+File Operations
+Agent State
+Notifications
+Plugin Events
+Assets
+```
+
+所以：
+
+> **参考 RustDesk 的 network topology，不参考它的 screen streaming abstraction。**
+
+---
+
+# 3. 甚至我现在会优先研究 `iroh`
+
+如果这个实验现在才开始，我不会第一时间自己造一个 `hbbs + hbbr`。
+
+2026 年现在有一个特别适合 Bitty 的 Rust 项目：
+
+**iroh 1.x**
+
+它目前本身就是：
+
+> public-key identified P2P QUIC connections
+
+它已经提供：
+
+```text
+Device identity
+    ↓
+QUIC
+    ↓
+Relay-assisted connection
+    ↓
+NAT traversal / hole punching
+    ↓
+Direct P2P
+    ↓
+Relay fallback
+```
+
+而且 Endpoint 本身通过 public key 标识并认证。当前 iroh 1.2.0 的设计是：Endpoint 先连接 relay，借助 relay 建立连接，然后尝试 QUIC NAT traversal；如果能打洞成功就迁移到 P2P，失败就继续走 Relay。Relay 只转发加密数据，不能读取 endpoint 间内容。([Docs.rs][2])
+
+这基本就是你自己实现一个 RustDesk-style Bitty backend 最麻烦的那部分。
+
+架构一下变成：
+
+```text
+bitty-remote
+     │
+     ├── iroh Endpoint
+     │      ├── identity
+     │      ├── QUIC
+     │      ├── NAT traversal
+     │      └── relay
+     │
+     └── Bitty Protocol
+            ├── Panel
+            ├── Files
+            ├── Agent
+            └── Notify
+```
+
+这个非常值得放进你说的：
+
+```text
+experiments/
+└── remote-transport-iroh/
+```
+
+做实验。
+
+---
+
+# 4. QUIC 又特别适合 Bitty
+
+因为 Bitty 不止一种数据。
+
+一个设备连接起来后，可以同时存在：
+
+```text
+QUIC Connection
+│
+├── Stream 0    Control
+├── Stream 1    Panel A
+├── Stream 2    Panel B
+├── Stream 3    File Download
+├── Stream 4    File Upload
+├── Stream 5    Wheel Events
+└── Stream 6    Notification
+```
+
+QUIC 原生支持多个独立 Stream，一个 Stream 的丢包不需要阻塞其他 Stream。Quinn 当前就是 Rust 中成熟的 QUIC implementation，而 iroh 本身也是建立在这类 QUIC 模型之上的。([Docs.rs][3])
+
+例如：
+
+```text
+正在传 2GB 文件
+
+files stream
+██████████████████
+
+同时：
+
+panel stream
+> cargo test_
+
+依然低延迟
+```
+
+如果全塞到一个 TCP/WebSocket byte stream 里，就必须自己处理很多 QoS / multiplexing 问题。
+
+所以之前我说 WebSocket 适合 MVP，但如果你准备正式做一个 **Bitty Remote Core**，我现在反而会把：
+
+```text
+iroh / QUIC
+```
+
+作为非常值得优先验证的方案。
+
+---
+
+# 5. Rust Core 可以拆成这些 crate
+
+我不会做成一个巨大的：
+
+```text
+bitty-remote
+```
+
+而更可能是：
+
+```text
+crates/
+├── bitty-remote-protocol/
+├── bitty-remote-transport/
+├── bitty-remote-auth/
+├── bitty-remote-session/
+├── bitty-remote-service/
+│
+├── bitty-panel-remote/
+├── bitty-file-service/
+└── bitty-notify/
+```
+
+其中：
+
+```text
+bitty-remote-transport
+```
+
+只管：
+
+```text
+connect
+listen
+relay
+disconnect
+reconnect
+streams
+network migration
+```
+
+完全不知道 Panel 是什么。
+
+---
+
+# 6. 再建立一个 Service 层
+
+我认为这里可以借鉴 RPC / microkernel 的思想。
+
+一个 Bitty Remote Session 建立以后：
+
+```text
+RemoteSession
+│
+├── panel
+├── filesystem
+├── agent
+├── workspace
+├── notification
+├── clipboard
+└── plugin
+```
+
+例如 protocol：
+
+```text
+service = "panel"
+method  = "attach"
+
+panel_id = 123
+```
+
+或者：
+
+```text
+service = "fs"
+method  = "read_dir"
+
+path = "/home/xuepoo/project"
+```
+
+这样未来添加能力的时候：
+
+```text
+Remote Transport
+```
+
+根本不需要改变。
+
+---
+
+# 7. File Browser：非常适合参考“能力”，但别依赖它
+
+你提到的 File Browser 思路完全合理。
+
+最终 Bitty Remote App 可以有：
+
+```text
+Desktop
+├── Panels
+├── Files
+├── Agents
+├── Processes
+└── Notifications
+```
+
+Files 点进去：
+
+```text
+/home/xuepoo/project
+
+📁 src
+📁 docs
+📄 Cargo.toml
+📄 README.md
+```
+
+支持：
+
+```text
+browse
+download
+upload
+rename
+move
+delete
+preview
+edit
+```
+
+这实际上就是一个 **Remote File Service**。
+
+但是有一个很重要的最新变化：`filebrowser/filebrowser` 已经在 **2026-09-01 正式归档**，不会再发布 bug fix 或 security fix。它自己的 README 甚至明确提到了 command execution/hooks 以及 JWT session 等尚未解决的安全问题。([GitHub][4])
+
+所以：
+
+> 可以研究 File Browser 的产品设计和 API 思路，但不应该把它嵌入 Bitty，也不建议基于它继续开发。
+
+Bitty 自己实现反而很简单。
+
+---
+
+# 8. Bitty File Service 应该非常 Core
+
+例如：
+
+```rust
+trait FileService {
+    async fn stat(&self, path: Path) -> Result<Metadata>;
+    async fn read_dir(&self, path: Path) -> Result<Vec<Entry>>;
+
+    async fn read(
+        &self,
+        path: Path,
+        offset: u64,
+        len: u64,
+    ) -> Result<Bytes>;
+
+    async fn write(
+        &self,
+        path: Path,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<()>;
+}
+```
+
+Remote：
+
+```text
+Mobile
+   │
+   │ fs.read("/project/src/main.rs")
+   ▼
+Bitty
+   │
+   ▼
+FileService
+   │
+   ▼
+OS filesystem
+```
+
+但是千万不要直接：
+
+```text
+Remote device has access to /
+```
+
+而应该是 capability based：
+
+```text
+device: iPhone
+
+allowed:
+  panel.read
+  panel.input
+
+  fs.read:
+    ~/Projects
+
+  fs.write:
+    ~/Projects/bitty
+
+denied:
+    ~/.ssh
+    ~/.gnupg
+    ~/.config
+    ~/.local/share/wheel/secrets
+```
+
+这和 Wheel 的安全设计其实可以共用同一种 capability model。
+
+---
+
+# 9. 我甚至建议整个 Remote 系统都使用 Capability
+
+不要简单设计：
+
+```text
+trusted = true
+```
+
+应该变成：
+
+```text
+DeviceCapability {
+    panel.list
+    panel.read
+    panel.input
+    panel.create
+    panel.kill
+
+    workspace.read
+
+    fs.read
+    fs.write
+
+    agent.read
+    agent.command
+
+    clipboard.read
+    clipboard.write
+
+    notify.subscribe
+}
+```
+
+手机第一次连接：
+
+```text
+iPhone requests:
+
+✓ View Panels
+✓ Control Panels
+✓ Read ~/Projects
+✗ Modify Files
+✓ View Agent Status
+✗ Control Agents
+```
+
+用户授权后产生：
+
+```text
+Device Grant
+```
+
+以后可以随时 revoke。
+
+这个非常重要，因为你实际上是在造：
+
+> 一个远程控制计算机的基础设施。
+
+安全边界必须从第一天设计。
+
+---
+
+# 10. ntfy 又正好对应另一个 Service
+
+ntfy 本质就是：
+
+```text
+HTTP
+   ↓
+Pub/Sub
+   ↓
+Notification
+   ↓
+Mobile/Desktop
+```
+
+官方也把它定义为 HTTP-based pub/sub notification service。([ntfy][5])
+
+Bitty 可以借鉴成：
+
+```text
+Bitty Event Bus
+      │
+      ├── Panel exited
+      ├── cargo build failed
+      ├── Wheel task completed
+      ├── Agent asks question
+      ├── SSH disconnected
+      └── long command finished
+                │
+                ▼
+          Notification Service
+                │
+         ┌──────┴───────┐
+         ▼              ▼
+   Remote App        Plugin
+```
+
+例如：
+
+```text
+Wheel Agent #3
+
+Review completed.
+3 issues found.
+
+[Open Panel] [Ask Agent]
+```
+
+这个体验会非常好。
+
+---
+
+# 11. 但是 Notification 要分两层
+
+这里有一个很重要的区别。
+
+如果 Bitty Remote App 当前在线：
+
+```text
+Bitty
+   ↓ QUIC
+Remote App
+```
+
+直接传：
+
+```text
+NotifyEvent
+```
+
+就行。
+
+但如果 App 被 iOS/Android 杀掉：
+
+```text
+Bitty ─X─> App
+```
+
+这时候就必须经过系统 Push Infrastructure：
+
+```text
+                ┌─ APNs → iPhone/iPad
+Bitty → Gateway ┤
+                └─ FCM  → Android
+```
+
+ntfy 自己也面对同样的问题：例如 Android 的真正后台即时通知需要依赖 FCM；官方文档明确说明 FCM 是 Android 在不运行 foreground service 情况下接收消息的系统途径。([ntfy][5])
+
+所以 Bitty 可以有：
+
+```text
+bitty-notify
+│
+├── online
+│     └── Remote Session
+│
+└── offline
+      └── Push Gateway
+             ├── APNs
+             └── FCM
+```
+
+---
+
+# 12. 这里就会自然出现一个小型 Bitty Cloud
+
+但它不应该是必需的。
+
+例如：
+
+```text
+                    Bitty Infrastructure
+                           │
+          ┌────────────────┼────────────────┐
+          │                │                │
+      Discovery          Relay          Push Gateway
+          │                │                │
+          └────────────────┴────────────────┘
+                           │
+                     optional service
+```
+
+用户可以：
+
+```text
+A. 官方服务
+B. Self-host
+C. LAN only
+D. VPN / Tailscale only
+```
+
+这一点最好和 Bitty 本身的理念一致：
+
+> Core 不应该强制依赖 Bitty Cloud。
+
+---
+
+# 13. LAN 下甚至完全不需要服务器
+
+例如：
+
+```text
+Home Wi-Fi
+
+iPad ──────────────── Desktop
+        QUIC P2P
+```
+
+可以通过：
+
+```text
+mDNS
+local discovery
+QR pairing
+```
+
+找到设备。
+
+只有：
+
+```text
+Phone on 5G
+        ↓
+Internet
+        ↓
+Home desktop behind NAT
+```
+
+才需要：
+
+```text
+Rendezvous / Relay
+```
+
+这点 RustDesk 就是很好的参考。([RustDesk][1])
+
+---
+
+# 14. Plugin 怎么参与？
+
+这里我还是会坚持：
+
+> **Network implementation 属于 Rust Core；网络能力可以暴露给 Lua。**
+
+也就是说不是：
+
+```text
+Lua Plugin
+   ↓
+自己 import HTTP/TCP library
+```
+
+而是：
+
+```text
+Lua Plugin
+    ↓
+Bitty Capability API
+    ↓
+Rust Remote Core
+```
+
+例如：
+
+```lua
+bitty.notify.send({
+    title = "Build completed",
+    body = "cargo test passed",
+})
+```
+
+或者：
+
+```lua
+bitty.remote.publish("docker/status", {
+    containers = 12,
+    running = 10,
+})
+```
+
+底下插件完全不知道：
+
+```text
+QUIC
+Relay
+APNs
+FCM
+NAT traversal
+TLS
+```
+
+这些全部由 Core 负责。
+
+这和你之前坚持的：
+
+```text
+Rust Core = mechanism
+Lua Core / Plugin = policy & composition
+```
+
+其实完全一致。
+
+---
+
+# 15. 最后会形成非常漂亮的结构
+
+我觉得最后 Bitty 可以变成：
+
+```text
+                         Bitty
+                           │
+                    Remote Runtime
+                           │
+       ┌───────────┬───────┼───────────┬────────────┐
+       │           │       │           │            │
+     Panel       Files   Events     Clipboard      Agent
+       │           │       │           │            │
+       └───────────┴───────┼───────────┴────────────┘
+                           │
+                       Services
+                           │
+                    Capability Layer
+                           │
+                     Remote Session
+                           │
+                     Protocol Layer
+                           │
+                    iroh / QUIC
+                           │
+            ┌──────────────┼───────────────┐
+            │              │               │
+          Direct       Rendezvous        Relay
+           P2P
+```
+
+而上层：
+
+```text
+Bitty Remote App
+├── Panels
+├── Files
+├── Wheel
+├── Notifications
+├── Devices
+└── Settings
+```
+
+---
+
+## 我现在会怎么做实验
+
+你现在其实已经可以在 `experiments/` 下面开 **三个非常明确的实验**：
+
+```text
+experiments/
+├── remote-transport/
+│   └── 验证 iroh / QUIC / NAT / Relay
+│
+├── remote-panel/
+│   └── Snapshot + Diff + Input
+│
+└── remote-files/
+    └── list/read/write/chunk transfer
+```
+
+等这三个跑通，再验证：
+
+```text
+remote-notify/
+```
+
+其中 **`remote-transport` 应该优先级最高**。尤其建议先验证 iroh，因为它现在已经把你如果参考 RustDesk 最难自己实现的 **identity + QUIC + hole punching + relay fallback** 基本组合好了。([Docs.rs][2])
+
+如果这个实验成立，我甚至不建议 Bitty 自己从零实现类似 `hbbs/hbbr` 的协议；**把 iroh 当 network substrate，然后 Bitty 自己重点设计 Remote Protocol + Service + Capability Layer，架构会干净很多。**
+
+[1]: https://rustdesk.com/docs/en/self-host/?utm_source=chatgpt.com "Self-host – RustDesk Documentation"
+[2]: https://docs.rs/crate/iroh/latest?utm_source=chatgpt.com "iroh 1.2.0 - Docs.rs"
+[3]: https://docs.rs/quinn/latest/quinn/?utm_source=chatgpt.com "quinn - Rust"
+[4]: https://github.com/filebrowser/filebrowser/releases?utm_source=chatgpt.com "Releases · filebrowser/filebrowser · GitHub"
+[5]: https://docs.ntfy.sh/config/?utm_source=chatgpt.com "Configuration - ntfy"

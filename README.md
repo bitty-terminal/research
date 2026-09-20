@@ -105,8 +105,9 @@ To add new research:
 | 058 | Captured | Beacon targeting framework: spatial and semantic addressing via Command Registry         |
 | 059 | Captured | Wheel context runtime: tiered evidence, knowledge DAG, and information refinement        |
 | 060 | Captured | Phodopus runtime strategy: fork Piccolo, modular stdlib, and sandbox architecture        |
+| 061 | Captured | Bitty Remote: unified remote infrastructure and the remote client                         |
 
-Records 044–060 are **Captured** (owner directive 2026-09-18: the `*-docs` corpora are the working corpus agents build on; the research archive records discussion provenance, not task state). Record-to-document coverage now lives here, in the [`coverage/`](coverage/README.md) index (one file per docs corpus), together with each record summary's Destination/Open-items fields. The `*-docs` corpora are intentionally research-free — they carry no research references, record numbers, or coverage ledgers — so the mappings are kept only in this archive. The origin files stay byte-identical; only the `.completed` suffix and this row status changed.
+Records 044–061 are **Captured** (owner directive 2026-09-18: the `*-docs` corpora are the working corpus agents build on; the research archive records discussion provenance, not task state). Record-to-document coverage now lives here, in the [`coverage/`](coverage/README.md) index (one file per docs corpus), together with each record summary's Destination/Open-items fields. The `*-docs` corpora are intentionally research-free — they carry no research references, record numbers, or coverage ledgers — so the mappings are kept only in this archive. The origin files stay byte-identical; only the `.completed` suffix and this row status changed.
 
 Records 042 and 043 are captured as draft pages in `bitty-docs`
 (`development/platform-compatibility.md`, `development/testing-infrastructure.md`)
