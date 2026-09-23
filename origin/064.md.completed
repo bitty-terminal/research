@@ -1,0 +1,784 @@
+对，而且我觉得你现在对 `bitty-network` 的定位已经不只是“把网络依赖抽出来复用”，而是逐渐形成了一个更完整的原则：
+
+> **插件不能自己携带一套系统能力；插件只能声明自己需要什么能力，由 Bitty 上游统一提供、调度和授权。**
+
+这会直接决定 Bitty 插件生态能不能在几年以后仍然保持轻量、可维护和安全。
+
+## `bitty-network` 真正解决的其实是三个问题
+
+第一层当然是你最开始考虑的 **dependency reuse**。
+
+最差的生态可能变成：
+
+```text
+Plugin A
+├── HTTP Client
+├── TLS
+├── DNS
+└── Async Runtime
+
+Plugin B
+├── HTTP Client
+├── TLS
+├── DNS
+└── Async Runtime
+
+Plugin C
+├── HTTP Client
+├── TLS
+├── WebSocket
+└── Async Runtime
+
+Wheel
+├── HTTP Client
+├── TLS
+├── SSE
+└── Async Runtime
+```
+
+即使 Cargo 对相同版本的 crate 本身会 deduplicate，这种架构仍然会产生更严重的重复：
+
+```text
+不同版本
+不同 feature
+不同 TLS backend
+不同 async runtime
+不同 connection pool
+不同 DNS cache
+不同配置
+不同安全策略
+```
+
+最后真正浪费的甚至不只是 binary size，而是：
+
+```text
+Memory
+Threads
+Connections
+Timers
+Caches
+TLS sessions
+Maintenance cost
+```
+
+如果统一成：
+
+```text
+                   bitty-network
+                         │
+             Shared Network Runtime
+                         │
+       ┌─────────────────┼─────────────────┐
+       ▼                 ▼                 ▼
+     Wheel             GitHub            Weather
+       │                 │                 │
+       └──────── Network API ──────────────┘
+```
+
+整个 runtime 就只需要一套。
+
+---
+
+# 更重要的是：Bitty 插件最好根本没有“自己联网”的能力
+
+这个实际上比依赖复用还重要。
+
+比如 Lua 插件不能：
+
+```lua
+socket.connect("1.2.3.4", 1234)
+```
+
+也不能：
+
+```lua
+ffi.load("libcurl")
+```
+
+甚至最好没有类似：
+
+```lua
+os.execute("curl ...")
+```
+
+这种绕过 Bitty permission system 的方式。
+
+插件应该只能：
+
+```lua
+local net = bitty.require("network")
+
+net.request({
+    url = "...",
+})
+```
+
+然后：
+
+```text
+Plugin
+   │
+   │ network.http
+   ▼
+Capability Manager
+   │
+   │ allowed?
+   ▼
+bitty-network
+   │
+   ▼
+Internet
+```
+
+这样 Bitty 才真正掌控了网络。
+
+---
+
+## 所以 Piccolo / Phodopus 的选择和这个设计其实是同一件事
+
+你之前选择 Piccolo/Phodopus，一个非常重要的目的就是：
+
+> 不给插件一个完整、无限制的宿主环境。
+
+这里有一个需要特别强调的地方：
+
+**使用 Piccolo 本身并不会自动获得 sandbox。**
+
+真正的安全边界来自：
+
+```text
+Lua VM
++
+Bitty 暴露了哪些 Host Functions
++
+Capability System
++
+Resource Limits
+```
+
+例如 Bitty 根本不提供：
+
+```text
+raw socket
+arbitrary FFI
+arbitrary process spawn
+unrestricted filesystem
+raw environment secrets
+```
+
+那么插件就算是恶意 Lua：
+
+```lua
+-- 想联网
+```
+
+它也没有路径出去。
+
+这种设计非常接近 capability-based security：
+
+```text
+Plugin
+  │
+  ├─ UI         ✓
+  ├─ clipboard  ?
+  ├─ network    ?
+  ├─ filesystem ?
+  ├─ process    ?
+  └─ secrets    ?
+```
+
+而不是：
+
+```text
+安装插件
+=
+获得当前用户所有权限
+```
+
+这会成为 Bitty 相比很多传统插件系统非常大的优势。
+
+---
+
+# `bitty-network` 就应该成为一个 Capability Provider
+
+所以我现在甚至不会只把它叫：
+
+> 网络 crate
+
+更准确的架构身份应该是：
+
+> **Network Capability Provider**
+
+比如：
+
+```text
+bitty-network
+
+provides:
+├── network.http
+├── network.websocket
+├── network.tcp
+├── network.udp
+├── network.quic
+├── network.listen
+└── network.discovery
+```
+
+然后插件 manifest：
+
+```toml
+[capabilities]
+network = [
+    "http"
+]
+
+[network]
+allow = [
+    "api.github.com"
+]
+```
+
+Weather：
+
+```toml
+[capabilities]
+network = ["http"]
+
+[network]
+allow = [
+    "api.open-meteo.com"
+]
+```
+
+Wheel Provider：
+
+```toml
+[capabilities]
+network = [
+    "http",
+    "websocket"
+]
+```
+
+Remote plugin：
+
+```toml
+[capabilities]
+network = [
+    "quic",
+    "listen"
+]
+```
+
+这样 Bitty甚至可以区分：
+
+```text
+能作为 client
+≠
+能监听端口
+
+能 HTTP
+≠
+能 raw TCP
+
+能访问 api.github.com
+≠
+能访问任意 host
+```
+
+这个安全模型就很漂亮。
+
+---
+
+# 类似的能力以后其实会越来越多
+
+一旦把 `bitty-network` 想清楚，你会发现它不是孤立案例。
+
+以后可能有：
+
+```text
+bitty-network
+bitty-process
+bitty-fs
+bitty-secrets
+bitty-media
+bitty-notify
+bitty-remote
+```
+
+这里有些可能属于 Core，有些属于 Optional Core Extension。
+
+例如：
+
+```text
+                   Bitty Runtime
+                        │
+                Capability Layer
+                        │
+       ┌────────────────┼────────────────┐
+       ▼                ▼                ▼
+   filesystem         network          process
+       │                │                │
+      Core         optional ext         Core
+```
+
+Lua Plugin 不直接碰 OS：
+
+```text
+               Lua Plugin
+                    │
+             Capability API
+                    │
+               Bitty Core
+                    │
+                   OS
+```
+
+这就是一个非常稳定的安全边界。
+
+---
+
+# 这样确实有机会比 VS Code 的插件资源模型控制得更好
+
+但关键不是“Lua 比 JavaScript 省资源”这么简单。
+
+真正应该从架构上避免的是：
+
+```text
+Plugin
+=
+一个新的 runtime
++
+一堆自己的 dependency
++
+一堆 background worker
++
+一套自己的 cache
+```
+
+Bitty 可以做成：
+
+```text
+                 Bitty
+                   │
+        Shared Runtime Services
+                   │
+   ┌───────────────┼─────────────────┐
+   │               │                 │
+ Network      Scheduler/Timer      Renderer
+   │               │                 │
+ Plugin A       Plugin B          Plugin C
+```
+
+也就是说尽量：
+
+### 共享 event loop
+
+不要：
+
+```text
+Plugin A → 4 threads
+Plugin B → 8 threads
+Plugin C → Tokio runtime
+```
+
+而是：
+
+```text
+Bitty Async Runtime
+       │
+       ├─ task A
+       ├─ task B
+       └─ task C
+```
+
+---
+
+### 共享 network connection pool
+
+比如 5 个插件都访问 GitHub：
+
+```text
+Git Plugin
+Issue Plugin
+PR Plugin
+Release Plugin
+Wheel GitHub Tool
+```
+
+不应该建立五套：
+
+```text
+DNS
+TLS
+HTTP/2 connections
+```
+
+可以共享：
+
+```text
+api.github.com
+      │
+Shared HTTP/2 Pool
+      │
+ ┌────┼────┬────┐
+ A    B    C    D
+```
+
+---
+
+### 共享 timer/scheduler
+
+不要让每个插件：
+
+```text
+while true {
+    sleep(...)
+}
+```
+
+Bitty可以提供：
+
+```lua
+bitty.timer.every("30s", function()
+end)
+```
+
+这样一个 scheduler 管全部 timer。
+
+---
+
+### 共享 UI renderer
+
+Native plugin UI 更应该如此。
+
+插件提交：
+
+```text
+UI description/state
+```
+
+而不是自己创建：
+
+```text
+GPU context
+window
+renderer
+font cache
+```
+
+最终：
+
+```text
+Plugin A ─┐
+Plugin B ─┼─→ Bitty UI Runtime → wgpu
+Plugin C ─┘
+```
+
+资源利用率会高很多。
+
+---
+
+# 再加 Resource Quota
+
+这会是 Bitty非常值得从第一版 plugin architecture 就设计进去的东西。
+
+比如每个 Plugin Instance：
+
+```text
+Plugin Runtime Budget
+├── memory
+├── CPU time
+├── tasks
+├── processes
+├── network connections
+├── network bandwidth
+├── timers
+└── storage
+```
+
+例如：
+
+```toml
+[limits]
+memory = "64MiB"
+tasks = 8
+network_connections = 4
+```
+
+当然普通插件不一定真的需要用户手写这些。
+
+Bitty可以有默认等级：
+
+```text
+tiny
+normal
+heavy
+system
+```
+
+甚至自动统计。
+
+---
+
+# Plugin Manager 应该知道插件到底在消耗什么
+
+以后可以出现一个非常 Bitty 风格的：
+
+```text
+Plugins
+
+Git
+  Memory        12 MB
+  CPU           0.2%
+  Tasks         2
+  Network       3 connections
+  Storage       14 MB
+
+Weather
+  Memory         2 MB
+  CPU            0%
+  Tasks          1
+  Network        idle
+
+Wheel
+  Memory        48 MB
+  CPU           1.3%
+  Tasks          7
+  Network        2 connections
+```
+
+甚至：
+
+```text
+Suspend
+Restart
+Disable
+Kill
+Inspect
+```
+
+这会比“插件卡了然后不知道哪个插件的问题”好很多。
+
+---
+
+# Lazy Loading 也非常关键
+
+假设用户装了：
+
+```text
+100 plugins
+```
+
+不应该：
+
+```text
+Bitty startup
+ ↓
+load 100 plugins
+ ↓
+initialize everything
+```
+
+而应该类似：
+
+```text
+Plugin installed
+≠
+Plugin loaded
+≠
+Plugin active
+```
+
+比如：
+
+```text
+Git Plugin
+trigger:
+  git repository detected
+
+Weather
+trigger:
+  user opens weather panel
+
+Wheel
+trigger:
+  /wheel
+  or workspace enables Wheel
+```
+
+于是：
+
+```text
+Installed: 100
+Loaded:     12
+Active:      4
+```
+
+这个 distinction 很重要。
+
+---
+
+# Headless Plugin 更应该能够 suspend
+
+例如天气插件：
+
+```text
+fetch weather
+ ↓
+update state
+ ↓
+nothing to do
+```
+
+那就不应该一直占一个 active loop。
+
+可以：
+
+```text
+Active
+  ↓
+waiting
+  ↓
+Suspended
+  ↓
+timer/network event
+  ↓
+Wake
+```
+
+甚至 Phodopus 可以围绕这种 suspension model 做得很好。
+
+这会跟 Bitty 的 Headless Panel / Plugin Runtime 模型形成很好的统一。
+
+---
+
+# 所以 Bitty 可以避免一种“插件生态熵增”
+
+很多软件都是：
+
+```text
+Core 很快
+ ↓
+插件越来越多
+ ↓
+每个插件各搞一套东西
+ ↓
+资源越来越大
+ ↓
+启动越来越慢
+ ↓
+出了问题不知道是谁
+```
+
+可以把这个叫做：
+
+$$
+Extension\ Ecosystem\ Entropy
+$$
+
+Bitty应该从一开始通过：
+
+```text
+Shared Services
+Capability System
+Resource Quotas
+Lazy Loading
+Lifecycle Management
+Dependency Reuse
+Runtime Introspection
+```
+
+把它控制住。
+
+整个架构可以变成：
+
+```text
+                      Plugins
+                         │
+              ┌──────────┴──────────┐
+              │ Capability Requests │
+              └──────────┬──────────┘
+                         │
+                 Runtime Supervisor
+                         │
+       ┌─────────────────┼─────────────────┐
+       ▼                 ▼                 ▼
+ Network Service     UI Service       Task Service
+ bitty-network         wgpu          Scheduler
+       │                 │                 │
+       └─────────────────┼─────────────────┘
+                         │
+                     Rust Core
+                         │
+                         OS
+```
+
+插件看到的是 **能力**：
+
+```text
+network
+ui
+timer
+storage
+process
+clipboard
+```
+
+而不是底层实现：
+
+```text
+reqwest
+tokio
+rustls
+wgpu
+SQLite
+```
+
+我认为这一点尤其重要：
+
+> **Bitty Plugin API 应该面向 capability，而不是面向 crate。**
+
+因此 `bitty-network` 对 Rust 项目来说是一个 crate，但对插件来说不应该是一个 crate。
+
+插件只知道：
+
+```text
+network capability
+```
+
+这会让你以后替换：
+
+```text
+reqwest → hyper
+rustls → other TLS
+Tokio → another runtime
+```
+
+甚至把 network 移到：
+
+```text
+bitty-networkd
+```
+
+都不会破坏插件。
+
+---
+
+所以你现在担心 VS Code 那种“装插件越多，整个程序越来越重”的问题是很合理的，但 Bitty 真正可以做得更好的地方，不只是选择一个更轻的 Lua VM，而是从一开始建立：
+
+$$
+\boxed{
+Plugins\ share\ infrastructure,\ not\ duplicate\ infrastructure
+}
+$$
+
+再加上一条：
+
+$$
+\boxed{
+Plugins\ request\ capabilities,\ not\ own\ system\ privileges
+}
+$$
+
+我觉得这两句话其实完全可以成为 Bitty 插件架构最核心的设计原则。它们同时解决了你关心的 **长期维护、依赖膨胀、资源占用、安全边界和未来扩展能力**。
