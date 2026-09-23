@@ -1,0 +1,924 @@
+那么你可以看看 foot 为什么能做到非常快呢？里面好像有一个只渲染改变的部分？那么对于 Bitty 是否可以借鉴呢？
+
+是的，而且 **foot 很值得 Bitty 专门研究**。你记得的“只渲染改变的部分”确实是它快的重要原因之一，但并不是唯一原因。
+
+foot 的思路可以概括成：
+
+> **少做事，而不是把同样的事情交给 GPU 更快地做。**
+
+这和 Alacritty / Kitty / Ghostty 那种 GPU-first 的路线很不一样。
+
+## foot 到底怎么做到这么快
+
+foot 是一个非常 Wayland-native、非常专一的终端。它并不依赖 GPU 做整个 terminal rendering，而是以软件渲染 + Wayland shared-memory buffer 为核心，然后尽可能避免无意义的重绘。官方配置文档明确写着：默认情况下不会 damage 整个窗口，而只会 damage **updated rows**；强制整个窗口 damage 反而可能增加 compositor 的 CPU/GPU 消耗。([GitHub][1])
+
+更有意思的是，它内部不只是“行级别”：
+
+```text
+Terminal Grid
+│
+├── Row 0   clean
+├── Row 1   clean
+├── Row 2   dirty
+│   ├── cell 0 clean
+│   ├── cell 1 clean
+│   ├── cell 2 DIRTY
+│   └── ...
+├── Row 3   clean
+└── ...
+```
+
+从源码可以看到类似：
+
+```c
+row->dirty = true;
+cell->attrs.clean = false;
+```
+
+例如 cursor blink 时，foot 只把 cursor 所在 cell 标记为不 clean，同时把这一行标记为 dirty；文本 blink 也是扫描相关 cell 后只 dirtify 对应区域。([GitHub][2])
+
+所以一次：
+
+```text
+$ hel█
+```
+
+变成：
+
+```text
+$ hell█
+```
+
+理论上不需要：
+
+```text
+整个窗口
+↓
+全部字符重新 rasterize
+↓
+全部 framebuffer 重画
+↓
+整个 surface 重新 damage
+```
+
+而可以接近：
+
+```text
+cell changed
+    ↓
+row dirty
+    ↓
+只重画对应区域
+    ↓
+Wayland damage region
+    ↓
+Compositor 只处理变化区域
+```
+
+Wayland 本身的 `wl_surface_damage_buffer()` 就是专门支持这种模式的：client 告诉 compositor **哪些 buffer 区域发生了变化**。([Wayland Client Documentation][3])
+
+---
+
+## 但 foot 真正厉害的是整个 pipeline 都贯彻这个思想
+
+它不是简单加一个：
+
+```rust
+if dirty {
+    render();
+}
+```
+
+就结束了。
+
+### 1. Dirty rendering
+
+首先是刚才说的：
+
+```text
+Terminal state mutation
+        ↓
+dirty cell
+        ↓
+dirty row
+        ↓
+dirty region
+        ↓
+render only necessary region
+```
+
+这是最直接的一层。
+
+---
+
+### 2. scrolling 甚至有专门的 mmap 优化
+
+这个很值得 Bitty 注意。
+
+foot 的配置文档里专门有：
+
+```text
+max-shm-pool-size-mb
+```
+
+因为它使用了一个 **virtual-memory mapping trick** 来优化 interactive scrolling。
+
+官方文档明确说这是用于：
+
+> fast rendering of interactive scrolling
+
+比如：
+
+```text
+vim
+
+↓
+按住 ↑ / ↓
+↓
+不断滚动
+```
+
+foot 会为 pixmap 使用较大的 virtual address space，减少滚动过程中的昂贵 framebuffer 搬运。([Debian Manpages][4])
+
+这背后的思想其实和 Terminal Grid 的 ring buffer 很像：
+
+```text
+错误思路：
+
+row0
+row1
+row2
+row3
+row4
+
+scroll ↑
+
+memcpy:
+row1 -> row0
+row2 -> row1
+row3 -> row2
+row4 -> row3
+```
+
+而更好的设计是：
+
+```text
+Physical:
+
+[A][B][C][D][E]
+
+Logical viewport:
+    ↓
+[B][C][D][E][A]
+```
+
+即：
+
+> **移动 view，而不是移动所有数据。**
+
+这和你之前 Bitty 的 `Scrollback/Grid` 设计其实非常相关。
+
+---
+
+### 3. foot 会把连续 PTY 更新合并
+
+这也是非常漂亮的一点。
+
+一个 TUI 更新一帧的时候，并不一定：
+
+```text
+write(fd, 完整的一帧)
+```
+
+它可能是：
+
+```text
+write(clear line)
+write(cursor move)
+write(text A)
+write(text B)
+write(text C)
+```
+
+如果 Terminal 每收到一次 `write()` 都 render：
+
+```text
+PTY write
+ ↓
+render
+
+PTY write
+ ↓
+render
+
+PTY write
+ ↓
+render
+```
+
+不仅浪费，而且可能看到：
+
+```text
+旧界面
+→ 空白界面
+→ 半完成界面
+→ 完整界面
+```
+
+造成 flicker。
+
+foot 会故意加入一个非常小的 delayed rendering window，把附近的更新合并起来；源码对这个原因解释得非常清楚。([GitHub][2])
+
+变成：
+
+```text
+PTY writes
+ ↓
+VT parse
+ ↓
+PTY writes
+ ↓
+VT parse
+ ↓
+PTY writes
+ ↓
+VT parse
+ ↓
+coalesce
+ ↓
+render once
+```
+
+这其实对 Bitty **非常重要**。
+
+因为 Bitty 后面不只是 terminal output，还有：
+
+```text
+PTY
+Native UI
+Plugin IPC
+Wheel Agent
+Panel state
+Animation
+Image
+```
+
+都可能不断产生更新。
+
+---
+
+## 4. foot 还会并行渲染
+
+当前 foot 配置中有：
+
+```ini
+workers = <logical CPU count>
+```
+
+可以使用多个 worker 做 rendering，并且文档特别指出：
+
+> 最大并行度不会超过 visible rows。
+
+也就是说它天然把：
+
+```text
+row rendering
+```
+
+作为一种容易并行化的工作单元。([Debian Manpages][5])
+
+例如：
+
+```text
+dirty rows:
+
+2
+3
+7
+8
+9
+20
+
+          Renderer
+       /     |      \
+worker 1  worker 2  worker 3
+ 2,3       7,8       9,20
+```
+
+对于 CPU renderer 特别有效。
+
+---
+
+## 5. Glyph cache / Font cache 也非常重要
+
+foot 的 server mode 会让多个窗口共享：
+
+```text
+Fonts
+Glyph cache
+Process resources
+```
+
+官方 README 直接把减少内存占用和启动时间列为 server mode 的主要目的。([GitHub][6])
+
+所以：
+
+```text
+foot
+foot
+foot
+foot
+```
+
+不一定每一个都：
+
+```text
+load font
+shape glyph
+rasterize glyph
+build cache
+```
+
+而可以共享大量东西。
+
+---
+
+# 所以 foot 的“快”更准确地说是
+
+```text
+                       foot
+
+PTY read
+   │
+   ▼
+VT Parser
+   │
+   │ mutate
+   ▼
+Terminal Grid
+   │
+   ├── dirty cells
+   ├── dirty rows
+   └── scroll damage
+          │
+          ▼
+     Frame Scheduler
+     ├── batch updates
+     └── avoid intermediate frames
+          │
+          ▼
+      Renderer
+     ├── glyph cache
+     ├── dirty rendering
+     ├── workers
+     └── mmap scrolling
+          │
+          ▼
+       SHM Buffer
+          │
+          ▼
+  Wayland damage regions
+          │
+          ▼
+      Compositor
+```
+
+所以它能在**没有传统意义 GPU terminal renderer** 的情况下依然非常快。
+
+---
+
+# 那 Bitty 能不能借鉴？
+
+不仅能，而且我认为应该借鉴。
+
+但不要直接复制 foot 的：
+
+```text
+dirty row renderer
+```
+
+而应该把它升级成 Bitty 自己的一套：
+
+# `Damage / Invalidation System`
+
+因为 Bitty 已经不只是 Terminal Grid 了。
+
+可以设计成：
+
+```text
+                    Bitty State
+                        │
+          ┌─────────────┼─────────────┐
+          ▼             ▼             ▼
+    Terminal Grid    Native UI     Graphics
+          │             │             │
+      dirty cell     dirty node     dirty rect
+          │             │             │
+          └──────┬──────┴──────┬─────┘
+                 ▼
+          Damage Tracker
+                 │
+          Region / Tile Set
+                 │
+                 ▼
+          Frame Scheduler
+                 │
+                 ▼
+             Renderer
+```
+
+这会比 foot 更一般化。
+
+---
+
+## Bitty 的 Terminal Grid 可以直接借 foot
+
+比如：
+
+```rust
+struct Cell {
+    // ...
+    dirty: bool,
+}
+
+struct Row {
+    cells: Vec<Cell>,
+    dirty: bool,
+}
+
+struct TerminalDamage {
+    rows: BitSet,
+}
+```
+
+甚至更进一步，不只是：
+
+```text
+row 10 dirty
+```
+
+而是：
+
+```text
+row 10:
+col 23..28 dirty
+```
+
+表示：
+
+```text
+DamageSpan {
+    row: 10,
+    start: 23,
+    end: 28,
+}
+```
+
+那么普通 shell 输入：
+
+```text
+$ cargo bui█
+```
+
+变成：
+
+```text
+$ cargo buil█
+```
+
+可能就只产生：
+
+```text
+Damage:
+row = 42
+cols = 11..12
+```
+
+---
+
+# 但 Bitty 不应该只做 Terminal Damage
+
+因为 Bitty 还有：
+
+```text
+┌──────────────────────────────────────┐
+│ Sidebar │ Panel                      │
+│         │                            │
+│ Agent   │ $ cargo build              │
+│ status  │ ...                        │
+│         │                            │
+├─────────┴────────────────────────────┤
+│ Statusline                          │
+└──────────────────────────────────────┘
+```
+
+假设 Wheel 的 Agent 状态：
+
+```text
+Running
+```
+
+变成：
+
+```text
+Waiting
+```
+
+那就不应该导致 Terminal Panel 重画。
+
+应该是：
+
+```text
+Agent Status Node
+       ↓
+invalidate
+       ↓
+Sidebar rectangle dirty
+       ↓
+only sidebar UI rebuilt
+```
+
+所以 Bitty 可以做三层 dirty：
+
+```text
+Level 1
+Cell Damage
+
+Level 2
+Panel Damage
+
+Level 3
+Scene/UI Damage
+```
+
+---
+
+# 对 Native UI，我甚至建议做类似浏览器的 invalidation
+
+比如：
+
+```text
+UI Tree
+
+Workspace
+├── Sidebar
+│   ├── AgentList
+│   │   ├── Agent A
+│   │   └── Agent B  ← changed
+│   └── PluginList
+│
+├── TerminalPanel
+│
+└── Statusline
+```
+
+只有：
+
+```text
+Agent B
+```
+
+状态变化。
+
+那么：
+
+```text
+Agent B
+ ↓
+dirty
+ ↓
+AgentList layout maybe unchanged
+ ↓
+Sidebar subrect damage
+```
+
+而不是：
+
+```text
+Workspace dirty
+ ↓
+rerender EVERYTHING
+```
+
+这就已经开始类似：
+
+```text
+React reconciliation
+browser invalidation
+retained-mode GUI
+scene graph
+```
+
+而不是传统 Terminal Renderer 了。
+
+---
+
+# wgpu 下应该怎么实现？
+
+这里有一个很重要的区别。
+
+foot 可以直接：
+
+```text
+CPU framebuffer
++
+Wayland SHM
++
+wl_surface_damage_buffer
+```
+
+Bitty 是：
+
+```text
+wgpu
+ ↓
+Vulkan / Metal / D3D12 / GLES
+ ↓
+Swapchain
+```
+
+所以不能简单照搬。
+
+截至当前 `wgpu 30` 的标准 Rust API，surface presentation 仍然主要是：
+
+```rust
+get_current_texture()
+render
+submit
+present()
+```
+
+并没有公开一个类似 foot 的跨平台：
+
+```rust
+present(damage_rects)
+```
+
+接口；`wgpu` 关于扩展 presentation/damage region 的设计讨论仍然存在。([GitHub][7])
+
+所以 Bitty 最好不要把：
+
+> dirty rendering = Wayland damage
+
+绑死。
+
+---
+
+# 我更建议 Bitty 使用 Persistent Panel Texture
+
+例如：
+
+```text
+                      GPU
+
+┌─────────────────────────────────┐
+│ Workspace                       │
+│                                 │
+│ ┌──────────────┐ ┌────────────┐ │
+│ │ Panel Texture│ │Panel Texture│ │
+│ │      A       │ │     B      │ │
+│ └──────────────┘ └────────────┘ │
+└─────────────────────────────────┘
+```
+
+每个 Panel 有一个持久 texture：
+
+```text
+Panel A changed
+Panel B unchanged
+Panel C unchanged
+```
+
+则：
+
+```text
+Panel A
+ ↓
+update dirty region
+
+Panel B
+ ↓
+reuse texture
+
+Panel C
+ ↓
+reuse texture
+```
+
+最后：
+
+```text
+Panel textures
+      ↓
+cheap composition pass
+      ↓
+wgpu Surface
+```
+
+也就是说：
+
+```text
+Terminal render cost
+        ≠
+Window present cost
+```
+
+即使最终 Swapchain 还是提交整张 window：
+
+> **昂贵的 text shaping、glyph generation、vertex rebuilding、native UI layout 等都不需要重新做。**
+
+最后 compositing 几个 texture quad 本身非常便宜。
+
+---
+
+# 甚至可以进一步做 Tile-based Damage
+
+比如一个 Panel：
+
+```text
+┌────┬────┬────┬────┐
+│ 00 │ 01 │ 02 │ 03 │
+├────┼────┼────┼────┤
+│ 10 │ 11 │ XX │ 13 │
+├────┼────┼────┼────┤
+│ 20 │ 21 │ 22 │ 23 │
+└────┴────┴────┴────┘
+```
+
+只有 `XX` 改变：
+
+```text
+DamageTracker:
+
+tile(1,2)
+```
+
+renderer：
+
+```text
+only update tile(1,2)
+```
+
+这对于以后：
+
+```text
+Terminal
+Native UI
+Image
+Agent dashboard
+Graph
+Animation
+```
+
+都可以统一使用。
+
+---
+
+# Scroll 更值得专门优化
+
+这里 foot 对 Bitty 的启发很大。
+
+Terminal 滚动时千万不要：
+
+```text
+100 rows
+↓
+重建 100 rows glyph vertices
+↓
+重新 upload
+↓
+全部 redraw
+```
+
+可以利用：
+
+```text
+Logical ring buffer
++
+viewport offset
+```
+
+例如：
+
+```text
+GPU Terminal Grid
+
+physical:
+A B C D E F G
+
+viewport:
+    ↓
+C D E F G
+
+scroll
+
+physical:
+A B C D E F G H
+
+viewport:
+      ↓
+D E F G H
+```
+
+实际上只有：
+
+```text
+new row H
+```
+
+是真正的新内容。
+
+于是 GPU 可以做到：
+
+```text
+reuse C/D/E/F/G
+       +
+render H
+```
+
+这一点对：
+
+```bash
+yes
+find /
+journalctl -f
+cargo build
+```
+
+这种高速输出非常重要。
+
+---
+
+# 我会建议 Bitty 最终形成这样的渲染架构
+
+```text
+               State mutation
+                     │
+        ┌────────────┼────────────┐
+        ▼            ▼            ▼
+   Terminal       Native UI     Graphics
+      Grid          Scene         Scene
+        │            │            │
+        ▼            ▼            ▼
+ Cell/Row       Node/Layout    Rect/Image
+  Damage          Damage        Damage
+        └────────────┼────────────┘
+                     ▼
+              Damage Manager
+                     │
+          ┌──────────┴──────────┐
+          │                     │
+    Frame Scheduler       Resource Cache
+          │               ├─ Glyph Atlas
+          │               ├─ Images
+          │               ├─ Text Runs
+          │               └─ Panel Textures
+          │
+          ▼
+        wgpu
+          │
+     dirty regions
+          │
+          ▼
+ Persistent Render Targets
+          │
+          ▼
+       Compositor Pass
+          │
+          ▼
+     wgpu Surface
+```
+
+我觉得这里甚至可以形成 Bitty renderer 的一条核心原则：
+
+> **State change does not imply frame redraw.
+> Frame redraw does not imply panel redraw.
+> Panel redraw does not imply full-region redraw.**
+
+即：
+
+```text
+状态变了
+≠
+整个 frame 重画
+
+需要 frame
+≠
+所有 Panel 重画
+
+Panel 变了
+≠
+整个 Panel 重画
+```
+
+这比简单说“像 foot 一样 dirty row”更适合 Bitty。
+
+foot 给 Bitty 最大的启示其实不是 **CPU renderer 比 GPU renderer 快**，而是：**先减少工作量，再讨论如何把剩下的工作加速。** 对 Bitty 这种以后同时存在 Terminal + Native UI + Graphics + Wheel Dashboard 的架构，这一点可能比单纯追求 shader 性能重要得多。
+
+[1]: https://github.com/clearcmos/foot/blob/main/doc/foot.ini.5.scd?utm_source=chatgpt.com "foot/doc/foot.ini.5.scd at main · clearcmos/foot · GitHub"
+[2]: https://github.com/DanteAlighierin/foot/blob/master/terminal.c?utm_source=chatgpt.com "foot/terminal.c at master · DanteAlighierin/foot · GitHub"
+[3]: https://wayland-client-d.dpldocs.info/wayland.client.protocol.wl_surface_damage_buffer.html?utm_source=chatgpt.com "wl_surface_damage_buffer (wayland.client.protocol.wl_surface_damage_buffer)"
+[4]: https://manpages.debian.org/testing/foot/foot.ini.5.en.html?utm_source=chatgpt.com "foot.ini(5) — foot — Debian testing — Debian Manpages"
+[5]: https://manpages.debian.org/unstable/foot/foot.5.en.html?utm_source=chatgpt.com "foot(5) — foot — Debian unstable — Debian Manpages"
+[6]: https://github.com/yonasBSD/foot?utm_source=chatgpt.com "GitHub - yonasBSD/foot: A fast, lightweight and minimalistic Wayland terminal emulator · GitHub"
+[7]: https://github.com/gfx-rs/wgpu/blob/trunk/wgpu-core/src/present.rs?utm_source=chatgpt.com "wgpu/wgpu-core/src/present.rs at trunk · gfx-rs/wgpu · GitHub"
