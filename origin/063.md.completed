@@ -1,0 +1,994 @@
+在 Bitty 中是不是对于网络依赖算是一个 Rust Core 的 crates?之前我想的是 Bitty AI 那边是会涉及的，但是我想着这个网络依赖如果是写到 Bitty AI 那边的话，以后再扩展的话，比如别的插件需要网络依赖，比如天气、GitHub、邮箱等等插件也是需要涉及到网络依赖的，还有就是远程操纵相关的，这些是不是可以把这些放到 bitty-network 这种的来做呢？然后这种也算是一个 Rust Core 的扩展，因为默认 Bitty 是不需要网络依赖的，如果是需要使用到跟网络相关的插件扩展才会用得到呢？然后 bitty-ai 也需要用到这个 bitty-network?然后这样是不是可以避免安装多个网络依赖，使得依赖复用呢？
+
+是的，而且我认为你现在这个思路比“让 `bitty-ai` 自己维护网络栈”更合理。
+
+更准确地说，我会把它定义为：
+
+> **`bitty-network` 是 Bitty 官方提供的、可选的 Rust Core Extension / Runtime Service，而不是 Bitty 基础 Core 的强制组成部分。**
+
+这样天气、GitHub、邮箱、Wheel Provider、远程控制等都可以复用同一套网络基础设施，而默认纯终端 Bitty 仍然可以做到 **zero-network dependency**。
+
+## 推荐的整体关系
+
+我会设计成这样：
+
+```text
+                    Bitty Core
+                  无网络依赖
+                       │
+           Extension / Service API
+                       │
+                bitty-network
+                       │
+       ┌───────────────┼────────────────┐
+       │               │                │
+      HTTP          WebSocket       Transport/TLS
+       │               │                │
+       ▼               ▼                ▼
+ ┌──────────┐    ┌──────────┐    ┌──────────────┐
+ │ Wheel /  │    │ Remote   │    │ GitHub Plugin│
+ │ bitty-ai │    │ Control  │    │ Weather      │
+ │ Provider │    │          │    │ Mail Plugin  │
+ └──────────┘    └──────────┘    └──────────────┘
+```
+
+也就是说：
+
+```text
+bitty
+```
+
+默认：
+
+```text
+PTY
+renderer
+window
+input
+Lua runtime
+plugin host
+IPC
+```
+
+但没有：
+
+```text
+HTTP client
+TLS
+DNS
+WebSocket
+OAuth
+proxy
+network server
+```
+
+只有用户安装或者启用某个需要网络的功能时：
+
+```text
+bitty-network
+```
+
+才进入 runtime。
+
+这和 Bitty 的 **small core + extension** 哲学非常一致。
+
+---
+
+# 1. `bitty-ai` 不应该拥有网络层
+
+以前如果：
+
+```text
+bitty-ai
+├── Agent
+├── Context
+├── Tools
+├── Provider
+└── HTTP/TLS/network
+```
+
+短期没问题。
+
+但马上会碰到：
+
+```text
+GitHub Plugin
+└── reqwest + rustls
+
+Weather Plugin
+└── reqwest + rustls
+
+Mail Plugin
+└── reqwest + rustls
+
+Remote
+└── tokio + quinn + rustls
+
+bitty-ai
+└── reqwest + rustls
+```
+
+那么 Bitty 生态里每个人都重新解决：
+
+* TLS
+* Proxy
+* DNS
+* certificate store
+* timeout
+* connection pool
+* HTTP/2
+* HTTP/3
+* WebSocket
+* authentication
+* retry
+* rate limit
+* streaming
+* cancellation
+
+这是明显不应该重复的基础设施。
+
+更合理的是：
+
+```text
+             bitty-network
+                  │
+         Network Runtime
+                  │
+   ┌──────────────┼──────────────┐
+   ▼              ▼              ▼
+ Wheel        GitHub Plugin   Weather Plugin
+```
+
+---
+
+# 2. 而且这不只是“依赖复用”
+
+这个 distinction 很重要。
+
+最开始你可能想到：
+
+> 大家都用 `reqwest`，放在一起可以避免重复依赖。
+
+这个确实有一定作用，但真正价值远比 Cargo dependency deduplication 大。
+
+Cargo 本身如果一个 binary 中多个 crate 都依赖完全兼容的：
+
+```toml
+reqwest = "..."
+tokio = "..."
+rustls = "..."
+```
+
+Cargo 本来就会尽量统一 dependency graph。
+
+例如：
+
+```text
+plugin-a ─┐
+          ├─ reqwest 0.x
+plugin-b ─┘
+```
+
+一般不会简单变成两份完全相同的 `reqwest`。
+
+真正可能重复的是：
+
+```text
+plugin A → reqwest version A
+plugin B → reqwest version B
+```
+
+或者不同 runtime：
+
+```text
+Plugin A → tokio
+Plugin B → async-std
+Plugin C → smol
+```
+
+这个时候就可能有多套东西。
+
+所以 `bitty-network` 最大的意义不是：
+
+> deduplicate crates
+
+而是：
+
+> **统一 networking runtime 和 policy。**
+
+---
+
+# 3. 最重要的是避免每个插件自己创建 Tokio Runtime
+
+这个比 `reqwest` 重复更值得担心。
+
+最差的架构可能变成：
+
+```text
+Bitty
+│
+├─ Plugin A
+│   └─ Tokio Runtime
+│
+├─ Plugin B
+│   └─ Tokio Runtime
+│
+├─ Wheel
+│   └─ Tokio Runtime
+│
+└─ Remote
+    └─ Tokio Runtime
+```
+
+于是出现：
+
+```text
+threads
+timers
+DNS
+connection pools
+TLS sessions
+HTTP pools
+```
+
+全部重复。
+
+Bitty可以直接：
+
+```text
+              bitty-network
+                    │
+          Shared Async Runtime
+                    │
+      ┌─────────────┼─────────────┐
+      │             │             │
+    Wheel        GitHub        Weather
+```
+
+甚至：
+
+```text
+HTTP connection pool
+DNS cache
+TLS session cache
+proxy settings
+```
+
+都可以共享。
+
+这才是真正的资源复用。
+
+---
+
+# 4. 我甚至建议拆成两个 crate
+
+不要让所有东西都塞进一个：
+
+```text
+bitty-network
+```
+
+最好：
+
+```text
+bitty-network-api
+bitty-network
+```
+
+### `bitty-network-api`
+
+应该极轻：
+
+```text
+bitty-network-api
+├── Request
+├── Response
+├── Error
+├── Stream
+├── WebSocket API
+├── capability definitions
+└── service traits
+```
+
+尽量：
+
+> **不依赖真正的 HTTP/TLS implementation。**
+
+例如：
+
+```rust
+trait NetworkService {
+    async fn request(
+        &self,
+        request: Request,
+    ) -> Result<Response>;
+
+    async fn websocket(
+        &self,
+        request: WebSocketRequest,
+    ) -> Result<WebSocket>;
+}
+```
+
+其他插件只需要依赖：
+
+```text
+bitty-network-api
+```
+
+---
+
+### `bitty-network`
+
+这里才放真正的：
+
+```text
+bitty-network
+├── async runtime
+├── HTTP client
+├── TLS
+├── DNS
+├── proxy
+├── WebSocket
+├── connection pooling
+├── streaming
+└── network policy
+```
+
+因此：
+
+```text
+Plugin
+   ↓
+bitty-network-api
+   ↓
+IPC / service lookup
+   ↓
+bitty-network
+```
+
+插件甚至不需要知道：
+
+```text
+reqwest
+hyper
+rustls
+quinn
+```
+
+到底存在不存在。
+
+---
+
+# 5. 对 Lua 插件尤其重要
+
+因为 Bitty 大量扩展最终是在 Lua 层。
+
+你肯定不希望：
+
+```lua
+local reqwest = ...
+```
+
+这种事情。
+
+而是：
+
+```lua
+local net = bitty.network
+
+local response = net.get {
+    url = "https://...",
+}
+```
+
+或者：
+
+```lua
+local github = require("github")
+
+github.request(...)
+```
+
+下面：
+
+```text
+Lua Plugin
+    │
+    ▼
+Bitty Network Lua API
+    │
+    ▼
+bitty-network-api
+    │
+    ▼
+Rust bitty-network
+```
+
+这样 Lua 插件根本不用管理：
+
+* sockets
+* TLS
+* async runtime
+* certificate
+* proxy
+
+---
+
+# 6. 而且可以统一权限模型
+
+这是我认为 `bitty-network` 最大的额外价值之一。
+
+假设一个天气插件：
+
+```text
+Weather Plugin
+```
+
+manifest：
+
+```toml
+[permissions.network]
+hosts = [
+    "api.weather.example"
+]
+```
+
+GitHub：
+
+```toml
+[permissions.network]
+hosts = [
+    "api.github.com"
+]
+```
+
+Wheel Provider：
+
+```toml
+[permissions.network]
+hosts = [
+    "api.openai.com",
+    "api.anthropic.com"
+]
+```
+
+然后：
+
+```text
+Plugin
+   ↓
+Network API
+   ↓
+Capability Check
+   ↓
+bitty-network
+   ↓
+Internet
+```
+
+插件不能直接：
+
+```text
+socket()
+connect(anywhere)
+```
+
+这样 Bitty 能真正知道：
+
+> 谁在联网，连了哪里，为什么连接。
+
+甚至以后可以：
+
+```text
+Bitty Network Inspector
+
+Plugin        Host                  Traffic
+────────────────────────────────────────────
+Wheel         api.openai.com         24 MB
+GitHub        api.github.com          2 MB
+Weather       api.xxx.com            80 KB
+```
+
+这个能力如果每个插件自己 `reqwest`，基本就没法统一实现。
+
+---
+
+# 7. Proxy 也只需要配置一次
+
+这个在企业/学校环境其实很重要。
+
+用户：
+
+```toml
+[network]
+proxy = "http://127.0.0.1:7890"
+```
+
+然后：
+
+```text
+Wheel
+GitHub
+Weather
+Mail
+Remote
+```
+
+全部继承。
+
+而不是：
+
+```text
+Wheel proxy config
+GitHub proxy config
+Weather proxy config
+...
+```
+
+还可以统一处理：
+
+```text
+HTTP_PROXY
+HTTPS_PROXY
+NO_PROXY
+system proxy
+PAC
+```
+
+这是一个 Runtime Service 的价值。
+
+---
+
+# 8. TLS / certificate 也应该统一
+
+如果每个插件自己实现网络，会碰到：
+
+```text
+Plugin A → rustls + webpki roots
+Plugin B → native-tls
+Plugin C → OpenSSL
+```
+
+最后会非常混乱。
+
+`bitty-network` 可以统一：
+
+```text
+TLS Provider
+├── system certificates
+├── custom CA
+├── client certificates
+└── certificate policy
+```
+
+甚至未来允许 backend：
+
+```text
+Rustls
+Native TLS
+Platform TLS
+```
+
+但上层 API 不变化。
+
+---
+
+# 9. Wheel 会因此明显变干净
+
+Wheel 本身就可以真正保持：
+
+```text
+Wheel
+├── Agent Runtime
+├── Context Compiler
+├── Tasks
+├── Tools
+├── Provider abstraction
+└── UI
+```
+
+而：
+
+```text
+network
+HTTP
+TLS
+WebSocket
+```
+
+不属于 Wheel。
+
+例如：
+
+```text
+OpenAI Provider Plugin
+        │
+        ▼
+LLM Provider API
+        │
+        ▼
+bitty-network
+        │
+        ▼
+api.openai.com
+```
+
+这样以后即使没有 Wheel：
+
+```text
+GitHub Plugin
+Weather Plugin
+Remote Plugin
+```
+
+仍然可以使用 Bitty 的同一网络层。
+
+架构边界就会明显干净很多。
+
+---
+
+# 10. Remote Control 需要稍微区分
+
+不过这里我会提醒一点：
+
+**远程控制不一定全部建立在通用 HTTP client API 上。**
+
+例如：
+
+```text
+bitty remote
+```
+
+以后可能需要：
+
+* TCP
+* QUIC
+* WebSocket
+* WebRTC
+* local discovery
+* TLS
+* NAT traversal
+* multiplexing
+* file transfer
+
+因此不要把 `bitty-network` 定义成：
+
+> `reqwest` wrapper
+
+而应该定义成更高层：
+
+```text
+bitty-network
+├── runtime
+├── transport
+│   ├── TCP
+│   ├── UDP
+│   └── QUIC
+│
+├── protocol
+│   ├── HTTP
+│   └── WebSocket
+│
+├── TLS
+├── DNS
+└── policy
+```
+
+然后：
+
+```text
+HTTP Plugins
+   ↓
+HTTP layer
+
+Remote Control
+   ↓
+Transport layer
+
+Wheel
+   ↓
+HTTP/WebSocket layer
+```
+
+这样以后扩展空间大很多。
+
+---
+
+# 11. 我会进一步加 feature 分层
+
+例如：
+
+```toml
+bitty-network = {
+    features = [
+        "client",
+        "http",
+        "websocket"
+    ]
+}
+```
+
+可以有：
+
+```text
+client
+server
+http
+websocket
+quic
+proxy
+oauth
+```
+
+默认：
+
+```text
+bitty
+```
+
+完全不启用。
+
+天气插件只需要：
+
+```text
+client + http
+```
+
+Wheel：
+
+```text
+client + http + websocket
+```
+
+Remote：
+
+```text
+server + quic
+```
+
+这样不会：
+
+> 为了天气插件顺便把 Remote Server 全编译进去。
+
+---
+
+# 12. 但这里有一个 Rust 特有的问题：运行时可选 ≠ 编译时可选
+
+这个很值得提前决定。
+
+如果你写：
+
+```toml
+[features]
+network = ["dep:bitty-network"]
+```
+
+那么：
+
+```text
+bitty --features network
+```
+
+生成的 binary 已经包含 network stack。
+
+只是运行时：
+
+```text
+不用 → 不初始化
+```
+
+而不是：
+
+```text
+不用 → 二进制里完全不存在
+```
+
+如果你真正想做到：
+
+> 默认安装 Bitty 没有任何 network dependency；安装网络插件后才出现网络组件。
+
+有三个方案。
+
+### A. 编译时 Feature
+
+```text
+bitty
+bitty-network-enabled
+```
+
+最简单，但需要不同 build。
+
+### B. 动态 Rust Library
+
+```text
+libbitty_network.so
+bitty_network.dll
+```
+
+但 Rust 没有稳定 ABI，长期插件兼容比较麻烦。
+
+### C. 独立 Network Service
+
+例如：
+
+```text
+Bitty
+  │ IPC
+  ▼
+bitty-networkd
+```
+
+然后：
+
+```text
+Plugins
+   ↓
+Bitty IPC
+   ↓
+bitty-networkd
+```
+
+这个架构非常干净。
+
+甚至：
+
+```text
+bitty-networkd
+```
+
+没有安装：
+
+```text
+bitty.network unavailable
+```
+
+安装了：
+
+```text
+bitty-networkd
+      ↓
+network available
+```
+
+---
+
+# 我更推荐一个折中方案
+
+对于 Bitty，我会做：
+
+```text
+                Bitty Core
+                    │
+              Network API
+              非常轻量
+                    │
+              Service Bridge
+                    │
+           ┌────────┴────────┐
+           │                 │
+    Embedded Backend   External Backend
+           │                 │
+     bitty-network      bitty-networkd
+```
+
+MVP 先：
+
+```text
+embedded bitty-network
+```
+
+简单开发。
+
+如果以后真的出现：
+
+* 网络栈越来越大
+* 插件越来越多
+* sandbox 需求增强
+* security isolation
+* 独立更新网络组件
+
+再允许：
+
+```text
+bitty-networkd
+```
+
+变成独立服务。
+
+API 完全不需要改变。
+
+---
+
+## 最终我建议 crate 关系
+
+```text
+bitty-core
+│
+├── bitty-terminal
+├── bitty-panel
+├── bitty-renderer
+├── bitty-plugin
+├── bitty-ipc
+│
+└── bitty-network-api      ← 轻量接口
+          ▲
+          │
+    bitty-network          ← Optional Rust Core Extension
+          │
+    ┌─────┼────────┐
+    │     │        │
+ HTTP    WS      Transport
+    │     │        │
+    ▼     ▼        ▼
+Wheel   GitHub   Remote
+Weather Mail
+```
+
+最值得坚持的 boundary 是：
+
+```text
+bitty-core
+    ≠
+bitty-network
+
+bitty-network
+    ≠
+bitty-ai
+```
+
+而应该是：
+
+$$
+\boxed{
+Bitty\ Core
+\rightarrow
+Optional\ Core\ Extensions
+\rightarrow
+Plugins
+}
+$$
+
+其中：
+
+```text
+bitty-network
+```
+
+是一个官方的 **shared infrastructure extension**。
+
+这样以后可能还会出现类似：
+
+```text
+bitty-network
+bitty-media
+bitty-browser
+bitty-devtools
+bitty-remote
+```
+
+它们都属于：
+
+> **比 Lua Plugin 更底层，但又不值得污染最小 Bitty Core 的 Rust Extension。**
+
+我觉得这其实可以正式成为 Bitty 的 **三层扩展模型**：
+
+```text
+Level 0 — Bitty Core
+最小、稳定、无网络
+
+Level 1 — Rust Core Extensions
+bitty-network
+bitty-remote
+bitty-media
+...
+
+Level 2 — Lua Plugins
+Wheel
+Weather
+GitHub
+UI plugins
+...
+```
+
+这会比单纯的“Rust Core + Lua Plugin”二分法更适合 Bitty现在的发展方向。
